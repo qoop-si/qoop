@@ -23,7 +23,7 @@ use crate::answers::{
     HOLD, HandInput, Hold, Holds, Offer, Pick, Slot, offers, refusal_words, text_key,
 };
 use crate::asks::wrap_whole;
-use crate::inbox::{Context, Inbox, Item, ItemKind, OwnAnswer};
+use crate::inbox::{Answered, Context, Inbox, Item, ItemKind, OwnAnswer};
 use crate::input::{PASTE_OFF, PASTE_ON};
 use crate::mux::{machine_of, machine_of_terminal};
 use crate::places::{Beside, Place, PlaceOut};
@@ -113,6 +113,30 @@ impl Env<'_> {
                 .or_else(|| self.card(id).and_then(|c| c.terminal)),
         };
         self.who_of(terminal, &item.slot)
+    }
+
+    /// Whom an answer in Answered today went to: what this client wrote when it sent it, else
+    /// the agent its card was about, else the card's own question, else "a card from qass".
+    /// Never a handle: it names nobody the person knows once the agent is gone.
+    fn answered_to(&self, a: &Answered) -> String {
+        let Some(card) = a
+            .card
+            .as_deref()
+            .filter(|_| !a.own)
+            .and_then(|id| self.card(id))
+        else {
+            return a.to.clone();
+        };
+        let rows: Vec<&AgentRow> = self.rows.iter().collect();
+        match crate::inbox::card_row(card, &rows, self.hand) {
+            Some(row) => format!(
+                "{} / {}",
+                self.space_name(row.workspace),
+                crate::sidebar::label(row)
+            ),
+            None if card.body.asks.trim().is_empty() => "a card from qass".to_string(),
+            None => format!("\"{}\"", card.body.asks.trim()),
+        }
     }
 
     /// [`Env::who`] for a slot alone, as a hold names its target.
@@ -255,6 +279,9 @@ pub struct Opt {
     /// The digit that answers it, none for a standing permission (click only).
     pub digit: Option<u8>,
     pub label: String,
+    /// The rest of a long label the agent wrapped, or the words it drew under the option: read
+    /// with the label, never left out.
+    pub detail: Option<String>,
     pub act: Act,
 }
 
@@ -322,9 +349,10 @@ pub struct Pane {
     /// Between a paste's opening bracket and its closing one: the client reads stdin in blocks,
     /// so one paste comes in several reads and the state outlives each of them.
     in_paste: bool,
-    /// The card the person had selected left the list and the selection fell to another: digits
-    /// answer nothing until a key moves the selection, so a digit typed at that moment never
-    /// answers for an agent the person was not looking at.
+    /// The card the person had selected left the list: no card is marked until a key moves the
+    /// selection, and digits and Enter answer nothing, so a key typed at that moment never
+    /// answers for an agent the person was not looking at. The screen says what is true: no
+    /// mark, so nothing to answer (the marked card would otherwise refuse its own digit).
     fell: bool,
     /// The start of a closing bracket cut off at the end of a read, for the next one.
     carry: Vec<u8>,
@@ -337,6 +365,9 @@ pub struct Pane {
     /// of the client (see [`Pane::key`]).
     parts: std::collections::VecDeque<(bool, Vec<u8>, bool)>,
 }
+
+/// What a digit or Enter is told while no card is marked.
+const FELL_SAID: &str = "that card went, so none is picked: press j or k to pick one";
 
 /// How long a paste may go without a byte before its missing closing bracket is given up on.
 const PASTE_IDLE: Duration = Duration::from_secs(1);
@@ -352,7 +383,7 @@ impl Pane {
         self.in_paste = false;
         self.carry.clear();
         self.parts.clear();
-        self.fell = false;
+        self.picked();
         self.open = true;
         self.whole = false;
         self.board = false;
@@ -435,8 +466,13 @@ impl Pane {
         order
     }
 
-    /// The selected slot: the one chosen when it is still listed, else the first.
+    /// The selected slot: the one chosen when it is still listed, else the first. Nothing while
+    /// the selection has fallen (see [`Pane::fell`]): no card is marked, and no key acts on one,
+    /// until a move picks one.
     fn selected(&self, order: &[Slot]) -> Option<Slot> {
+        if self.fell {
+            return None;
+        }
         self.sel
             .as_ref()
             .filter(|s| order.contains(s))
@@ -444,7 +480,7 @@ impl Pane {
             .cloned()
     }
 
-    /// The selection left the list: note it, and fall to the first until a key moves it.
+    /// The selection left the list: note it, and mark no card until a key moves it.
     fn note_fell(&mut self, env: &Env) {
         let order = self.order(&self.inbox(env));
         if self.sel.as_ref().is_some_and(|s| !order.contains(s)) {
@@ -454,7 +490,7 @@ impl Pane {
     }
 
     pub fn select(&mut self, slot: Slot) {
-        self.fell = false;
+        self.picked();
         if self.sel.as_ref() != Some(&slot) {
             self.whole = false;
             self.stash_typing();
@@ -469,6 +505,10 @@ impl Pane {
             .selected(&order)
             .and_then(|s| order.iter().position(|o| *o == s))
         else {
+            // Nothing is marked (the selection fell): either key picks the top card.
+            if let Some(first) = order.first() {
+                self.select(first.clone());
+            }
             return;
         };
         let to = if down {
@@ -486,6 +526,18 @@ impl Pane {
         inbox.items.iter().find(|i| i.slot == slot).cloned()
     }
 
+    /// A card is picked again after the selection fell: what was said about it is over.
+    fn picked(&mut self) {
+        if std::mem::take(&mut self.fell)
+            && self
+                .notice
+                .as_ref()
+                .is_some_and(|(said, _)| said == FELL_SAID)
+        {
+            self.notice = None;
+        }
+    }
+
     fn say(&mut self, what: impl Into<String>, env: &Env) {
         self.notice_slot = None;
         self.notice = Some((what.into(), env.now + NOTICE));
@@ -501,6 +553,7 @@ impl Pane {
         let go = || Opt {
             digit: Some(1),
             label: "Open the agent".into(),
+            detail: None,
             act: Act::Go,
         };
         match item.kind {
@@ -524,10 +577,14 @@ impl Pane {
                 .filter(|o| o.pick != Pick::Qass)
                 .map(
                     |Offer {
-                         digit, label, pick, ..
+                         digit,
+                         label,
+                         detail,
+                         pick,
                      }| Opt {
                         digit,
                         label,
+                        detail,
                         act: Act::Pick(pick),
                     },
                 )
@@ -547,6 +604,7 @@ impl Pane {
                             .map(|(i, o)| Opt {
                                 digit: (i < 9).then_some(i as u8 + 1),
                                 label: o.label.clone(),
+                                detail: None,
                                 act: Act::Pick(Pick::Card {
                                     card: id.clone(),
                                     option: o.key.clone(),
@@ -1547,7 +1605,7 @@ impl Pane {
             // Enter is Send now or Open: for the card the person was on, not the one that took its
             // place.
             Key::Char(b'1'..=b'9' | b'\r' | b'\n') if self.fell => {
-                self.say("that card went, press j or k to pick one first", env);
+                self.say(FELL_SAID, env);
                 Out::Stay
             }
             Key::Char(d @ b'1'..=b'9') => {
@@ -2072,6 +2130,14 @@ pub(crate) fn wrapped(
 }
 
 /// How long ago, in the words a card uses.
+/// How long ago, for a line of Answered today: "just now" under a minute, else "3m ago".
+fn ago_words(secs: i64) -> String {
+    match crate::asks::age_short(secs).as_str() {
+        "now" => "just now".to_string(),
+        short => format!("{short} ago"),
+    }
+}
+
 fn since(env: &Env, at: Option<i64>) -> Option<String> {
     let secs = env.now_unix - at?;
     Some(crate::asks::age_short(secs))
@@ -2425,9 +2491,13 @@ impl Pane {
                 format!(" answered today {}", inbox.answered.len()),
             ));
             for a in &inbox.answered {
-                let ago = crate::asks::age_short(env.now_unix - a.at);
                 body.extend(wrapped(
-                    &format!("{} to {}, {ago} ago", a.label, a.to),
+                    &format!(
+                        "{} to {}, {}",
+                        a.label,
+                        env.answered_to(a),
+                        ago_words(env.now_unix - a.at)
+                    ),
                     3,
                     cols,
                     Role::FaintText,
@@ -2494,12 +2564,15 @@ impl Pane {
     /// The title, whole, with how long it has waited. qass's own notice names no agent.
     fn title_rows(&self, item: &Item, on: bool, env: &Env, cols: usize) -> Vec<Row> {
         let who = env.who(item);
-        let mark = if item.kind.from_qass() {
-            "\u{25c6} via qass  "
-        } else {
-            ""
+        // A plan says so, in the design's words: it waits for the person's approval.
+        let mark = match item.kind {
+            ItemKind::Plan => "\u{25c6} plan to approve  ",
+            kind if kind.from_qass() => "\u{25c6} via qass  ",
+            _ => "",
         };
-        let title = if who == "qass" && !mark.is_empty() {
+        let title = if who == "qass" && item.kind == ItemKind::Plan {
+            mark.trim_end().to_string()
+        } else if who == "qass" && !mark.is_empty() {
             "\u{25c6} qass".to_string()
         } else {
             format!("{mark}{who}")
@@ -2608,48 +2681,64 @@ impl Pane {
             Slot::Card(id) => env.card(id),
             Slot::Agent(_) => None,
         };
-        let mut units: Vec<Unit> = Self::opts(item, env)
-            .into_iter()
-            .enumerate()
-            .map(|(at, o)| {
-                let text = match o.digit {
-                    Some(d) => format!("{d} {}", o.label),
-                    None => o.label.clone(),
-                };
-                let suggested = card.and_then(|c| c.body.pick.as_ref()).is_some_and(
-                    |p| matches!(&o.act, Act::Pick(Pick::Card { option, .. }) if *option == p.key),
-                );
-                Unit {
-                    role: Role::Detail,
-                    bold: on && suggested,
-                    text: if suggested {
-                        format!("{text} (qass suggests)")
-                    } else {
-                        text
-                    },
-                    hit: Some(Hit::Opt(slot.clone(), at)),
-                }
-            })
-            .collect();
+        // A standing permission (no digit) stands on a line of its own: run into the line of
+        // the option before it, it reads as one long label.
+        let mut units: Vec<(Unit, bool)> = Vec::new();
+        for (at, o) in Self::opts(item, env).into_iter().enumerate() {
+            let words = match &o.detail {
+                Some(detail) => format!("{} {detail}", o.label),
+                None => o.label.clone(),
+            };
+            let text = match o.digit {
+                Some(d) => format!("{d} {words}"),
+                None => words,
+            };
+            let suggested = card.and_then(|c| c.body.pick.as_ref()).is_some_and(
+                |p| matches!(&o.act, Act::Pick(Pick::Card { option, .. }) if *option == p.key),
+            );
+            let unit = Unit {
+                role: Role::Detail,
+                bold: on && suggested,
+                text: if suggested {
+                    format!("{text} (qass suggests)")
+                } else {
+                    text
+                },
+                hit: Some(Hit::Opt(slot.clone(), at)),
+            };
+            units.push((unit, o.digit.is_none()));
+        }
         if item.hand_to_qass {
-            units.push(unit(
+            let hand = unit(
                 Role::Detail,
                 "h hand to qass",
                 Some(Hit::Hand(slot.clone())),
-            ));
+            );
+            units.push((hand, false));
         }
         if Self::takes_words(item, env) {
-            units.push(unit(
+            let reply = unit(
                 Role::Detail,
                 "r reply in your own words",
                 Some(Hit::Reply(slot.clone())),
-            ));
+            );
+            units.push((reply, false));
         }
-        let mut rows = if units.is_empty() {
-            Vec::new()
-        } else {
-            flow(units, BODY, 3, cols)
-        };
+        let mut rows: Vec<Row> = Vec::new();
+        let mut line: Vec<Unit> = Vec::new();
+        for (unit, alone) in units {
+            if alone {
+                if !line.is_empty() {
+                    rows.extend(flow(std::mem::take(&mut line), BODY, 3, cols));
+                }
+                rows.extend(flow(vec![unit], BODY, 3, cols));
+            } else {
+                line.push(unit);
+            }
+        }
+        if !line.is_empty() {
+            rows.extend(flow(line, BODY, 3, cols));
+        }
         if let Some(words) = self.drafts.get(slot).filter(|w| !w.is_empty()) {
             rows.extend(wrapped(
                 &format!("draft: {words}"),
@@ -4288,6 +4377,168 @@ mod tests {
         press(&mut pane, &w, ready, b"k");
         press(&mut pane, &w, ready, b"2");
         assert_ne!(label(&pane), Some(before), "after a move the digit answers");
+    }
+
+    /// When the selected card leaves the list the screen says what is true: no card is marked,
+    /// digits answer nothing and say why, a move picks the top card, and the words are gone
+    /// before the next hold bar shows.
+    #[test]
+    fn when_the_selected_card_goes_no_card_is_marked_until_a_move() {
+        let mut w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        pane.select(Slot::Agent(4));
+        let row = w.rows.iter_mut().find(|r| r.terminal == 4).expect("row");
+        row.state = "working".into();
+        row.status = Some("working".into());
+        pane.rows_changed(&env(&w, ready));
+        let shown = |pane: &Pane| pane.view(&env(&w, ready), 104, 80).plain.join("\n");
+        let marks = |pane: &Pane| shown(pane).matches('\u{258c}').count();
+        assert_eq!(marks(&pane), 0, "a mark on a card a digit would refuse");
+        press(&mut pane, &w, ready, b"1");
+        assert!(shown(&pane).contains("press j or k"), "{}", shown(&pane));
+        assert!(pane.holds.held.is_empty(), "the digit answered");
+        // Either move key picks the top card; the words go with the refusal.
+        press(&mut pane, &w, ready, b"k");
+        assert_eq!(marks(&pane), 1);
+        assert!(!shown(&pane).contains("press j or k"), "{}", shown(&pane));
+        press(&mut pane, &w, ready, b"1");
+        assert!(!pane.holds.held.is_empty(), "a digit answers after a move");
+        let shown = shown(&pane);
+        assert!(shown.contains("sending in"), "{shown}");
+        assert!(!shown.contains("press j or k"), "{shown}");
+    }
+
+    /// Answered today says "just now" under a minute, never "now ago", and names the agent, or
+    /// the card's question when the agent is gone, never the card's handle.
+    #[test]
+    fn answered_today_says_just_now_and_names_the_agent_or_the_card() {
+        let mut w = world("normal");
+        w.ctx.day_start = w.now_unix - 86_400;
+        let mut gone = w
+            .cards
+            .iter()
+            .find(|c| c.card == "E10")
+            .expect("card")
+            .clone();
+        gone.closed_at = Some(w.now_unix - 5);
+        let handle = gone.body.handle.clone();
+        let question = gone.body.asks.clone();
+        w.cards.push(AskInfo {
+            card: "E90".into(),
+            ..gone
+        });
+        let (mut pane, ready) = armed(&w, Instant::now());
+        pane.own.push(OwnAnswer {
+            at: w.now_unix - 2,
+            label: "Yes".into(),
+            to: "shop / api".into(),
+            card: None,
+        });
+        let shown = pane.view(&env(&w, ready), 104, 200).plain.join("\n");
+        let section = shown.split("answered today").nth(1).expect("the section");
+        assert!(!section.contains("now ago"), "{section}");
+        assert!(section.contains("Yes to shop / api, just now"), "{section}");
+        assert!(
+            section.contains(&format!("to \"{question}\", just now")),
+            "{section}"
+        );
+        assert!(!section.contains(&format!("to {handle},")), "{section}");
+        // A card whose agent is still listed is named like the Inbox names it.
+        let live = w.cards.iter().find(|c| c.card == "E9").expect("card");
+        let row = w
+            .rows
+            .iter()
+            .find(|r| Some(r.terminal) == live.terminal)
+            .expect("row");
+        let named = format!(
+            "{} / {}",
+            env(&w, ready).space_name(row.workspace),
+            crate::sidebar::label(row)
+        );
+        assert!(section.contains(&format!("to {named}, ")), "{section}");
+    }
+
+    /// An option's words are all there, wrapped whole at its own boundaries: a standing
+    /// permission stands on a line of its own, the rest of a wrapped label stays with it.
+    #[test]
+    fn options_wrap_whole_and_a_standing_permission_has_its_own_line() {
+        let mut w = world("normal");
+        let row = w.rows.iter_mut().find(|r| r.terminal == 2).expect("row");
+        let choice = |key: &str, label: &str, detail: Option<&str>| {
+            serde_json::from_value(serde_json::json!({
+                "key": key, "label": label, "detail": detail
+            }))
+            .expect("a choice")
+        };
+        row.menu.as_mut().expect("menu").options = vec![
+            choice("1", "Yes", None),
+            choice(
+                "2",
+                "Yes, and don't ask again for cargo",
+                Some("test commands in /Users/me/coding/qoop"),
+            ),
+            choice(
+                "3",
+                "No, and tell Claude what to do differently (esc)",
+                None,
+            ),
+        ];
+        let (pane, ready) = armed(&w, Instant::now());
+        for cols in [30, 39, 63, 104] {
+            let mut pane_view = pane.view(&env(&w, ready), cols, 200).plain;
+            pane_view.retain(|r| !r.trim().is_empty());
+            let at = pane_view
+                .iter()
+                .position(|r| r.contains("Allow the microphone"))
+                .expect("the card");
+            let card = pane_view[at..].to_vec();
+            let all = flat(&card.join(" "));
+            assert!(
+                all.contains(
+                    "Yes, and don't ask again for cargo test commands in /Users/me/coding/qoop"
+                ),
+                "{cols}: {all}"
+            );
+            assert!(
+                all.contains("2 No, and tell Claude what to do differently (esc)"),
+                "{cols}: {all}"
+            );
+            let first = card.iter().find(|r| r.contains("1 Yes")).expect("option 1");
+            assert!(
+                !first.contains("don't ask"),
+                "{cols}: run into option 1: {first:?}"
+            );
+            let standing = card
+                .iter()
+                .find(|r| r.contains("don't ask"))
+                .expect("standing");
+            assert!(
+                !standing.contains("2 No") && !standing.contains("1 Yes"),
+                "{cols}: {standing:?}"
+            );
+        }
+    }
+
+    /// A plan says so on its card, in the design's words.
+    #[test]
+    fn a_plan_card_says_it_is_a_plan_to_approve() {
+        let w = world("normal");
+        let (pane, ready) = armed(&w, Instant::now());
+        let shown = pane.view(&env(&w, ready), 104, 200).plain.join("\n");
+        let plan = pane
+            .inbox(&env(&w, ready))
+            .items
+            .iter()
+            .find(|i| i.kind == ItemKind::Plan)
+            .cloned()
+            .expect("a plan item");
+        let who = env(&w, ready).who(&plan);
+        assert!(
+            shown.contains(&format!("plan to approve  {who}")),
+            "{shown}"
+        );
+        // qass's other cards keep their words.
+        assert!(shown.contains("via qass"), "{shown}");
     }
 
     #[test]

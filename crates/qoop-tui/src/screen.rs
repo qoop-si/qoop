@@ -4207,6 +4207,23 @@ pub fn paint_inbox(frame: &Frame, view: &crate::inbox_pane::View, out: &mut Stri
         out.push_str(&at(1 + i, left + 1));
         out.push_str(row);
     }
+    // The divider beside it is repainted whole: the frame under the Inbox may be an agent
+    // page's, and its joints (`├`, `┴`) would stand in the divider where the Inbox has no
+    // pane lines. The top bend stays; the bottom one bends toward the column, in ember.
+    if left > 0 {
+        let last = view.rows.len().saturating_sub(1);
+        for i in 1..=last {
+            out.push_str(&at(1 + i, left));
+            if i == last {
+                out.push_str(&theme::fg(theme::Role::Brand));
+                out.push('\u{256f}');
+            } else {
+                out.push_str(&theme::fg(theme::Role::Rule));
+                out.push('\u{2502}');
+            }
+            out.push_str(theme::RESET);
+        }
+    }
     match view.cursor {
         Some((row, col)) => {
             out.push_str(&at(1 + row, left + 1 + col));

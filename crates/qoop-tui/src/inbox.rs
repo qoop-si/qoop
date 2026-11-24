@@ -164,6 +164,9 @@ pub struct Answered {
     pub to: String,
     /// Sent by this client, rather than read from an ended card.
     pub own: bool,
+    /// The card it answered, when it was one: its agent and question name it better than its
+    /// handle does once the agent is gone.
+    pub card: Option<String>,
 }
 
 /// The Inbox.
@@ -375,7 +378,11 @@ fn card_kind(card: &AskInfo) -> ItemKind {
 
 /// The row a card is about: by its terminal on This Mac, else by its agent's key
 /// (`staging/T2`) on another machine.
-fn card_row<'a>(card: &AskInfo, rows: &[&'a AgentRow], hand: &HandInput) -> Option<&'a AgentRow> {
+pub(crate) fn card_row<'a>(
+    card: &AskInfo,
+    rows: &[&'a AgentRow],
+    hand: &HandInput,
+) -> Option<&'a AgentRow> {
     if let Some(t) = card_terminal(card) {
         return rows.iter().copied().find(|r| r.terminal == t);
     }
@@ -408,6 +415,7 @@ fn answered_today(cards: &[AskInfo], own: &[OwnAnswer], day_start: i64) -> Vec<A
                 label: answer_label(c)?,
                 to: c.body.handle.clone(),
                 own: false,
+                card: Some(c.card.clone()),
             })
         })
         .collect();
@@ -416,6 +424,7 @@ fn answered_today(cards: &[AskInfo], own: &[OwnAnswer], day_start: i64) -> Vec<A
         label: o.label.clone(),
         to: o.to.clone(),
         own: true,
+        card: o.card.clone(),
     }));
     out.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.label.cmp(&b.label)));
     out
