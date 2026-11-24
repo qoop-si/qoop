@@ -13,8 +13,8 @@ qoop qass
 
 It opens qass in its own space on the agent `qoop settings` names (`qass runs on`: claude by
 default, codex, gemini, opencode, or one of your own `[agents]` lines, such as
-`claudes = "claude --model sonnet"`), or shows or wakes the one you have. `ctrl-a Q` goes there
-and back. Close it as any tab: `ctrl-a x` in it, or `qoop close`.
+`claudes = "claude --model sonnet"`), or shows or wakes the one you have. `ctrl-a Q` opens its ledger (how it stands, what it holds and did, its schedules and
+rules, a line to ask it; `t` opens qass's own terminal). Close it as any tab: `ctrl-a x` in it, or `qoop close`.
 
 ## When it acts
 

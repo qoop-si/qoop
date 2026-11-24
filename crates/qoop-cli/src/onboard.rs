@@ -718,7 +718,7 @@ fn open_qass(agent: &str, inside: bool) -> std::io::Result<()> {
     config::set(&config::path(), "qass.agent", agent).map_err(std::io::Error::other)?;
     let dir = qoop_runtime::paths::runtime_dir().map_err(std::io::Error::other)?;
     crate::ensure_daemon(&qoop_runtime::paths::socket_path(&dir))?;
-    let terminal = crate::qass::start(false)?;
+    let terminal = crate::qass::start()?;
     if inside {
         let _ = crate::qass::run(&["focus", &terminal.to_string()]);
         return Ok(());

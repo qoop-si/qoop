@@ -345,7 +345,8 @@ impl Interface {
         env: &[(&str, std::ffi::OsString)],
     ) -> Self {
         let runtime = dir.path().to_path_buf();
-        let (child, daemon, master) = Self::start_in(dir.path(), backgrounded, cols, rows, env);
+        let (child, daemon, master) =
+            Self::start_in(dir.path(), backgrounded, cols, rows, env, &[]);
         Self {
             child,
             daemon,
@@ -420,7 +421,7 @@ impl Interface {
     /// adopts and sizes. Drop this before the interface that owns the
     /// directory.
     fn attach_sized(dir: &std::path::Path, cols: u16, rows: u16) -> Self {
-        let (child, daemon, master) = Self::start_in(dir, false, cols, rows, &[]);
+        let (child, daemon, master) = Self::start_in(dir, false, cols, rows, &[], &[]);
         Self {
             child,
             daemon,
@@ -434,12 +435,14 @@ impl Interface {
         }
     }
 
+    /// `daemon_env` is added to the daemon's environment, which every terminal it opens inherits.
     fn start_in(
         dir: &std::path::Path,
         backgrounded: bool,
         cols: u16,
         rows: u16,
         env: &[(&str, std::ffi::OsString)],
+        daemon_env: &[(&str, std::ffi::OsString)],
     ) -> (Child, Child, OwnedFd) {
         let mut daemon_cmd = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
         daemon_cmd
@@ -451,6 +454,7 @@ impl Interface {
             .env_remove("QOOP_SESSION")
             .env_remove("QORO_SESSION")
             .env("SHELL", "/bin/sh")
+            .envs(daemon_env.iter().map(|(k, v)| (*k, v)))
             .stdout(Stdio::null())
             .stderr(Stdio::from(
                 std::fs::File::create(dir.join("daemon.log")).expect("log"),
@@ -3243,4 +3247,155 @@ fn the_inbox_at_100_columns_keeps_the_column() {
         let path = std::path::Path::new(&dir).join("inbox-real-100x30.txt");
         std::fs::write(path, ui.screen.to_string()).expect("keep the screen");
     }
+}
+
+// New agent (`n` in the Inbox) ------------------------------------------------------------
+
+/// `n` in the Inbox opens the new agent box; a task with a quote in it, enter, and the line
+/// typed into the new shell is the shared worktree line: a stand-in `qoop` first on the shell's
+/// PATH records the arguments it was given, so the quoting is checked by what the shell made of
+/// it, and nothing real is started.
+#[test]
+fn n_in_the_inbox_types_the_worktree_line_into_a_new_shell() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(
+        dir.path(),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .expect("chmod");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    let args = dir.path().join("worktree-args");
+    let stub = bin.join("qoop");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n",
+            args.display()
+        ),
+    )
+    .expect("stub");
+    std::fs::set_permissions(
+        &stub,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .expect("chmod");
+    // The agents the person's config lists: one that starts in a worktree.
+    let config = dir.path().join("config").join("qoop");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(
+        config.join("config.toml"),
+        "[agents]\nclaude = \"claude\"\n",
+    )
+    .expect("config");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let runtime = dir.path().to_path_buf();
+    let (child, daemon, master) =
+        Interface::start_in(dir.path(), false, 220, 40, &[], &[("PATH", path.into())]);
+    let mut ui = Interface {
+        child,
+        daemon,
+        master,
+        _dir: Some(dir),
+        runtime,
+        cols: 220,
+        rows: 40,
+        painted: String::new(),
+        screen: Screen::new(220, 40),
+    };
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    ui.type_in(b"\x01i");
+    assert!(
+        ui.wait_on_screen("inbox:", Duration::from_secs(10)),
+        "ctrl-a i did not open the Inbox:\n{}",
+        ui.screen
+    );
+    ui.type_in(b"n");
+    assert!(
+        ui.wait_on_screen("what should the agent do?", Duration::from_secs(5)),
+        "n did not open the new agent box:\n{}",
+        ui.screen
+    );
+    ui.type_in(b"it's done");
+    assert!(
+        ui.wait_on_screen("it's done", Duration::from_secs(5)),
+        "{}",
+        ui.screen
+    );
+    assert!(
+        ui.on_screen("new worktree feat/its-done"),
+        "no branch on the box:\n{}",
+        ui.screen
+    );
+    ui.type_in(b"\r");
+    let start = Instant::now();
+    while !args.exists() && start.elapsed() < Duration::from_secs(20) {
+        ui.wait_a_while(Duration::from_millis(100));
+    }
+    let got = std::fs::read_to_string(&args).unwrap_or_default();
+    assert_eq!(
+        got.lines().collect::<Vec<_>>(),
+        [
+            "worktree",
+            "new",
+            "feat/its-done",
+            "--space",
+            "1",
+            "--",
+            "claude",
+            "it's done"
+        ],
+        "the shell was typed the wrong line:\n{}",
+        ui.screen
+    );
+}
+
+// qass's ledger (`ctrl-a Q`) --------------------------------------------------------------
+
+/// `ctrl-a Q` opens the ledger over the pane. With no qass on a fresh machine it says qass is
+/// not started and offers Start, not Pause; `esc` puts it away and the same key opens it again.
+#[test]
+fn ctrl_a_capital_q_opens_the_ledger_and_a_stopped_qass_offers_start() {
+    let mut ui = Interface::start_impl_sized(false, 220, 40);
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    ui.type_in(b"\x01Q");
+    assert!(
+        ui.wait_on_screen("not started", Duration::from_secs(10)),
+        "ctrl-a Q did not open the ledger:\n{}",
+        ui.screen
+    );
+    assert!(
+        ui.on_screen("s start qass") && ui.on_screen("did today") && ui.on_screen("rules"),
+        "{}",
+        ui.screen
+    );
+    assert!(
+        !ui.on_screen("p pause") && !ui.on_screen("t its terminal"),
+        "a stopped qass offered Pause:\n{}",
+        ui.screen
+    );
+    ui.type_in(b"\x1b");
+    ui.wait_a_while(Duration::from_millis(600));
+    assert!(
+        !ui.on_screen("did today"),
+        "esc left the ledger open:\n{}",
+        ui.screen
+    );
+    ui.type_in(b"\x01Q");
+    assert!(
+        ui.wait_on_screen("did today", Duration::from_secs(5)),
+        "{}",
+        ui.screen
+    );
+    ui.type_in(b"\x01Q");
+    ui.wait_a_while(Duration::from_millis(600));
+    assert!(
+        !ui.on_screen("did today"),
+        "the same key did not put it away:\n{}",
+        ui.screen
+    );
 }

@@ -71,8 +71,8 @@ B: Stop | <one line why> | stop this item
 pick: A | <why>
 ```
 
-Each option is its own line, `label | reason | words`, in this order (A approve, B stop): the phone
-and qass's screen show A as the main button. No option changes the plan: he types his own words on
+Each option is its own line, `label | reason | words`, in this order (A approve, B stop): the phone,
+the desktop and the Inbox show A as the main button. No option changes the plan: he types his own words on
 the card, and they come with his answer.
 
 ```

@@ -17,9 +17,8 @@ program.
 | `ctrl-a w` | new space |
 | `ctrl-a s`, `ctrl-a S` | next, previous space |
 | `ctrl-a R` | the space's settings: its name and colour |
-| `ctrl-a Q` | qass in its own space, or back to where you were; a click on the pet in the column's foot does the same |
-| `ctrl-a i` | Inbox: from any tab, everything that needs you as one list, oldest first, one card each, with the count in its title. Below 100 columns it folds the agents column while it is open. In it `j` `k` move, `1` to `9` answer with the option of that number (the answer waits 3 seconds, `u` takes it back, `enter` sends it now), `h` hands the question to qass to decide, `r` types your own words, `g` goes to that agent's tab, `o` talks it through with the agent, `m` reads the whole card, `x` puts it away, `f` shows only what qass asked (again to clear), `esc` closes it. A click on the `needs you` title of the agents column opens it too |
-| `ctrl-a T` | fold: on qass's screen, fold the pane the keyboard is in to its strip, or open the folded one |
+| `ctrl-a Q` | qass's ledger over the pane, or put away: how qass stands with `p` to pause or resume it (`s` starts it when it is stopped, and opens its terminal), a link to the questions it asked you (`i` opens them in the Inbox), what it holds, what it did today as the daemon recorded it, its schedules (add or change them with `qoop schedule`), its rules as a count, and a line to ask it (`a`, then `enter`). `t` opens qass's own terminal, `esc` goes back. A click on the pet in the column's foot does the same |
+| `ctrl-a i` | Inbox: from any tab, everything that needs you as one list, oldest first, one card each, with the count in its title. Below 100 columns it folds the agents column while it is open. In it `j` `k` move, `1` to `9` answer with the option of that number (the answer waits 3 seconds, `u` takes it back, `enter` sends it now), `h` hands the question to qass to decide, `r` types your own words, `g` goes to that agent's tab, `o` talks it through with the agent, `m` reads the whole card, `x` puts it away, `f` shows only what qass asked (again to clear), `tab` shows the Board in place of the list (read only: waiting on you, doing, todo and done; `tab` again goes back), `n` starts a new agent in a new worktree (what to do, which space and agent, the branch; `tab` moves between them, `enter` starts it), `esc` closes it. A click on the `needs you` title of the agents column opens it too |
 | `ctrl-a W` | close the space when it is empty |
 | `ctrl-a Z` | sleep, wake: put the tab the keyboard is in to sleep, or wake the sleeping tab it rests on |
 | `ctrl-a f` | fold: the focused space's agents fold under its rule, or open again |
@@ -68,9 +67,9 @@ program.
 | click | focus a tab, a pane, a space or an agent; in a chat, open or close the step you click (shift-click selects over it instead) |
 | drag | select, and copy when you let go; scroll while the button is down and the selection runs on, and every row it covers is copied, also rows scrolled out of view |
 | drag a divider | resize the panes on either side |
-| click a space's `+`, or the tab bar's | a new agent or terminal in that space, in its directory; an agent asks for its name (empty for the agent's own) |
-| click the pet at the foot of the column | qass, or back to where you were: the same as `ctrl-a Q` |
-| click the `questions` count in qass's header | open or close the questions, the same as `ctrl-a i` |
+| click a space's `+`, or the tab bar's | a new agent, terminal or agent in a worktree in that space, in its directory; an agent asks for its name (empty for the agent's own) |
+| click the pet at the foot of the column | qass's ledger: the same as `ctrl-a Q` |
+| click a computer on the computers line of the agents column | that computer's own screen: how it is reached and since when, and its agents as they were when it last answered; `r` tries a computer that is not reached again |
 | click the `needs you` title in the agents column | open the Inbox, the same as `ctrl-a i` |
 | click a space's `⋯` | the space's settings: its name and colour |
 | drag the column's edge | widen or narrow the left column, up to half the window |

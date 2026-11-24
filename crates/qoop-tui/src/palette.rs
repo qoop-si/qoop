@@ -24,6 +24,12 @@ pub enum Item {
     /// A new terminal running an agent the table does not know: the palette
     /// asks which command to type, so any agent works, not just the listed ones.
     NewAgentAsk,
+    /// The box that starts an agent in a new worktree (`n` in the Inbox).
+    NewWork,
+    /// qass's ledger, as `ctrl-a Q` opens it.
+    Ledger,
+    /// A computer's own screen, by its machine number.
+    Computer(usize),
     CopyMode,
     Resize,
     Equalize,
@@ -103,7 +109,7 @@ impl Filter {
     fn keeps(self, item: &Item) -> bool {
         let agent = matches!(
             item,
-            Item::NewAgent(_) | Item::NewAgentAsk | Item::Resume { .. }
+            Item::NewAgent(_) | Item::NewAgentAsk | Item::NewWork | Item::Resume { .. }
         );
         match self {
             Filter::All => true,
@@ -295,6 +301,30 @@ impl Palette {
                 program: None,
             });
         }
+        // Each other computer, with how it is reached: its own screen.
+        let mut machines: Vec<usize> = Vec::new();
+        for space in spaces {
+            let machine = crate::mux::machine_of(space.id);
+            if machine == 0 || machines.contains(&machine) {
+                continue;
+            }
+            machines.push(machine);
+            let name = crate::places::machine_name(spaces, machine);
+            out.push(Entry {
+                item: Item::Computer(machine),
+                section: "computers",
+                sub: match space.link {
+                    Some(qoop_runtime::control::LinkState::Down) => "not reached".to_string(),
+                    Some(qoop_runtime::control::LinkState::Parked) => "not connected".to_string(),
+                    _ => "online".to_string(),
+                },
+                space_len: crate::width::width(&name),
+                text: name,
+                space: None,
+                state: None,
+                program: None,
+            });
+        }
         // The things the interface can do, each with the key that does it without the
         // palette, so the next time needs no palette. The agent row takes no key: it
         // asks which command to type, so an agent nobody listed still starts.
@@ -304,12 +334,24 @@ impl Palette {
             (Item::Equalize, "equalize panes", "="),
             (Item::NewTerminal, "new terminal here", "c"),
             (Item::NewAgentAsk, "new agent terminal...", ""),
+            (
+                Item::NewWork,
+                "new agent in a worktree...",
+                "n in the Inbox",
+            ),
+            (
+                Item::Ledger,
+                "qass: what it does, its schedules and rules",
+                "Q",
+            ),
             (Item::Sleep, "sleep this tab", "Z"),
             (Item::NewSpace, "new space", "w"),
         ] {
             // Under the agent filter the ask row leads the agents it offers, not a `do`
             // header of its own.
-            let section = if item == Item::NewAgentAsk && self.filter == Filter::Agents {
+            let section = if matches!(item, Item::NewAgentAsk | Item::NewWork)
+                && self.filter == Filter::Agents
+            {
                 "agents"
             } else {
                 "do"
@@ -320,6 +362,8 @@ impl Palette {
                 text: text.to_string(),
                 sub: if key.is_empty() {
                     "type any agent".to_string()
+                } else if key.contains(' ') {
+                    key.to_string()
                 } else {
                     crate::keys::named(&format!("ctrl-a {key}"))
                 },
@@ -1322,5 +1366,31 @@ mod tests {
         assert!(shown(&searching, 1).is_empty(), "never a search hit");
         palette.plugins = crate::plugins::Listed::Nothing;
         assert!(shown(&palette, 1).is_empty(), "no plugins, nothing extra");
+    }
+
+    /// The ledger's key is named with the command key the person chose, not written `ctrl-a`.
+    #[test]
+    fn the_ledgers_key_is_named_with_the_persons_command_key() {
+        crate::keys::TEST_PREFIX.with(|c| c.set(Some(0x02)));
+        let (rows, spaces) = sample();
+        let entries = opened_for(&rows).items(
+            &rows,
+            &spaces,
+            0,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
+        crate::keys::TEST_PREFIX.with(|c| c.set(None));
+        let ledger = entries
+            .iter()
+            .find(|e| e.item == Item::Ledger)
+            .expect("the ledger row");
+        assert_eq!(ledger.sub, "ctrl-b Q");
+        // A key that is not a command of the prefix keeps its own words.
+        let new = entries
+            .iter()
+            .find(|e| e.item == Item::NewWork)
+            .expect("the new agent row");
+        assert_eq!(new.sub, "n in the Inbox");
     }
 }

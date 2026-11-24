@@ -323,6 +323,8 @@ pub enum Hit {
     Doze(i64),
     /// The Needs you header, or a question that names no agent: opens the Inbox.
     Inbox,
+    /// A row of the computers line with another machine on it: that machine's own screen.
+    Computer(usize),
     /// The `spaces` title, with the order word and the `+` at its right.
     Title,
     /// The search chip under the title.
@@ -340,6 +342,8 @@ pub enum Hit {
 /// What a click on the column asks for, once the column it landed on is known.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Act {
+    /// A machine on the computers line: its own screen.
+    Computer(usize),
     /// The version on the foot: open the site in the browser.
     Site,
     /// `restart for update` on the foot: move the daemon onto the qoop on disk.
@@ -391,7 +395,7 @@ pub enum Act {
     HubDown,
     /// Fold the whole column away to its strip, and back.
     Collapse,
-    /// The pet: qass's screen, or back from it, as `ctrl-a Q` does.
+    /// The pet: qass's ledger, or back from it, as `ctrl-a Q` does.
     Qass,
     /// qass's eye beside the count chip: turn qass's watching over.
     QassWatch,
@@ -1792,15 +1796,19 @@ type Runs = Vec<(usize, usize, crate::theme::Role)>;
 /// stays whole on one row and the line wraps between machines. An interface attached to remote
 /// machines alone has no daemon here, so This Mac is not listed then.
 fn computer_rows(c: &Column) -> Vec<Row> {
-    computer_rows_with(c, crate::mux::has_local())
+    computer_rows_with(c, crate::mux::has_local(), &crate::places::reach_now())
 }
 
-fn computer_rows_with(c: &Column, local: bool) -> Vec<Row> {
+/// [`computer_rows`] with whether This Mac is listed and when each machine was last reached
+/// named: a machine that is not reached says since when, as this window saw it. A row that has
+/// another machine on it opens that machine's own screen.
+fn computer_rows_with(c: &Column, local: bool, reach: &crate::places::Reach) -> Vec<Row> {
     use crate::theme::Role;
-    // Each unit: its text, and the glyph in it that wears the state's ink.
-    let mut units: Vec<(String, Option<(char, Role)>)> = vec![("computers".to_string(), None)];
+    // Each unit: its text, the glyph in it that wears the state's ink, and the machine it names.
+    type Unit = (String, Option<(char, Role)>, Option<usize>);
+    let mut units: Vec<Unit> = vec![("computers".to_string(), None, None)];
     if local {
-        units.push((format!("This Mac {DOT}"), Some((DOT, Role::Done))));
+        units.push((format!("This Mac {DOT}"), Some((DOT, Role::Done)), None));
     }
     let mut known: Vec<usize> = Vec::new();
     for space in c.spaces {
@@ -1814,32 +1822,47 @@ fn computer_rows_with(c: &Column, local: bool) -> Vec<Row> {
             .split_once(':')
             .map_or(space.name.as_str(), |(m, _)| m);
         let (glyph, words, ink) = match space.link {
-            Some(LinkState::Down) => (FAILED_DOT, " not reached", Role::Failed),
-            Some(LinkState::Parked) => (BACKGROUND_DOT, " not connected", Role::Faint),
-            _ => (DOT, "", Role::Done),
+            Some(LinkState::Down) => (
+                FAILED_DOT,
+                format!(" {}", reach.not_reached(machine)),
+                Role::Failed,
+            ),
+            Some(LinkState::Parked) => (BACKGROUND_DOT, " not connected".to_string(), Role::Faint),
+            _ => (DOT, String::new(), Role::Done),
         };
-        units.push((format!("{name} {glyph}{words}"), Some((glyph, ink))));
+        units.push((
+            format!("{name} {glyph}{words}"),
+            Some((glyph, ink)),
+            Some(machine),
+        ));
     }
     // A blank at each edge, two between machines on one row.
     let room = c.width.saturating_sub(2);
-    let mut lines: Vec<(String, Runs)> = Vec::new();
-    for (at, (unit, glyph)) in units.into_iter().enumerate() {
+    let mut lines: Vec<(String, Runs, Option<usize>)> = Vec::new();
+    for (at, (unit, glyph, machine)) in units.into_iter().enumerate() {
         for (n, piece) in crate::asks::wrap_whole(&unit, room).into_iter().enumerate() {
+            // A machine that can be clicked stands on rows of its own, so a click on a row opens
+            // exactly the machine on it; the label and This Mac, which open nothing, may share.
             let joins = n == 0
                 && at > 0
-                && lines.last().is_some_and(|(t, _)| {
-                    crate::width::width(t) + 2 + crate::width::width(&piece) <= room
+                && machine.is_none()
+                && lines.last().is_some_and(|(t, _, opens)| {
+                    opens.is_none()
+                        && crate::width::width(t) + 2 + crate::width::width(&piece) <= room
                 });
             if joins {
-                if let Some((text, _)) = lines.last_mut() {
+                if let Some((text, _, _)) = lines.last_mut() {
                     text.push_str("  ");
                 }
             } else {
-                lines.push((String::new(), Vec::new()));
+                lines.push((String::new(), Vec::new(), None));
             }
-            let Some((text, runs)) = lines.last_mut() else {
+            let Some((text, runs, opens)) = lines.last_mut() else {
                 continue;
             };
+            if opens.is_none() {
+                *opens = machine;
+            }
             let from = crate::width::width(text);
             if let Some((mark, ink)) = glyph
                 && let Some(i) = piece.find(mark)
@@ -1851,7 +1874,7 @@ fn computer_rows_with(c: &Column, local: bool) -> Vec<Row> {
     }
     lines
         .into_iter()
-        .map(|(text, runs)| {
+        .map(|(text, runs, opens)| {
             (
                 Line {
                     text: fit(&format!(" {text}"), c.width),
@@ -1859,7 +1882,7 @@ fn computer_rows_with(c: &Column, local: bool) -> Vec<Row> {
                     runs,
                     ..Line::default()
                 },
-                None,
+                opens.map(Hit::Computer),
             )
         })
         .collect()
@@ -2743,9 +2766,8 @@ fn mark_of(c: &Column, agent: &AgentRow, role: crate::theme::Role) -> String {
     state_mark(role, moving, c.tick, c.icons)
 }
 
-/// A state's mark where the column is not the one drawing it (the qass screen's header, the
-/// board's list): the zzz where icons are drawn and the state is asleep, else the two cell
-/// picture.
+/// A state's mark where the column is not the one drawing it (the board's list): the zzz where
+/// icons are drawn and the state is asleep, else the two cell picture.
 pub fn state_mark(role: crate::theme::Role, moving: bool, tick: u64, icons: bool) -> String {
     if icons && role == crate::theme::Role::Sleeping {
         return asleep_mark();
@@ -3176,6 +3198,7 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
     match hit {
         Hit::Terminal(terminal) => Some(Act::Terminal(terminal)),
         Hit::Inbox => Some(Act::Inbox),
+        Hit::Computer(machine) => Some(Act::Computer(machine)),
         Hit::Doze(id) => Some(Act::Doze(id)),
         Hit::Space(id) => {
             // The folded strip is four columns and carries no controls, so a click there
@@ -7438,7 +7461,13 @@ mod tests {
         let said: Vec<String> = rows
             .iter()
             .map(|(l, _)| l.text.trim_end().to_string())
-            .filter(|t| t.contains("computers") || t.contains("This Mac") || t.contains("not "))
+            .filter(|t| {
+                t.contains("computers")
+                    || t.contains("This Mac")
+                    || t.contains("not ")
+                    || t.contains("window opened")
+                    || t.contains("nas")
+            })
             .collect();
         let all = said.join(" | ");
         assert!(all.contains("This Mac \u{25cf}"), "{all}");
@@ -7448,6 +7477,15 @@ mod tests {
             "a machine once: {all}"
         );
         assert!(all.contains("build-node \u{25c6} not reached"), "{all}");
+        // Never seen reached in this window: it says so, whole, and not a time it never had.
+        assert!(
+            all.replace(" | ", " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("since this window opened"),
+            "{all}"
+        );
         assert!(all.contains("pi \u{25cb} not connected"), "{all}");
         assert!(all.contains("nas \u{25cf}"), "{all}");
         // Whole: every row is the column's width and no machine is cut.
@@ -7466,6 +7504,82 @@ mod tests {
         }
     }
 
+    /// The computers line says since when a machine was not reached, from the window's own
+    /// record of when it last answered, and a click on its row opens that machine's screen.
+    #[test]
+    fn the_computers_line_says_since_when_a_machine_was_not_reached_and_opens_it() {
+        let remote = 1i64 << 40;
+        let mut up = space(remote | 1, "build-node:eval");
+        up.link = Some(LinkState::Up);
+        let mut down = space(remote | 1, "build-node:eval");
+        down.link = Some(LinkState::Down);
+        let mut reach = crate::places::Reach::default();
+        reach.note(std::slice::from_ref(&up), 1_763_000_000);
+        reach.note(std::slice::from_ref(&down), 1_763_000_600);
+        let none: Vec<AgentRow> = Vec::new();
+        let spaces = vec![space(1, "app"), down];
+        let c = column_for(&spaces, &none);
+        let rows = computer_rows_with(&c, true, &reach);
+        let said = rows
+            .iter()
+            .map(|(l, _)| l.text.trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let at = {
+            let wall = (qoop_runtime::schedule::system_zone().local)(1_763_000_000);
+            format!("{:02}:{:02}", wall.hour, wall.minute)
+        };
+        assert!(
+            said.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(&format!("not reached since {at}")),
+            "{said}"
+        );
+        // The row that has the machine on it answers its click; This Mac's alone answers none.
+        let machine = crate::mux::machine_of(remote | 1);
+        assert!(
+            rows.iter()
+                .any(|(_, hit)| *hit == Some(Hit::Computer(machine)))
+        );
+        assert_eq!(rows[0].1, None, "the first row names This Mac");
+        assert_eq!(
+            act(Hit::Computer(machine), 3, &c, false),
+            Some(Act::Computer(machine))
+        );
+    }
+
+    /// Each machine that can be clicked stands on rows of its own, so a click on a row opens
+    /// the machine on that row and never another: This Mac, which opens nothing, shares only
+    /// the label's row.
+    #[test]
+    fn every_clickable_machine_has_a_row_and_a_hit_of_its_own() {
+        let on = |machine: i64, id: i64| (machine << 40) | id;
+        let mut build = space(on(1, 1), "build-node:eval");
+        build.link = Some(LinkState::Up);
+        let mut nas = space(on(2, 1), "nas:files");
+        nas.link = Some(LinkState::Up);
+        let spaces = vec![space(1, "app"), build, nas];
+        let none: Vec<AgentRow> = Vec::new();
+        let c = column_for(&spaces, &none);
+        let rows = computer_rows_with(&c, true, &crate::places::Reach::default());
+        let text = |at: usize| rows[at].0.text.trim().to_string();
+        assert_eq!(text(0), "computers  This Mac \u{25cf}");
+        assert_eq!(rows[0].1, None, "This Mac opens nothing");
+        let hits: Vec<(String, Option<Hit>)> = rows
+            .iter()
+            .map(|(l, h)| (l.text.trim().to_string(), *h))
+            .collect();
+        assert_eq!(
+            hits[1..],
+            [
+                ("build-node \u{25cf}".to_string(), Some(Hit::Computer(1))),
+                ("nas \u{25cf}".to_string(), Some(Hit::Computer(2))),
+            ],
+            "{hits:?}"
+        );
+    }
+
     /// An interface attached to remote machines alone has no This Mac to list.
     #[test]
     fn the_computers_line_leaves_out_this_mac_when_the_interface_has_no_daemon_here() {
@@ -7475,7 +7589,7 @@ mod tests {
         let none: Vec<AgentRow> = Vec::new();
         let c = column_for(&spaces, &none);
         let said = |local| {
-            computer_rows_with(&c, local)
+            computer_rows_with(&c, local, &crate::places::Reach::default())
                 .iter()
                 .map(|(l, _)| l.text.trim().to_string())
                 .collect::<Vec<_>>()
@@ -7483,9 +7597,9 @@ mod tests {
         };
         assert_eq!(
             said(true),
-            "computers  This Mac \u{25cf}  build-node \u{25cf}"
+            "computers  This Mac \u{25cf} build-node \u{25cf}"
         );
-        assert_eq!(said(false), "computers  build-node \u{25cf}");
+        assert_eq!(said(false), "computers build-node \u{25cf}");
     }
 
     /// Idle rows are the newest first, the working keep the daemon's order, and a row the

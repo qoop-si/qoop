@@ -435,10 +435,6 @@ pub(crate) fn folder(row: &AgentRow, max: usize) -> String {
     )
 }
 
-/// The most columns a folder takes on a pane's edge before its start gives way to an
-/// ellipsis.
-pub(crate) const MAX_PATH: usize = 20;
-
 /// A folder as a path with the home folder as `~`, and past `max` columns its end: the end
 /// is what tells two worktrees of one repository apart.
 fn path_of(cwd: Option<&str>, home: Option<&str>, max: usize) -> String {
@@ -862,28 +858,6 @@ mod tests {
         assert!(!top.contains("+3") && !top.contains(" +0"), "{top:?}");
     }
 
-    /// The path under a tab: home as `~`, and a long one keeps its end.
-    #[test]
-    fn the_path_under_a_tab_is_home_relative_and_keeps_its_end() {
-        let home = Some("/Users/me");
-        assert_eq!(path_of(Some("/Users/me"), home, MAX_PATH), "~");
-        assert_eq!(path_of(Some("/Users/me/"), home, MAX_PATH), "~");
-        assert_eq!(
-            path_of(Some("/Users/me/coding/wend"), home, MAX_PATH),
-            "~/coding/wend"
-        );
-        assert_eq!(
-            path_of(Some("/Users/meg/a"), home, MAX_PATH),
-            "/Users/meg/a"
-        );
-        assert_eq!(path_of(Some("/"), home, MAX_PATH), "/");
-        assert_eq!(path_of(None, home, MAX_PATH), "");
-        assert_eq!(path_of(Some("  "), home, MAX_PATH), "");
-        let long = path_of(Some("/Users/me/coding/qoop-wt-events-log"), home, MAX_PATH);
-        assert_eq!(long, "\u{2026}/qoop-wt-events-log");
-        assert_eq!(crate::width::width(&long), MAX_PATH);
-    }
-
     /// A folder cut to its tab gives way at a separator, never mid-name.
     #[test]
     fn a_cut_folder_gives_way_at_a_separator() {
@@ -1044,5 +1018,30 @@ mod tests {
         let line = render(&[], 1, 10);
         assert_eq!(line.text, "  +       ");
         assert_eq!(hit(&[], 1, 10, 1, 0), Some(Hit::New));
+    }
+
+    /// The widest path a test names under a tab.
+    const PATH_MAX: usize = 20;
+
+    /// The path under a tab: home as `~`, and a long one keeps its end.
+    #[test]
+    fn the_path_under_a_tab_is_home_relative_and_keeps_its_end() {
+        let home = Some("/Users/me");
+        assert_eq!(path_of(Some("/Users/me"), home, PATH_MAX), "~");
+        assert_eq!(path_of(Some("/Users/me/"), home, PATH_MAX), "~");
+        assert_eq!(
+            path_of(Some("/Users/me/coding/wend"), home, PATH_MAX),
+            "~/coding/wend"
+        );
+        assert_eq!(
+            path_of(Some("/Users/meg/a"), home, PATH_MAX),
+            "/Users/meg/a"
+        );
+        assert_eq!(path_of(Some("/"), home, PATH_MAX), "/");
+        assert_eq!(path_of(None, home, PATH_MAX), "");
+        assert_eq!(path_of(Some("  "), home, PATH_MAX), "");
+        let long = path_of(Some("/Users/me/coding/qoop-wt-events-log"), home, PATH_MAX);
+        assert_eq!(long, "\u{2026}/qoop-wt-events-log");
+        assert_eq!(crate::width::width(&long), PATH_MAX);
     }
 }

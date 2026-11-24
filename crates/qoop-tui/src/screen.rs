@@ -151,25 +151,6 @@ pub struct Chrome<'a> {
     pub drag: Option<&'a DragPaint>,
     /// The keyboard's hold on the column: its filter and the row it stands on.
     pub nav: Option<&'a sidebar::Nav>,
-    /// The pane is qass's screen: a header over qass's terminal in a box, or over qass's
-    /// split tab (the board above qass). Set only while one of those has the keyboard, by the
-    /// one place that knows (`State::qass_header`).
-    pub qass: Option<crate::qass_screen::Ui>,
-    /// The question inbox, as this client keeps it, while qass's screen is up.
-    pub asks: Option<&'a crate::asks::Pane>,
-    /// The schedules ("on the clock"), as this client keeps them, while qass's screen is up.
-    pub clock: Option<&'a crate::schedules::Pane>,
-    /// Where the questions are drawn on qass's split tab: cut from the board beside it, or
-    /// over the board's tile. The tree knows where the board is, so the client says.
-    pub questions: Option<crate::qass_screen::Side>,
-    /// qass's rail while a pane is folded: the tabs, one per folded pane.
-    pub rail: Option<RailPaint>,
-    /// The handle on the divider of qass's split tab, in ember.
-    pub handle: Option<crate::qass_screen::Handle>,
-    /// The handle on the questions' own edge, beside the board, in ember too.
-    pub questions_handle: Option<crate::qass_screen::Handle>,
-    /// qass's split tab: whose titles fold their pane, and the pane folded.
-    pub fold: Option<FoldPaint>,
     /// A plugin's agent view, the agents it shows in its order (`sidebar::Column::order`).
     pub agent_order: Option<&'a crate::plugins::AgentView>,
     /// The reserved lines of the tab on screen, one under each agent pane (`crate::tabq`).
@@ -198,35 +179,6 @@ pub struct Next {
     pub says: &'static str,
     /// Failed, so the line wears the failed ink.
     pub failed: bool,
-}
-
-/// qass's rail, in pane cells: its tabs start at (`x`, `y`) and are `w` wide, one row per pane in
-/// screen order; the rail runs `rows` rows down from `y`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RailPaint {
-    pub x: usize,
-    pub y: usize,
-    pub rows: usize,
-    pub w: usize,
-    pub panes: [Option<crate::rail::Pane>; 3],
-}
-
-impl RailPaint {
-    /// The folded panes in screen order.
-    pub fn tabs(&self) -> Vec<crate::rail::Pane> {
-        self.panes.iter().flatten().copied().collect()
-    }
-}
-
-/// qass's tab with the board, for its titles and the rail: the two panes a click on the title
-/// folds, the one folded to its strip, and whether qass's top edge carries its folder (the
-/// tab bar's path, which the header took the place of).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FoldPaint {
-    pub board: u32,
-    pub qass: u32,
-    pub folded: Option<u32>,
-    pub path: bool,
 }
 
 /// A pane's name on its top edge, the one its row in the column shows: on qass's tab with the
@@ -290,14 +242,6 @@ impl Default for Chrome<'_> {
             list_scroll: None,
             drag: None,
             nav: None,
-            qass: None,
-            asks: None,
-            clock: None,
-            questions: None,
-            rail: None,
-            handle: None,
-            questions_handle: None,
-            fold: None,
             agent_order: None,
             tab_lines: Vec::new(),
             list: &NO_LIST,
@@ -367,10 +311,11 @@ pub enum KeyContext {
     Sidebar,
     /// `ctrl-a` is down and the next key is a command: every command there is.
     Prefix,
-    /// qass's tab with the board: its titles fold their panes, and the keys that fold.
-    Qass,
     /// The Inbox is open over the pane: its own keys.
     Inbox,
+    /// A place beside the Inbox (qass's ledger, a computer, the new agent box) has the pane:
+    /// it lists its own keys on its last rows.
+    Place,
 }
 
 /// One entry of the key row: the key, what it does, and how soon it goes when the row
@@ -406,16 +351,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("b", Some("hide column"), 5),
             ("d", Some("detach"), 0),
         ],
-        KeyContext::Qass => &[
-            ("click title", Some("fold or open"), 1),
-            ("ctrl-a:", None, 0),
-            ("T", Some("fold pane"), 2),
-            ("i", Some("inbox"), 2),
-            ("t", Some("chat"), 3),
-            ("space", Some("find"), 3),
-            ("?", Some("keys"), 4),
-            ("d", Some("detach"), 0),
-        ],
+        KeyContext::Place => &[("esc", Some("back"), 0)],
         KeyContext::Inbox => &[
             ("inbox:", None, 0),
             ("1-9", Some("answer"), 1),
@@ -424,7 +360,9 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("h", Some("hand to qass"), 3),
             ("r", Some("reply"), 3),
             ("f", Some("from qass"), 4),
-            ("j k", Some("move"), 5),
+            ("tab", Some("board"), 4),
+            ("n", Some("new agent"), 5),
+            ("j k", Some("move"), 6),
             ("esc", Some("back"), 0),
         ],
         // Grouped as the keys box groups them, under the same names, so the row and the
@@ -435,8 +373,8 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("n/p", Some("next/prev"), 1),
             ("x", Some("close"), 2),
             ("P", Some("save"), 5),
-            ("T", Some("fold pane"), 2),
             ("i", Some("inbox"), 1),
+            ("Q", Some("qass"), 2),
             ("r", Some("rename"), 4),
             ("t", Some("chat"), 4),
             ("1..9", Some("go to"), 6),
@@ -476,10 +414,6 @@ pub struct Place {
     pub collapsed: bool,
     /// The tab the keyboard is in is split, zoomed or not, so the pane keys do something.
     pub panes: bool,
-    /// qass's screen or its split tab: its questions open and its box zooms.
-    pub qass: bool,
-    /// qass's split tab with the board, the one place its pane folds.
-    pub qass_split: bool,
     /// Another space awake in the column, so `s` has somewhere to go.
     pub spaces: bool,
     /// The focused terminal is an agent's, the only kind `t` shows as a chat.
@@ -505,8 +439,7 @@ fn works(context: KeyContext, key: &str, place: Place) -> bool {
     }
     match key {
         "f" => place.fold,
-        "T" => place.qass_split,
-        "z" => place.panes || place.qass,
+        "z" => place.panes,
         "o" | "e" | "=" => place.panes,
         "s/S" => place.spaces,
         "t" => place.chat,
@@ -682,12 +615,10 @@ pub fn pane_size_for(
     )
 }
 
-/// Whether the pane area paints as tiles inside their frame: always, but for qass's lone box,
-/// which draws its own. One pane is a tile like any split one, in the same blank margin, with no
-/// line drawn round it.
+/// Whether the pane area paints as tiles inside their frame. One pane is a tile like any split
+/// one, in the same blank margin, with no line drawn round it.
 fn tiled(frame: &Frame) -> bool {
-    frame.tiles.len() >= 2
-        || (frame.tiles.len() == 1 && (frame.chrome.qass.is_none() || qass_plan(frame).is_none()))
+    !frame.tiles.is_empty()
 }
 
 /// The size a lone pane's terminal is given in a window of `cols` by `lines`: the pane inside
@@ -702,90 +633,6 @@ pub fn lone_pane_size(cols: u16, lines: u16) -> (u16, u16) {
         rows: pane_rows as usize,
     });
     (framed.cols as u16, framed.rows as u16)
-}
-
-/// The qass screen's plan for this frame's pane, when the pane is qass's screen and big
-/// enough to frame.
-pub(crate) fn qass_plan(frame: &Frame) -> Option<crate::qass_screen::Plan> {
-    let ui = frame.chrome.qass?;
-    let (cols, rows) = pane_size_for(
-        frame.cols,
-        frame.lines,
-        frame.collapsed,
-        0,
-        frame.sidebar_width,
-    );
-    // qass's split tab: the header over its panes, which draw their own edges, and the
-    // questions where the tree put them.
-    if frame.tiles.len() >= 2 {
-        return crate::qass_screen::Plan::band(cols as usize, rows as usize).map(|plan| {
-            crate::qass_screen::Plan {
-                side: frame.chrome.questions,
-                ..plan.with_clock(ui.clock)
-            }
-        });
-    }
-    crate::qass_screen::Plan::new(cols as usize, rows as usize, ui.zoomed, ui.inbox)
-        .map(|plan| plan.with_clock(ui.clock))
-}
-
-/// qass's screen painted for this frame, with its plan, when the pane is qass's and qass has
-/// a tab to speak for.
-pub(crate) fn qass_screen_of(
-    frame: &Frame,
-    pet: Option<&qoop_runtime::avatar::Avatar>,
-    spotlight: bool,
-) -> Option<(crate::qass_screen::Plan, crate::qass_screen::Screen)> {
-    let plan = qass_plan(frame)?;
-    let facts = crate::qass_screen::facts(
-        frame.rows,
-        frame.spaces,
-        frame.focused,
-        frame.chrome.asks.and_then(|asks| asks.count()),
-    )?;
-    let ctx = crate::qass_screen::Ctx {
-        pet,
-        colour: crate::colorlevel::level() != crate::colorlevel::Level::Mono,
-        icons: crate::icons::on(),
-        tick: frame.tick,
-        now: frame.now_unix,
-        fade: spotlight,
-    };
-    let wake_at = frame.chrome.qass.and_then(|ui| ui.wake_at);
-    let mut screen = crate::qass_screen::Screen::new(plan, &facts, wake_at, ctx);
-    if let (Some(side), Some(asks)) = (plan.side, frame.chrome.asks) {
-        let seen = crate::asks::Ctx {
-            rows: frame.rows,
-            spaces: frame.spaces,
-            now_unix: frame.now_unix,
-            fade: spotlight,
-            // The board is already a pane of qass's tab: no tab of the inbox's own for it.
-            board_above: frame.tiles.len() >= 2,
-            tab: None,
-        };
-        let view = crate::asks::view(asks, &seen, side.rect.cols, side.rect.rows);
-        screen = screen.with_inbox(view.rows);
-    }
-    if let (Some(clock), Some(pane)) = (plan.clock, frame.chrome.clock) {
-        let view = crate::schedules::view(
-            pane,
-            &clock_ctx(frame, spotlight),
-            clock.rect.cols,
-            clock.rect.rows,
-        );
-        screen = screen.with_clock(view.rows);
-    }
-    Some((plan, screen))
-}
-
-/// What the "on the clock" panel is painted with: this frame's clock, in the machine's zone
-/// (the one the daemon words its times in).
-pub(crate) fn clock_ctx(frame: &Frame, fade: bool) -> crate::schedules::Ctx {
-    crate::schedules::Ctx {
-        now_unix: frame.now_unix,
-        zone: qoop_runtime::schedule::system_zone(),
-        fade,
-    }
 }
 
 /// The columns spent before the pane starts: the left column and the rule beside it, or
@@ -1020,24 +867,14 @@ fn edge_grid(frame: &Frame, cols: usize, rows: usize) -> Vec<Vec<Option<(char, E
         .iter()
         .map(|line| (line.rect, line.terminal == frame.focused))
         .collect();
-    let mut edges = pane_edges(
+    pane_edges(
         &frame.tiles,
         &rails,
         frame.rows,
         focus_ink(frame),
         cols,
         rows,
-    );
-    if let Some(fold) = frame.chrome.fold {
-        put_fold_titles(&mut edges, &frame.tiles, frame.rows, fold);
-    }
-    if let Some(handle) = frame.chrome.handle {
-        put_handle(&mut edges, handle);
-    }
-    if let Some(handle) = frame.chrome.questions_handle {
-        put_handle(&mut edges, handle);
-    }
-    edges
+    )
 }
 
 /// The park label opening the notice row, for a pane with no corners (one pane alone), in
@@ -1166,8 +1003,7 @@ pub(crate) fn picture_cell(frame: &Frame) -> Option<(usize, usize)> {
     }
     let left = left_for(frame.cols, frame.collapsed, frame.sidebar_width);
     if !tiled(frame) {
-        let (y, x) = qass_plan(frame).map_or((0, 0), |p| (p.inner.y, p.inner.x));
-        return Some((TABS + 1 + y, left + 1 + x));
+        return Some((TABS + 1, left + 1));
     }
     let t = frame.tiles.iter().find(|t| t.focused)?;
     Some((TABS + 1 + t.rect.y, left + 1 + t.rect.x))
@@ -1188,38 +1024,22 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
         0,
         frame.sidebar_width,
     );
-    // The keyboard is in the inbox: its own caret is drawn, and the chat's is not.
-    if frame.chrome.asks.is_some_and(|asks| asks.focus)
-        && qass_plan(frame).is_some_and(|p| p.side.is_some())
-    {
-        return None;
-    }
-    // The same for the schedules: their form draws its own caret.
-    if frame.chrome.clock.is_some_and(|clock| clock.focus)
-        && qass_plan(frame).is_some_and(|p| p.clock.is_some())
-    {
-        return None;
-    }
     if !tiled(frame) {
         let (row, cell) = snapshot.cursor;
         let col = cursor_column(
             snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
             cell,
         );
-        // Inside qass's box, the cursor is offset by the header and the frame.
-        let (area, y, x) = match qass_plan(frame) {
-            Some(p) => (p.inner, p.inner.y, p.inner.x),
-            None => (
-                layout::Rect {
-                    x: 0,
-                    y: 0,
-                    cols: pane_cols as usize,
-                    rows: pane_rows as usize,
-                },
-                0,
-                0,
-            ),
-        };
+        let (area, y, x) = (
+            layout::Rect {
+                x: 0,
+                y: 0,
+                cols: pane_cols as usize,
+                rows: pane_rows as usize,
+            },
+            0,
+            0,
+        );
         let row = row.min(area.rows - 1) + y + 1 + TABS;
         let col = col.min(area.cols - 1)
             + x
@@ -1342,17 +1162,6 @@ pub fn paint(frame: &Frame) -> String {
     // The pet stands on the foot of the column. Read once per frame so the
     // reservation below and the overlay further down paint the same pet.
     let avatar = sidebar::current_avatar();
-    let qass = qass_screen_of(frame, avatar.as_ref(), spotlight);
-    // qass's full header stands in the tab bar's rows: its screen goes without the tabs.
-    let above: Vec<&str> = qass
-        .as_ref()
-        .map(|(_, screen)| (0..TABS).map_while(|i| screen.above(i)).collect())
-        .unwrap_or_default();
-    for (at_row, header) in above.iter().enumerate() {
-        out.push_str(&at(at_row + 1, left + 1));
-        out.push_str(header);
-        out.push_str(theme::RESET);
-    }
 
     // The tab bar, over the pane and only over the pane. It starts where the pane starts,
     // past the column and its rule. Split panes are sub-terminals, never top tabs.
@@ -1362,7 +1171,6 @@ pub fn paint(frame: &Frame) -> String {
     for (at_row, pieces) in tabs::painted(&tabs, focused_tab, pane_cols as usize)
         .into_iter()
         .enumerate()
-        .filter(|_| above.is_empty())
     {
         out.push_str(&at(at_row + 1, left + 1));
         for (piece, style) in pieces {
@@ -1403,32 +1211,8 @@ pub fn paint(frame: &Frame) -> String {
     // The lines around split panes, worked out once for the whole frame, and the park mark
     // against the focused corner when it stands there.
     let mut edges = edge_grid(frame, pane_cols as usize, pane_rows as usize);
-    // The rows qass paints itself from the pane's first column: its lone box whole, or on its
-    // split tab the header over the panes and the schedules under them. Painted ahead, so the
-    // rule can take their left side over just as it does the split panes'.
-    let mut qass_rows: Vec<Option<String>> = match &qass {
-        Some((plan, screen)) => (0..pane_rows as usize)
-            .map(|pane_row| {
-                if !tiled(frame) {
-                    Some(qass_box_row(frame, plan, screen, pane_row))
-                } else if pane_row < plan.header.rows() {
-                    Some(screen.row(pane_row, |_| String::new()))
-                } else {
-                    screen.clock_row(pane_row)
-                }
-            })
-            .collect(),
-        None => Vec::new(),
-    };
     let rule_side = if wide_enough {
-        let panes = take_left_side(&mut edges);
-        let qass = take_left_cells(&mut qass_rows);
-        (0..pane_rows as usize)
-            .map(|at| match qass_rows.get(at) {
-                Some(Some(_)) => qass[at].clone(),
-                _ => panes.get(at).cloned().flatten(),
-            })
-            .collect()
+        take_left_side(&mut edges)
     } else {
         Vec::new()
     };
@@ -1446,11 +1230,6 @@ pub fn paint(frame: &Frame) -> String {
             *cell = Some((c, ink));
         }
     }
-    // qass's rail: its rows, painted over the cells the tree left for it.
-    let rail_rows = frame
-        .chrome
-        .rail
-        .map(|rail| rail_rows_of(frame, &rail, spotlight));
     // Each agent pane's reserved line: its row, over the cells its tile left for it.
     let tab_line_rows: Vec<(layout::Rect, String)> = frame
         .chrome
@@ -1539,6 +1318,7 @@ pub fn paint(frame: &Frame) -> String {
                     | sidebar::Hit::Foot
                     | sidebar::Hit::Pet(_)
                     | sidebar::Hit::Eye(_)
+                    | sidebar::Hit::Computer(_)
                     | sidebar::Hit::Inbox,
                 )
                 | None => false,
@@ -1649,13 +1429,8 @@ pub fn paint(frame: &Frame) -> String {
         // of the live screen, so a person reading upwards sees one continuous terminal
         // rather than two. The rows behind it are text alone: what was written to disk is
         // rows, and colour there would be a second format nobody reads back.
-        // Tiled rows for every pane in its frame; the plain path for qass's lone box, which
-        // draws its own, and a frame with no tile at all.
+        // Tiled rows for every pane in its frame; the plain path for a frame with no tile.
         if !tiled(frame) {
-            if let Some(Some(row)) = qass_rows.get(pane_row) {
-                out.push_str(row);
-                continue;
-            }
             let (line, spans) = window_row(
                 frame.snapshot,
                 frame.behind,
@@ -1675,37 +1450,7 @@ pub fn paint(frame: &Frame) -> String {
                 selected,
             ));
         } else {
-            // qass's header over its split: the rows above the panes.
-            if let Some((plan, _)) = &qass
-                && pane_row < plan.header.rows()
-            {
-                out.push_str(qass_rows[pane_row].as_deref().unwrap_or_default());
-                continue;
-            }
-            // The questions beside the board, or over its tile: the panes paint first, the
-            // questions over their own cells, so qass's tile is never lost under them.
-            let inbox = qass
-                .as_ref()
-                .and_then(|(plan, screen)| Some((plan.side?, screen.inbox_row(pane_row)?)));
             paint_tiled_row(frame, &edges, pane_row, pane_cols as usize, left, &mut out);
-            if let Some((side, row)) = inbox {
-                out.push_str(&at(pane_row + TABS + 1, left + 1 + side.rect.x));
-                out.push_str(&row);
-            }
-            // The schedules under the panes, in the rows the tree leaves free.
-            if let Some((plan, _)) = &qass
-                && let Some(clock) = plan.clock
-                && let Some(Some(row)) = qass_rows.get(pane_row)
-            {
-                out.push_str(&at(pane_row + TABS + 1, left + 1 + clock.rect.x));
-                out.push_str(row);
-            }
-            if let (Some(rail), Some(rows)) = (frame.chrome.rail, &rail_rows)
-                && let Some(row) = pane_row.checked_sub(rail.y).and_then(|at| rows.get(at))
-            {
-                out.push_str(&at(pane_row + TABS + 1, left + 1 + rail.x));
-                out.push_str(row);
-            }
             for (rect, row) in &tab_line_rows {
                 if pane_row == rect.y {
                     out.push_str(&at(pane_row + TABS + 1, left + 1 + rect.x));
@@ -1861,8 +1606,6 @@ pub fn paint(frame: &Frame) -> String {
                     let tab = tab_of(frame.focused, &frame.panes);
                     frame.panes.values().any(|&of| of == tab)
                 },
-                qass: frame.chrome.qass.is_some(),
-                qass_split: frame.chrome.fold.is_some(),
                 // The way `s` walks: the column's spaces, qass's own left out, the asleep
                 // skipped.
                 spaces: sidebar::shown(frame.spaces, frame.rows)
@@ -1888,10 +1631,7 @@ pub fn paint(frame: &Frame) -> String {
     // covers terminal text.
     if let Some(notice) = frame.image_notice {
         let (tile_x, tile_y, tile_cols, tile_rows) = if !tiled(frame) {
-            match qass_plan(frame) {
-                Some(p) => (p.inner.x, p.inner.y, p.inner.cols, p.inner.rows),
-                None => (0, 0, pane_cols as usize, pane_rows as usize),
-            }
+            (0, 0, pane_cols as usize, pane_rows as usize)
         } else if let Some(tile) = frame.tiles.iter().find(|t| t.focused) {
             (tile.rect.x, tile.rect.y, tile.rect.cols, tile.rect.rows)
         } else {
@@ -1955,11 +1695,7 @@ pub fn paint(frame: &Frame) -> String {
     // types appears where they are looking. With the palette open it sits at the end of
     // the query instead, because that is where typing goes. While a box or the questions
     // hold the keyboard the child's caret is not where typing goes, so it is not shown.
-    let held = frame.menu.is_some()
-        || confirm.is_some()
-        || frame.reading.is_some()
-        || frame.chrome.asks.is_some_and(|asks| asks.focus)
-        || frame.chrome.clock.is_some_and(|clock| clock.focus);
+    let held = frame.menu.is_some() || confirm.is_some() || frame.reading.is_some();
     if let Some(prompt) = frame.prompt {
         // At the end of what has been typed, as much of it as the field shows, or at the
         // start of an empty field before the faint name it keeps.
@@ -3084,7 +2820,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("c", "new tab"),
             ("r", "rename tab"),
             ("x/P", "close, save"),
-            ("i/T", "inbox, fold"),
+            ("i", "the Inbox"),
         ],
     ),
     (
@@ -3095,7 +2831,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("w", "new space"),
             ("W", "close empty"),
             ("R", "settings"),
-            ("Q/C", "qass, schedules"),
+            ("Q", "qass ledger"),
             ("Z", "sleep, wake"),
             ("f", "fold"),
             ("g", "tree/priority"),
@@ -3426,25 +3162,6 @@ fn paint_box(
 pub(crate) const RESIZE_HINT: &[(&str, &str)] = &[
     ("hjkl", "move 5%"),
     ("HJKL", "20%"),
-    ("=", "equalize"),
-    ("esc", "done"),
-];
-
-/// Resize mode's keys on qass's tab, where `s` puts the board and qass on each other's side.
-pub(crate) const RESIZE_BOARD_HINT: &[(&str, &str)] = &[
-    ("hjkl", "move 5%"),
-    ("HJKL", "20%"),
-    ("s", "swap sides"),
-    ("=", "equalize"),
-    ("esc", "done"),
-];
-
-/// The same with the questions beside the board: `<` and `>` take them narrower and wider.
-pub(crate) const RESIZE_QUESTIONS_HINT: &[(&str, &str)] = &[
-    ("hjkl", "move 5%"),
-    ("HJKL", "20%"),
-    ("<>", "questions"),
-    ("s", "swap sides"),
     ("=", "equalize"),
     ("esc", "done"),
 ];
@@ -3814,139 +3531,6 @@ fn covers(frame: &Frame, x: usize, pane_row: usize) -> bool {
     })
 }
 
-/// The rail's painted rows, one per pane row it covers: the tabs built from the same facts the
-/// header's chip says, and under them what waits.
-fn rail_rows_of(frame: &Frame, rail: &RailPaint, fade: bool) -> Vec<String> {
-    use crate::rail::{Pane, Preview, Tab};
-    let facts = crate::qass_screen::facts(
-        frame.rows,
-        frame.spaces,
-        frame.focused,
-        frame.chrome.asks.and_then(|asks| asks.count()),
-    );
-    let asks = facts.as_ref().map_or(0, |f| f.asks);
-    let said = facts.as_ref().map(crate::qass_screen::say);
-    let panes = rail.tabs();
-    let tabs: Vec<Tab> = panes
-        .iter()
-        .map(|pane| match pane {
-            Pane::Board => Tab {
-                pane: *pane,
-                count: None,
-                state: None,
-                dot: theme::Role::Detail,
-            },
-            Pane::Questions => Tab {
-                pane: *pane,
-                // Its count is its state: `questions 2`, the word the header's chip says.
-                count: Some(asks),
-                state: None,
-                dot: if asks > 0 {
-                    theme::Role::Blocked
-                } else {
-                    theme::Role::Faint
-                },
-            },
-            Pane::Qass => Tab {
-                pane: *pane,
-                count: None,
-                state: said.as_ref().map(|s| s.word.clone()),
-                dot: said.as_ref().map_or(theme::Role::Idle, |s| s.role),
-            },
-        })
-        .collect();
-    let card = frame
-        .chrome
-        .asks
-        .and_then(|pane| pane.live.iter().find(|c| c.status == "open"));
-    let preview = card
-        .filter(|_| {
-            asks > 0 && panes.contains(&Pane::Questions) && frame.chrome.questions.is_none()
-        })
-        .map(|c| Preview {
-            count: asks,
-            title: c.body.asks.clone(),
-            agent: c.body.handle.clone(),
-        });
-    crate::rail::rows(rail.rows, rail.w, &tabs, preview.as_ref(), fade)
-}
-
-/// One row of qass's screen: its header and the frame around its terminal, whose rows are the
-/// box's inside, counted from its first.
-fn qass_box_row(
-    frame: &Frame,
-    plan: &crate::qass_screen::Plan,
-    screen: &crate::qass_screen::Screen,
-    pane_row: usize,
-) -> String {
-    screen.row(pane_row, |local| {
-        let (line, spans) = window_row(
-            frame.snapshot,
-            frame.behind,
-            frame.scroll,
-            frame.anchor,
-            local,
-        );
-        let selected = frame
-            .selection
-            .and_then(|s| s.columns_on(local, plan.inner.cols));
-        pane_row_paint(
-            frame,
-            line,
-            spans,
-            links_of(frame.snapshot),
-            plan.inner.cols,
-            selected,
-        )
-    })
-}
-
-/// [`take_left_side`] for rows qass paints itself: the first cell after the row's leading
-/// escapes is taken the same way, and the rule wears those escapes.
-fn take_left_cells(rows: &mut [Option<String>]) -> Vec<Option<(bool, String)>> {
-    rows.iter_mut()
-        .map(|row| {
-            let row = row.as_mut()?;
-            let at = escapes_len(row);
-            let glyph = row[at..].chars().next()?;
-            let (right, with) = match glyph {
-                '\u{2502}' => (false, ' '),
-                '\u{256d}' | '\u{2570}' | '\u{251c}' | '\u{2500}' => (true, '\u{2500}'),
-                _ => return None,
-            };
-            let style = row[..at].to_string();
-            row.replace_range(at..at + glyph.len_utf8(), with.encode_utf8(&mut [0; 4]));
-            Some((right, style))
-        })
-        .collect()
-}
-
-/// How many bytes of escapes (CSI and OSC) `row` starts with.
-fn escapes_len(row: &str) -> usize {
-    let bytes = row.as_bytes();
-    let mut at = 0;
-    while bytes.get(at) == Some(&0x1b) {
-        match bytes.get(at + 1) {
-            Some(b'[') => {
-                at += 2;
-                while bytes.get(at).is_some_and(|b| !(0x40..=0x7e).contains(b)) {
-                    at += 1;
-                }
-                at += 1;
-            }
-            Some(b']') => {
-                at += 2;
-                while at < bytes.len() && bytes[at] != 0x07 && !bytes[at..].starts_with(b"\x1b\\") {
-                    at += 1;
-                }
-                at += if bytes.get(at) == Some(&0x07) { 1 } else { 2 };
-            }
-            _ => break,
-        }
-    }
-    at.min(row.len())
-}
-
 /// The column's rule stands right beside the pane area's first column, where the panes' left
 /// side would draw a second line next to it. The rule takes that side over: the first column's
 /// side cells go blank and its corners and joints become the start of their line. Per area
@@ -3971,8 +3555,6 @@ fn take_left_side(edges: &mut [Vec<Option<(char, EdgeInk)>>]) -> Vec<Option<(boo
 /// How a cell of the marks around split panes is painted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EdgeInk {
-    /// The handle and the fold's caret, in the brand's ember.
-    Lit,
     /// The frame round a pane the keyboard is not in: a quiet line.
     Line,
     /// The frame round the focused pane, in its space's ink.
@@ -4114,89 +3696,6 @@ fn pane_edges(
     grid
 }
 
-/// qass's tab with the board: the titles of the board and qass rewritten behind the caret that
-/// folds them, and qass's folder on the right of its top edge, two cells in from its corner.
-fn put_fold_titles(
-    grid: &mut [Vec<Option<(char, EdgeInk)>>],
-    tiles: &[Tile],
-    agents: &[AgentRow],
-    fold: FoldPaint,
-) {
-    for tile in tiles
-        .iter()
-        .filter(|t| t.terminal == fold.board || t.terminal == fold.qass)
-    {
-        let r = tile.rect;
-        let (Some(top), Some(agent)) = (
-            r.y.checked_sub(1),
-            agents.iter().find(|a| a.terminal == tile.terminal),
-        ) else {
-            continue;
-        };
-        let room = r.cols.saturating_sub(2);
-        if room < 3 {
-            continue;
-        }
-        let title = pane_title(agent, true);
-        let title = width::fit(&title, width::width(&title).min(room - 2));
-        let ink = if tile.focused {
-            EdgeInk::TitleLit
-        } else {
-            EdgeInk::Title
-        };
-        let mut x = r.x + 1;
-        for c in format!(" {} ", title.trim_end()).chars() {
-            let at_ink = if c == '\u{25be}' { EdgeInk::Lit } else { ink };
-            let wide = width::columns(c) == 2;
-            if let Some(cell) = grid[top].get_mut(x) {
-                *cell = Some((c, at_ink));
-            }
-            // The cell a wide character spills into paints nothing of its own.
-            if wide && let Some(cell) = grid[top].get_mut(x + 1) {
-                *cell = Some(('\0', at_ink));
-            }
-            x += if wide { 2 } else { 1 };
-        }
-        let path = (fold.path && tile.terminal == fold.qass)
-            .then(|| crate::tabs::folder(agent, crate::tabs::MAX_PATH))
-            .filter(|p| !p.is_empty());
-        if let Some(path) = path {
-            let tag = format!(" {path} ");
-            let w = width::width(&tag);
-            if x + 2 + w + 2 <= r.x + r.cols {
-                for (at, c) in (r.x + r.cols - 1 - w..).zip(tag.chars()) {
-                    if let Some(cell) = grid[top].get_mut(at) {
-                        *cell = Some((c, EdgeInk::Title));
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// The handle's cells in the edge grid, in the brand's ember over the frame's straight line; a
-/// cell that holds a name or a joint is left as it is.
-fn put_handle(grid: &mut [Vec<Option<(char, EdgeInk)>>], handle: crate::qass_screen::Handle) {
-    let glyph = if handle.vertical {
-        '\u{2502}'
-    } else {
-        '\u{2500}'
-    };
-    for at in 0..handle.len {
-        let (x, y) = if handle.vertical {
-            (handle.x, handle.y + at)
-        } else {
-            (handle.x + at, handle.y)
-        };
-        if let Some(cell) = grid.get_mut(y).and_then(|row| row.get_mut(x))
-            && bare_line(*cell)
-            && cell.is_none_or(|(c, _)| c == glyph)
-        {
-            *cell = Some((glyph, EdgeInk::Lit));
-        }
-    }
-}
-
 /// The escape for one kind of edge cell: the focused pane's frame in its space's ink, its name
 /// bold in the text's ink, every other frame and name quiet. Bold carries the focus without
 /// colour, which is how every other focus on this screen reads in monochrome.
@@ -4207,9 +3706,8 @@ fn edge_style(ink: EdgeInk) -> String {
         EdgeInk::Quiet => theme::fg(theme::Role::FaintText),
         EdgeInk::Saved => theme::fg(theme::Role::Saved),
         EdgeInk::Line => theme::fg(theme::Role::Rule),
-        EdgeInk::Lit if !mono => theme::fg(theme::Role::Brand),
         EdgeInk::Frame(role) if !mono => theme::fg(role),
-        EdgeInk::Lit | EdgeInk::Frame(_) | EdgeInk::TitleLit => {
+        EdgeInk::Frame(_) | EdgeInk::TitleLit => {
             format!("{}\x1b[1m", theme::fg(theme::Role::Text))
         }
     }
@@ -6431,71 +5929,6 @@ mod tests {
         assert!(!painted.contains("?25h"), "hid cursor shown: {painted:?}");
     }
 
-    /// The menu, the close box and the questions hold the keyboard: the child's caret behind
-    /// them is not where typing goes, so it is neither placed nor shown.
-    #[test]
-    fn a_box_holding_the_keyboard_hides_the_childs_cursor() {
-        let mut snapshot = snapshot(&["$"]);
-        snapshot.cursor = (0, 2);
-        let rows = [row(1, "claude", "working")];
-        let (spaces, seen, unseen) = (spaces(), sidebar::Seen::new(), sidebar::Unseen::new());
-        let behind = crate::run::Behind::default();
-        let mut questions = crate::asks::Pane::new();
-        questions.focus = true;
-        let frame = |menu, closing, asks| Frame {
-            armed: None,
-            drawer: None,
-            rows: &rows,
-            spaces: &spaces,
-            panes: std::collections::BTreeMap::new(),
-            space: Some(1),
-            focused: 1,
-            snapshot: Some(&snapshot),
-            cols: 100,
-            lines: 30,
-            message: None,
-            hint: None,
-            palette: None,
-            prompt: None,
-            menu,
-            collapsed: false,
-            reading: None,
-            selection: None,
-            scroll: 0,
-            tick: 0,
-            now_unix: TEST_NOW,
-            sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Tree,
-            seen: &seen,
-            unseen: &unseen,
-            anchor: 0,
-            rows_back: 0,
-            tiles: Vec::new(),
-            behind: &behind,
-            image_notice: None,
-            toast: None,
-            chrome: Chrome {
-                closing,
-                asks,
-                ..Default::default()
-            },
-        };
-        assert!(paint(&frame(None, None, None)).ends_with("\x1b[?25h"));
-        let menu = Some((0, &crate::run::MenuKind::Main));
-        let keys = Frame {
-            reading: Some(crate::run::Reading::Keybinds),
-            ..frame(None, None, None)
-        };
-        for (what, painted) in [
-            ("menu", paint(&frame(menu, None, None))),
-            ("close box", paint(&frame(None, Some(1), None))),
-            ("questions", paint(&frame(None, None, Some(&questions)))),
-            ("keys", paint(&keys)),
-        ] {
-            assert!(!painted.contains("?25h"), "{what}: {painted:?}");
-        }
-    }
-
     /// Under the floor the screen says how big it must be and how big it is, wrapped on words,
     /// no row wider than the window and none below it.
     #[test]
@@ -6910,57 +6343,6 @@ mod tests {
         assert!(prefix.contains("[r\u{2192}rename]"), "{prefix:?}");
     }
 
-    #[test]
-    fn the_prefix_row_is_grouped_and_offers_only_what_works_here() {
-        let row = |place, cols| strip(&key_row(KeyContext::Prefix, place, cols));
-        let one = row(Place::default(), 400);
-        let tab = one.find("  tab [c\u{2192}new]").expect(&one);
-        let pane = one.find("  pane [v/-\u{2192}split]").expect(&one);
-        let space = one.find("  space [w\u{2192}new]").expect(&one);
-        let general = one.find("  general [space\u{2192}find]").expect(&one);
-        assert!(tab < pane && pane < space && space < general, "{one:?}");
-        // One pane, one space, off qass's tab, priority view: nothing that would be refused.
-        for gone in ["[T", "[z", "[o", "[e", "[=", "[s/S", "[f\u{2192}"] {
-            assert!(
-                !one.contains(gone),
-                "{gone} offered where it does nothing: {one:?}"
-            );
-        }
-        let all = row(
-            Place {
-                fold: true,
-                panes: true,
-                qass: true,
-                qass_split: true,
-                spaces: true,
-                ..Place::default()
-            },
-            400,
-        );
-        for there in [
-            "[T\u{2192}fold pane]",
-            "[z\u{2192}zoom]",
-            "[s/S\u{2192}next/prev]",
-            "[f\u{2192}fold]",
-        ] {
-            assert!(all.contains(there), "{there} missing: {all:?}");
-        }
-        // Short rows drop keys, never leave a name with nothing after it.
-        let names = ["tab", "pane", "space", "general"];
-        for cols in [40usize, 60, 80, 100, 120, 160] {
-            let short = row(Place::default(), cols);
-            let words: Vec<&str> = short.split_whitespace().collect();
-            for (at, word) in words.iter().enumerate() {
-                if names.contains(word) {
-                    let next = words.get(at + 1).copied().unwrap_or("");
-                    assert!(
-                        next.starts_with('['),
-                        "{word} with no key at {cols}: {short:?}"
-                    );
-                }
-            }
-        }
-    }
     /// The way out is the one key a person stuck in here has to be able to read, so it is
     /// never the one the cut takes.
     #[test]
@@ -7071,7 +6453,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 48;
+    const COMMANDS: usize = 46;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -7128,19 +6510,17 @@ mod tests {
             Action::Answer => (const { place(35) }, Some("ctrl-a M")),
             Action::Sleep => (const { place(36) }, Some("ctrl-a Z")),
             Action::UpNext => (const { place(37) }, Some("ctrl-a tab")),
-            Action::Qass => (const { place(38) }, Some("ctrl-a Q/C")),
+            Action::Qass => (const { place(38) }, Some("ctrl-a Q")),
             Action::Agents => (const { place(39) }, Some("ctrl-a a")),
-            Action::Asks => (const { place(40) }, Some("ctrl-a i/T")),
-            Action::Fold => (const { place(41) }, Some("ctrl-a i/T")),
-            Action::Chat => (const { place(42) }, Some("ctrl-a z/t")),
-            Action::ChatRow => (const { place(43) }, Some("ctrl-a enter")),
-            Action::Park => (const { place(44) }, Some("ctrl-a x/P")),
-            Action::Clock => (const { place(45) }, Some("ctrl-a Q/C")),
+            Action::Asks => (const { place(40) }, Some("ctrl-a i")),
+            Action::Chat => (const { place(41) }, Some("ctrl-a z/t")),
+            Action::ChatRow => (const { place(42) }, Some("ctrl-a enter")),
+            Action::Park => (const { place(43) }, Some("ctrl-a x/P")),
             // A right press on a row of the column: the menu says what it offers.
-            Action::Context { .. } => (const { place(46) }, None),
+            Action::Context { .. } => (const { place(44) }, None),
             // Copies a held mouse selection when `copy_on_select` is off: a setting's key, not
             // a line of the overlay, which has no room left at 80 by 24.
-            Action::CopySelection => (const { place(47) }, None),
+            Action::CopySelection => (const { place(45) }, None),
         }
     }
 
@@ -7207,11 +6587,9 @@ mod tests {
             Action::UpNext,
             Action::Agents,
             Action::Asks,
-            Action::Fold,
             Action::Chat,
             Action::ChatRow,
             Action::Park,
-            Action::Clock,
             Action::Context { row: 1, col: 1 },
             Action::CopySelection,
         ];
@@ -9489,46 +8867,113 @@ mod tests {
         assert!(!bare_line(Some(('x', EdgeInk::Title))));
     }
 
-    /// The handle's cells are ember edge cells over the divider only: a cell that holds a name or
-    /// a joint keeps it, a straight line of the frame is lit, and nothing outside it is touched.
+    /// The menu, the close box and the keys list hold the keyboard: the child's caret behind
+    /// them is not where typing goes, so it is neither placed nor shown.
     #[test]
-    fn the_handle_fills_only_free_cells_of_its_line() {
-        use crate::qass_screen::Handle;
-        let mut grid: Vec<Vec<Option<(char, EdgeInk)>>> = vec![vec![None; 10]; 10];
-        grid[4][3] = Some(('x', EdgeInk::Title));
-        grid[5][3] = Some(('\u{2502}', EdgeInk::Line));
-        grid[6][3] = Some(('\u{251c}', EdgeInk::Line));
-        put_handle(
-            &mut grid,
-            Handle {
-                x: 3,
-                y: 2,
-                len: 5,
-                vertical: true,
+    fn a_box_holding_the_keyboard_hides_the_childs_cursor() {
+        let mut snapshot = snapshot(&["$"]);
+        snapshot.cursor = (0, 2);
+        let rows = [row(1, "claude", "working")];
+        let (spaces, seen, unseen) = (spaces(), sidebar::Seen::new(), sidebar::Unseen::new());
+        let behind = crate::run::Behind::default();
+        let frame = |menu, closing| Frame {
+            armed: None,
+            drawer: None,
+            rows: &rows,
+            spaces: &spaces,
+            panes: std::collections::BTreeMap::new(),
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 100,
+            lines: 30,
+            message: None,
+            hint: None,
+            palette: None,
+            prompt: None,
+            menu,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
+            view: sidebar::View::Tree,
+            seen: &seen,
+            unseen: &unseen,
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &behind,
+            image_notice: None,
+            toast: None,
+            chrome: Chrome {
+                closing,
+                ..Default::default()
             },
-        );
-        let column: Vec<_> = (0..10).map(|y| grid[y][3]).collect();
-        assert_eq!(column[2], Some(('\u{2502}', EdgeInk::Lit)));
-        assert_eq!(column[3], Some(('\u{2502}', EdgeInk::Lit)));
-        assert_eq!(column[4], Some(('x', EdgeInk::Title)), "a name is kept");
-        assert_eq!(column[5], Some(('\u{2502}', EdgeInk::Lit)), "a line is lit");
-        assert_eq!(
-            column[6],
-            Some(('\u{251c}', EdgeInk::Line)),
-            "a joint is kept"
-        );
-        assert_eq!((column[1], column[7]), (None, None), "only its own cells");
-        assert!(grid.iter().flatten().filter(|c| c.is_some()).count() == 5);
-        // A row of it, off the edge of the grid: clipped, no panic.
-        put_handle(
-            &mut grid,
-            Handle {
-                x: 8,
-                y: 9,
-                len: 6,
-                vertical: false,
+        };
+        assert!(paint(&frame(None, None)).ends_with("\x1b[?25h"));
+        let menu = Some((0, &crate::run::MenuKind::Main));
+        let keys = Frame {
+            reading: Some(crate::run::Reading::Keybinds),
+            ..frame(None, None)
+        };
+        for (what, painted) in [
+            ("menu", paint(&frame(menu, None))),
+            ("close box", paint(&frame(None, Some(1)))),
+            ("keys", paint(&keys)),
+        ] {
+            assert!(!painted.contains("?25h"), "{what}: {painted:?}");
+        }
+    }
+
+    #[test]
+    fn the_prefix_row_is_grouped_and_offers_only_what_works_here() {
+        let row = |place, cols| strip(&key_row(KeyContext::Prefix, place, cols));
+        let one = row(Place::default(), 400);
+        let tab = one.find("  tab [c\u{2192}new]").expect(&one);
+        let pane = one.find("  pane [v/-\u{2192}split]").expect(&one);
+        let space = one.find("  space [w\u{2192}new]").expect(&one);
+        let general = one.find("  general [space\u{2192}find]").expect(&one);
+        assert!(tab < pane && pane < space && space < general, "{one:?}");
+        // One pane, one space, priority view: nothing that would be refused.
+        for gone in ["[z", "[o", "[e", "[=", "[s/S", "[f\u{2192}"] {
+            assert!(
+                !one.contains(gone),
+                "{gone} offered where it does nothing: {one:?}"
+            );
+        }
+        let all = row(
+            Place {
+                fold: true,
+                panes: true,
+                spaces: true,
+                ..Place::default()
             },
+            400,
         );
-        assert_eq!(grid[9][9], Some(('\u{2500}', EdgeInk::Lit)));
+        for there in [
+            "[z\u{2192}zoom]",
+            "[s/S\u{2192}next/prev]",
+            "[f\u{2192}fold]",
+        ] {
+            assert!(all.contains(there), "{there} missing: {all:?}");
+        }
+        // Short rows drop keys, never leave a name with nothing after it.
+        let names = ["tab", "pane", "space", "general"];
+        for cols in [40usize, 60, 80, 100, 120, 160] {
+            let short = row(Place::default(), cols);
+            let words: Vec<&str> = short.split_whitespace().collect();
+            for (at, word) in words.iter().enumerate() {
+                if names.contains(word) {
+                    let next = words.get(at + 1).copied().unwrap_or("");
+                    assert!(
+                        next.starts_with('['),
+                        "{word} with no key at {cols}: {short:?}"
+                    );
+                }
+            }
+        }
     }
 }

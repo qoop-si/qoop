@@ -567,7 +567,7 @@ pick: B | a column drop cannot be undone
     }
 
     /// The plan card qass copies from its skill must be a card the parser takes: its options
-    /// one a line, approve first, so the phone and qass's screen show A as the main button.
+    /// one a line, approve first, so the phone, the desktop and the Inbox show A as the main button.
     /// No option's words hold a slot qass cannot fill when it writes the card (his words come
     /// with his answer): only the item's key.
     #[test]
