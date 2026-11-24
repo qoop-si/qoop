@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.21.2](https://github.com/qoop-si/qoop/compare/v0.21.1...v0.21.2) (2026-11-24)
+
+
+### Fixed
+
+* **desktop:** send the macOS word and line keys to the terminal ([8457bde](https://github.com/qoop-si/qoop/commit/8457bdefe7c49a898c04f8177f0790801480ab14))
+* **desktop:** wrap the text field and move it by word ([a6e6826](https://github.com/qoop-si/qoop/commit/a6e6826c1b1f8a435fac97dde6967d9e901b4c84))
+* **detect:** a Claude Code startup that could not connect retries itself ([2b64f28](https://github.com/qoop-si/qoop/commit/2b64f282b6efe8bd00a755648f76fc9f42d3539f))
+* **runtime:** a person's key in an interface takes the terminal's size ([621b867](https://github.com/qoop-si/qoop/commit/621b867d848cacc7f407b0da9cf3f8ccac87f47a))
+* **runtime:** an agent can park itself with qoop park, from inside its turn ([983da4f](https://github.com/qoop-si/qoop/commit/983da4f5d547462a360f002f70dea925d4a0e910))
+
 ## [0.21.1](https://github.com/qoop-si/qoop/compare/v0.21.0...v0.21.1) (2026-11-20)
 
 
