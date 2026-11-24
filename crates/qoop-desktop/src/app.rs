@@ -30,6 +30,8 @@ use qoop_runtime::schedule::Zone;
 use qoop_tui::seen;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::board::BoardPage;
+use crate::chat::ChatDrawer;
 use crate::element::{BACKGROUND, Cells, FOREGROUND, TerminalElement, cells};
 use crate::keys::{self, Press};
 use crate::link::{self, Down, Latest, Up};
@@ -132,6 +134,7 @@ pub struct Desk {
     pub(crate) drawer_w: f32,
     pub(crate) review_w: f32,
     pub(crate) win_w: f32,
+    pub(crate) win_h: f32,
     pub(crate) drag: Option<Edge>,
     /// When the person last typed into each terminal: a held reply is never typed into a line
     /// they began after it was held.
@@ -153,6 +156,10 @@ pub struct Desk {
     pub(crate) strip_ask: Option<String>,
     /// The strip drawn as a vertical timeline.
     pub timeline: bool,
+    /// The task strip's drawer beside the terminal is open (closed until asked for).
+    pub(crate) task_open: bool,
+    /// What the agent page measures of its column (`element::Gauge`).
+    pub(crate) gauge: Rc<crate::element::Gauge>,
     pub review: Option<Review>,
     pub review_focus: FocusHandle,
     /// Picks waiting out their 3 s, and what became of each sent one, per agent.
@@ -173,6 +180,15 @@ pub struct Desk {
     pub lessons: Option<state::Lessons>,
     /// What starting qass said, while it starts or when it could not.
     pub(crate) qass_said: Option<String>,
+    /// The Board (the Inbox's second view), the chat drawer on the qass page, and the field of
+    /// the ask bar; what the last line to qass said; when this window last saw qass running;
+    /// and whether the page lists what it watches.
+    pub(crate) board: BoardPage,
+    pub(crate) chat: ChatDrawer,
+    pub(crate) qass_ask: Entity<crate::field::Field>,
+    pub(crate) ask_said: Option<String>,
+    pub(crate) qass_seen: Option<i64>,
+    pub(crate) watch_open: bool,
     /// The one timer of the holds is running.
     pub(crate) ticking: bool,
     /// qass's lessons file, read when its page opens.
@@ -308,6 +324,7 @@ impl Desk {
             drawer_w: shell::DRAWER_DEFAULT,
             review_w: shell::REVIEW_DEFAULT,
             win_w: 1440.,
+            win_h: 900.,
             drag: None,
             typed_at: HashMap::new(),
             drafts: HashMap::new(),
@@ -320,6 +337,8 @@ impl Desk {
             strip: None,
             strip_ask: None,
             timeline: false,
+            task_open: false,
+            gauge: Default::default(),
             review: None,
             review_focus: cx.focus_handle(),
             holds: state::Holds::default(),
@@ -332,6 +351,20 @@ impl Desk {
             acts: Vec::new(),
             lessons: None,
             qass_said: None,
+            board: BoardPage::new(cx),
+            chat: ChatDrawer::new(cx),
+            qass_ask: {
+                let ask = cx.new(|cx| {
+                    let mut f = crate::field::Field::new("Ask qass, or tell it what to do", cx);
+                    f.label = Some("Ask qass".into());
+                    f
+                });
+                cx.observe(&ask, |_, _, cx| cx.notify()).detach();
+                ask
+            },
+            ask_said: None,
+            qass_seen: None,
+            watch_open: false,
             ticking: false,
             schedule_page: Default::default(),
             lessons_path: qoop_runtime::paths::qass_config_dir().join("lessons.md"),
@@ -420,6 +453,7 @@ impl Desk {
                 }
                 self.ask_strip();
                 self.ask_inbox();
+                self.board_reconnected();
             }
             Down::Disconnected(why) => {
                 if self.connected {
@@ -466,6 +500,10 @@ impl Desk {
             Down::Event(EventMessage::TasksChanged) => {
                 self.ask_strip();
                 self.ask_watch();
+                self.board_changed();
+            }
+            Down::Event(EventMessage::MessagesChanged { terminal, .. }) => {
+                self.chat_changed(terminal);
             }
             Down::Event(EventMessage::AsksChanged) => self.ask_inbox(),
             Down::Event(EventMessage::SchedulesChanged) => self.refresh_remote(),
@@ -477,6 +515,8 @@ impl Desk {
         if self.answer_reply(&answer, cx)
             || self.report_came(&answer, window, cx)
             || self.remote_setting_came(&answer)
+            || self.board_answered(&answer, cx)
+            || self.chat_came(&answer, cx)
         {
             return;
         }
@@ -500,6 +540,9 @@ impl Desk {
                 }
                 self.note_hand();
                 self.listed = true;
+                if self.model.qass_row().is_some() {
+                    self.qass_seen = Some(unix_now());
+                }
                 // An agent that waited works again: maybe qass wrote to it, an act to show.
                 if self.page == Page::Qass && state::woke(&before, &self.model.rows) {
                     self.ask_acts();
@@ -515,10 +558,13 @@ impl Desk {
                 // or wakes, and goes when qass's agent leaves it (a plain shell is not qass), so
                 // "Start it" shows at once.
                 if self.page == Page::Qass
-                    && self.term.as_ref().map(|t| t.terminal) != self.qass_terminal()
+                    && self.term.as_ref().map(|t| t.terminal)
+                        != self.chat.terminal().then(|| self.qass_terminal()).flatten()
                 {
                     self.open(Page::Qass, window, cx);
                 }
+                // New agent's agent is listed: the sheet closes on it.
+                self.follow_new_agent(window, cx);
             }
             ControlResponse::Asks { live, ended, .. } => {
                 self.asks = live;
@@ -637,7 +683,8 @@ impl Desk {
         }
         let terminal = match page {
             Page::Session(t) => Some(t),
-            Page::Qass => self.qass_terminal(),
+            Page::Qass if self.chat.terminal() => self.qass_terminal(),
+            Page::Qass => None,
             _ if keep => self.term.as_ref().map(|t| t.terminal),
             _ => None,
         };
@@ -688,7 +735,7 @@ impl Desk {
         qoop_tui::inbox_pane::day_start(&mut self.day_start, unix_now());
     }
 
-    fn qass_terminal(&self) -> Option<TerminalStream> {
+    pub(crate) fn qass_terminal(&self) -> Option<TerminalStream> {
         self.model.qass_row().map(|r| r.terminal)
     }
 
@@ -825,13 +872,22 @@ impl Desk {
         if self.schedule_sheet_key(event, window, cx) {
             return;
         }
+        // Enter and Escape in the Board's and the chat's fields, which are theirs.
+        if !k.modifiers.control
+            && !k.modifiers.platform
+            && !k.modifiers.alt
+            && (self.board_key(&k.key, window, cx) || self.chat_key(&k.key, window, cx))
+        {
+            cx.stop_propagation();
+            return;
+        }
         // Escape leaves the Inbox for the page before it, and the terminal never hears it: an
-        // Escape typed into an agent interrupts its turn. Not from the field for one's own
-        // words, which keeps its keys.
+        // Escape typed into an agent interrupts its turn. Not from a field, which keeps its
+        // keys.
         if self.page == Page::Inbox
             && self.back != Page::Inbox
             && keys::typed(k) == "escape"
-            && !self.own_typing(window, cx)
+            && !self.typing_in_field(window, cx)
         {
             self.open(self.back, window, cx);
             cx.stop_propagation();
@@ -856,7 +912,9 @@ impl Desk {
 
     /// Whether the page draws a terminal that can take the keys.
     pub(crate) fn term_drawn(&self) -> bool {
-        self.term.is_some() && matches!(self.page, Page::Session(_) | Page::Qass)
+        self.term.is_some()
+            && (matches!(self.page, Page::Session(_))
+                || (self.page == Page::Qass && self.chat.terminal()))
     }
 
     /// Whether any text field of the window has the keys: the own words, New agent's task, the
@@ -877,6 +935,15 @@ impl Desk {
                     .any(|f| on(f, window, cx))
             });
         schedule
+            || on(&self.board.find, window, cx)
+            || on(&self.board.tell, window, cx)
+            || self
+                .board
+                .add
+                .as_ref()
+                .is_some_and(|a| on(&a.field, window, cx))
+            || on(&self.qass_ask, window, cx)
+            || on(&self.chat.ask, window, cx)
             || self.own.as_ref().is_some_and(|o| on(&o.field, window, cx))
             || self.sheet.as_ref().is_some_and(|s| on(&s.task, window, cx))
             || self
@@ -889,13 +956,6 @@ impl Desk {
     /// Whether a schedule sheet is open over the page.
     fn schedule_sheet_open(&self) -> bool {
         self.page == Page::Schedules && self.schedule_page.sheet.is_some()
-    }
-
-    /// Whether the field for the owner's own words has the keys.
-    pub(crate) fn own_typing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.own
-            .as_ref()
-            .is_some_and(|own| own.field.read(cx).focus.is_focused(window))
     }
 
     /// The keys' resting place: an open sheet's first stop, else the terminal on screen, else
@@ -931,7 +991,8 @@ impl Desk {
         if self.typing_in_field(window, cx) {
             return;
         }
-        let on_inbox = self.page == Page::Inbox;
+        // The Board has no cards to answer: its digits are the person's own.
+        let on_inbox = self.page == Page::Inbox && !self.board.open;
         // `u` belongs to Undo while anything is on hold, wherever its line shows (card, Inbox):
         // the focused card's pick, else the newest. It never reaches the terminal then.
         if keys::typed(k) == "u" && !self.holds.held.is_empty() {
@@ -1314,11 +1375,13 @@ impl Desk {
         let redraw = now != self.now && (fresh || now / 30 != self.now / 30);
         self.now = now;
         self.ping_machines();
+        let board_moved = self.board_tick(now);
+        self.chat_tick();
         let states: Vec<state::MachineState> = state::machines(&self.model.spaces)
             .into_iter()
             .map(|(m, _, _)| self.machine_state(m))
             .collect();
-        let redraw = redraw || states != self.drawn_states;
+        let redraw = redraw || board_moved || states != self.drawn_states;
         self.drawn_states = states;
         qoop_tui::inbox_pane::day_start(&mut self.day_start, now);
         let redraw = self.follow_config() || redraw;
@@ -1426,6 +1489,7 @@ impl Desk {
                 selection: None,
                 area: None,
                 lift: px(0.),
+                gauge: None,
             })
     }
 
@@ -1453,8 +1517,7 @@ impl Desk {
                 .child(padded(self.session(inbox, t, focused, cx)))
                 .into_any_element(),
             Page::Qass => body
-                .pt(px(12.))
-                .child(padded(self.qass_page(t, focused, cx)))
+                .child(self.qass_page(inbox, t, focused, cx))
                 .into_any_element(),
             Page::Schedules => body
                 .child(self.page_header(t))
@@ -1596,6 +1659,7 @@ impl Render for Desk {
         let focused = self.term_focus.is_focused(window);
         // The widths the dividers set are held to the window as it is now.
         self.win_w = f32::from(window.viewport_size().width);
+        self.win_h = f32::from(window.viewport_size().height);
         let inbox = self.inbox();
         self.follow_card_focus(&inbox, window, cx);
         let side = self.side_px();

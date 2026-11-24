@@ -1,5 +1,7 @@
-//! The session page: the space's tabs, the tab's panes as the daemon keeps them (read only),
-//! the task strip beside them (its width is dragged, see `shell.rs`), and d-review.
+//! The session page: the agent's header (Next waiting and the prefix hints), the space's tabs,
+//! the tab's panes as the daemon keeps them (read only) with the question card under them, and
+//! the task strip and d-review as drawers beside them, closed until asked for (their width is
+//! dragged, see `shell.rs`).
 //!
 //! The terminal keeps the keys: the strip and the review are driven by clicks and by the
 //! prefix; inside the review, which takes the focus while open, `x` marks the finish read and
@@ -305,6 +307,18 @@ impl Desk {
         cx.notify();
     }
 
+    /// The task strip's drawer: open or closed. The review takes the same room, so opening
+    /// the strip closes it.
+    pub(crate) fn toggle_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.review.take().is_some() {
+            self.task_open = true;
+        } else {
+            self.task_open = !self.task_open;
+        }
+        window.focus(&self.term_focus, cx);
+        cx.notify();
+    }
+
     /// Mark read: the finish on screen counts as seen, for that stop only.
     fn mark_read(&mut self) {
         let Some(terminal) = self.review.as_ref().map(|r| r.terminal) else {
@@ -364,7 +378,8 @@ impl Desk {
         }
     }
 
-    /// The centre of a session page.
+    /// The centre of a session page: the agent's header, its tabs, the terminal with the
+    /// question card under it, and the task strip or the review as a drawer once asked for.
     pub fn session(
         &self,
         inbox: &qoop_tui::inbox::Inbox,
@@ -376,60 +391,34 @@ impl Desk {
             return div().into_any_element();
         };
         let tree = self.model.tree_of(term.terminal);
-        // The agent on screen asks something: its card under its screen, the panel beside.
+        // The panes' tree, for the terminals to be sized from (`element::Gauge`).
+        *self.gauge.tree.borrow_mut() = Some(tree.clone());
+        // The agent on screen asks something: its card under its screen.
         let asking = self
             .model
             .row(term.terminal)
             .filter(|r| r.menu.is_some() && Kind::of(r).needs_you());
-        let right = match (&self.review, asking) {
-            (Some(review), _) => self.review_panel(review, t, cx).into_any_element(),
-            (None, Some(row)) => div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .gap(px(10.))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .flex_col()
-                        .child(self.question_side(row, t)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .flex_col()
-                        .child(self.task_column(t, cx)),
-                )
-                .into_any_element(),
-            (None, None) => match self.questions(term.terminal, inbox, t, cx) {
-                // The agent's question cards over its task.
-                Some(questions) => div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .child(questions)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .flex_col()
-                            .child(self.task_column(t, cx)),
-                    )
-                    .into_any_element(),
-                None => self.task_column(t, cx).into_any_element(),
-            },
+        let drawer = match (&self.review, self.task_open) {
+            (Some(review), _) => Some(self.review_panel(review, t, cx).into_any_element()),
+            (None, true) => Some(self.task_column(t, cx).into_any_element()),
+            (None, false) => None,
         };
+        let cards = match asking {
+            Some(_) => None,
+            None => self.questions(term.terminal, inbox, t, cx),
+        };
+        let below = asking.is_some()
+            || cards.is_some()
+            || self
+                .closed_card
+                .as_ref()
+                .is_some_and(|(on, _, _)| *on == term.terminal);
         div()
             .size_full()
             .flex()
             .flex_col()
             .gap(px(10.))
+            .child(self.agent_header(term.terminal, inbox, t, cx))
             .child(self.tab_row(term.terminal, t, cx))
             .child(
                 div()
@@ -439,41 +428,205 @@ impl Desk {
                     .gap(px(12.))
                     .child(
                         div()
+                            .relative()
                             .flex_1()
                             .min_w_0()
                             .h_full()
                             .flex()
                             .flex_col()
                             .gap(px(10.))
+                            // The whole column's height, whatever sits under the terminal: what
+                            // the terminal is sized from, so a card coming or going sends no
+                            // new size (written first, so it is known when the terminal is).
+                            .child({
+                                let gauge = self.gauge.clone();
+                                gpui::canvas(
+                                    move |bounds, _, _| gauge.column.set(bounds.size.height),
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .size_full()
+                            })
                             .child(
                                 div()
+                                    .relative()
                                     .flex_1()
                                     .min_h_0()
+                                    // The room the terminals have, less any card under them.
+                                    .child({
+                                        let gauge = self.gauge.clone();
+                                        gpui::canvas(
+                                            move |bounds, _, _| gauge.slot.set(bounds.size.height),
+                                            |_, _, _, _| {},
+                                        )
+                                        .absolute()
+                                        .size_full()
+                                    })
                                     .child(self.layout(&tree, focused, cx)),
                             )
-                            .when_some(asking, |d, row| d.child(self.question_card(row, t, cx)))
-                            .when_some(
-                                self.closed_card
-                                    .as_ref()
-                                    .filter(|(on, _, _)| *on == term.terminal && asking.is_none()),
-                                |d, (_, menu, line)| {
-                                    d.child(self.closed_card_view(menu, line, t, cx))
-                                },
-                            ),
+                            // Whatever waits on the person sits under the terminal, wrapped
+                            // whole; a tall card scrolls inside its own room, never over the
+                            // terminal.
+                            .when(below, |d| {
+                                d.child(ui::scroll(
+                                    div()
+                                        .id("agent-below")
+                                        .debug_selector(|| "agent-below".to_string())
+                                        .flex_none()
+                                        .max_h(px(self.win_h * 0.6))
+                                        .overflow_y_scroll()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(10.))
+                                        .when_some(asking, |d, row| {
+                                            d.child(self.question_card(row, t, cx))
+                                        })
+                                        .when_some(
+                                            self.closed_card.as_ref().filter(|(on, _, _)| {
+                                                *on == term.terminal && asking.is_none()
+                                            }),
+                                            |d, (_, menu, line)| {
+                                                d.child(self.closed_card_view(menu, line, t, cx))
+                                            },
+                                        )
+                                        .when_some(cards, |d, cards| d.child(cards)),
+                                ))
+                            }),
                     )
-                    .child(self.divider(Edge::Drawer, "Resize the side panel", t, cx))
-                    .child(
-                        div()
-                            .flex_none()
-                            .h_full()
-                            .w(px(self.drawer_px()))
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.))
-                            .child(div().flex_1().min_h_0().flex().flex_col().child(right)),
-                    ),
+                    .when_some(drawer, |d, drawer| {
+                        d.child(self.divider(Edge::Drawer, "Resize the side panel", t, cx))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .h_full()
+                                    .w(px(self.drawer_px()))
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div().flex_1().min_h_0().flex().flex_col().child(drawer),
+                                    ),
+                            )
+                    }),
             )
             .into_any_element()
+    }
+
+    /// The agent's header: its mark, space and title, where it runs, the prefix hint that
+    /// keeps the keys off the terminal, and Next waiting with how many other things wait.
+    fn agent_header(
+        &self,
+        terminal: TerminalStream,
+        inbox: &qoop_tui::inbox::Inbox,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let row = self.model.row(terminal);
+        let space = row.and_then(|r| self.model.space(r.workspace));
+        let others = inbox
+            .items
+            .iter()
+            .filter(|i| i.terminal != Some(terminal))
+            .count();
+        let (title, program, machine) = match row {
+            Some(r) => (
+                state::title_of(r),
+                r.program.clone(),
+                space.map_or_else(|| "This Mac".to_string(), state::machine_name),
+            ),
+            None => (format!("tab {terminal}"), None, "This Mac".to_string()),
+        };
+        let about = match program {
+            Some(program) => format!("{program} on {machine}"),
+            None => format!("on {machine}"),
+        };
+        let prefix = self.prefix_name();
+        let keys = |text: String| ui::kbd(&text, t);
+        let next = if others > 0 {
+            ui::pill("next-waiting", &format!("Next waiting, {others}"), t)
+                .child("Next waiting")
+                .child(
+                    div()
+                        .debug_selector(|| "next-waiting-count".to_string())
+                        .min_w(px(18.))
+                        .h(px(18.))
+                        .px(px(5.))
+                        .rounded_full()
+                        .bg(c(t.needs))
+                        .text_color(c(t.badge_fg))
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .flex()
+                        .justify_center()
+                        .child(others.to_string()),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.next_waiting(window, cx)))
+                .into_any_element()
+        } else {
+            ui::pill_off(
+                "next-waiting",
+                "Next waiting, unavailable: nothing else waits",
+                t,
+            )
+            .child("Next waiting")
+            .into_any_element()
+        };
+        let next = div().debug_selector(|| "next-waiting".to_string()).child(
+            // The pill is a Control: wrapped in a div only so a test can find it.
+            next,
+        );
+        div()
+            .id("agent-header")
+            .role(Role::Heading)
+            .aria_level(1)
+            .aria_label(format!("{title}, {about}"))
+            .flex_none()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_x(px(12.))
+            .gap_y(px(6.))
+            .child(match row {
+                Some(r) => ui::mark(self.shown_kind(state::Entry::Live(r)), t, 14.),
+                None => ui::mark(Kind::Status(qoop_domain::status::Status::Unknown), t, 14.),
+            })
+            .when_some(space, |d, w| {
+                d.child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.space(state::space_slot(w)))
+                        .child(state::short_space(w)),
+                )
+            })
+            .child(
+                div()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_size(px(16.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(div().text_color(c(t.t2)).child(about))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("agent-hints")
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(12.))
+                    .text_color(c(t.t2))
+                    .child(keys(format!("{prefix} a")))
+                    .child("keys to the page"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(next)
+                    .child(keys("\u{2318}J".to_string()))
+                    .child(keys(format!("{prefix} tab"))),
+            )
     }
 
     /// The space's tabs, then Changes and Open in editor for a tab on this machine.
@@ -488,6 +641,18 @@ impl Desk {
         let tabs = row.map_or_else(Vec::new, |r| self.model.tabs_of(r.workspace));
         let tree = self.model.tree_of(shown).leaves();
         let here = self.here(shown);
+        // How far the task is, as the strip reads it, else as the agent's row does.
+        let task_said = self
+            .strip
+            .as_ref()
+            .and_then(|strip| strip.heading())
+            .map(|(_, progress)| progress)
+            .or_else(|| {
+                row.and_then(|r| r.task.as_ref())
+                    .filter(|k| k.steps_total > 0)
+                    .map(|k| format!("{} of {} done", k.steps_done, k.steps_total))
+            })
+            .filter(|said| !said.is_empty());
         let totals = self.review.as_ref().and_then(|r| match &r.read {
             Some(Ok(changes)) => Some(changes.totals()),
             _ => None,
@@ -556,6 +721,36 @@ impl Desk {
                     t,
                 ))
             })
+            .child(
+                ui::control(
+                    "task-toggle",
+                    Role::Button,
+                    match &task_said {
+                        Some(said) => format!("Task, {said}"),
+                        None => "Task".to_string(),
+                    },
+                    t,
+                )
+                .debug_selector(|| "task-toggle".to_string())
+                .aria_expanded(self.task_open && self.review.is_none())
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .h(px(30.))
+                .px(px(10.))
+                .rounded(px(9.))
+                .text_size(px(12.5))
+                .text_color(c(t.t1))
+                .when(self.task_open && self.review.is_none(), |d| {
+                    ui::current(d, t)
+                })
+                .hover(|s| ui::paint(s, t.hover()))
+                .child("Task")
+                .when_some(task_said.clone(), |d, said| {
+                    d.child(div().text_color(c(t.t2)).child(said))
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_task(window, cx))),
+            )
             .when(here.is_some(), |d| {
                 d.child(
                     ui::control(
@@ -617,7 +812,7 @@ impl Desk {
                 second,
                 ..
             } => {
-                let share = (f32::from(*permille) / 1000.).clamp(0.05, 0.95);
+                let share = crate::element::share(*permille);
                 let across = *dir == SplitDir::V;
                 div()
                     .size_full()
@@ -728,6 +923,7 @@ impl Desk {
             .child(
                 div()
                     .id(("pane", terminal as u64))
+                    .debug_selector(move || format!("pane-{terminal}"))
                     .role(Role::Terminal)
                     .aria_label(format!("Terminal, {label}"))
                     .key_context("Terminal")
@@ -774,6 +970,7 @@ impl Desk {
                         selection: term.selection,
                         area: Some(term.area.clone()),
                         lift: self.cells.height * term.lift,
+                        gauge: Some(self.gauge.clone()),
                     }),
             )
             .into_any_element()
@@ -798,8 +995,6 @@ impl Desk {
                 .role(Role::Region)
                 .aria_label("Questions")
                 .flex_none()
-                .max_h(px(520.))
-                .overflow_y_scroll()
                 .flex()
                 .flex_col()
                 .gap(px(6.))
@@ -876,7 +1071,7 @@ impl Desk {
                 }))
                 .into_any_element()
             }));
-        Some(ui::scroll(body).into_any_element())
+        Some(body.into_any_element())
     }
 
     /// The task strip: the tab's open task, its plan steps with their times (or the vertical

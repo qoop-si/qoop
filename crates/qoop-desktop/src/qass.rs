@@ -1,22 +1,22 @@
-//! d-qass: qass's own terminal full height as the chat (its input line is the composer), words
-//! to type into it, what it handled today, what it watches with a switch per space and per
-//! agent, and its rules as its lessons file counts them.
+//! The qass page: how qass stands and its one control (Pause or Resume while it runs and its
+//! switch answers, Start or Wake while it does not), the link to its questions in the Inbox, two
+//! columns (Now, Schedules and Rules from lessons.md | Did today as the daemon recorded it, with
+//! no reason line), the ask bar, and the chat drawer (`chat.rs`) with qass's own terminal in its
+//! Terminal tab. What it watches, per space and per agent, sits behind "What it watches" under
+//! Rules.
+
+use std::collections::BTreeSet;
 
 use gpui::{AnyElement, Context, FontWeight, Role, Window, div, prelude::*, px};
 use qoop_runtime::control::{ControlRequest, WorkspaceRow};
+use qoop_tui::inbox::Inbox;
+use qoop_tui::ledger::Stand;
 
 use crate::app::{Desk, Page};
 use crate::link::{self, Up};
 use crate::state::{self, Kind};
 use crate::theme::{MONO_FONT, Theme, c, ca};
 use crate::ui::{self, Icon};
-
-/// Words the chips type into qass's input, without Enter: the owner finishes and sends.
-const CHIPS: [&str; 3] = [
-    "What did you handle for me today?",
-    "Why did you leave the last question to me?",
-    "Which of my agents are idle right now?",
-];
 
 impl Desk {
     /// qass's space on this Mac, when there is one.
@@ -27,11 +27,10 @@ impl Desk {
             .find(|w| w.name == state::QASS_SPACE)
     }
 
-    /// Read qass's lessons file again (on opening the page): small, on this Mac only.
+    /// Read qass's lessons file again (on opening the page): small, on this Mac only, by the
+    /// reader the TUI's ledger uses (a file that is not there is none written yet).
     pub(crate) fn read_lessons(&mut self) {
-        self.lessons = std::fs::read_to_string(&self.lessons_path)
-            .ok()
-            .map(|text| state::lessons_of(&text));
+        self.lessons = qoop_tui::places::rules_read_at(&self.lessons_path);
     }
 
     /// Watching: qass reads every question and answers what its rules allow, or none.
@@ -62,8 +61,6 @@ impl Desk {
         cx.notify();
     }
 
-    /// `qoop qass`, as the TUI's Start qass in its ledger runs it: it starts qass in its own space, or wakes
-    /// it. Off the window's thread; what it says when it cannot is shown.
     /// Whether a start of qass is under way: asked, and its terminal not an agent yet, for at
     /// most a minute (as `qoop qass` holds its own claim).
     pub(crate) fn qass_starting(&self) -> bool {
@@ -71,6 +68,8 @@ impl Desk {
             .is_some_and(|until| self.now < until)
     }
 
+    /// `qoop qass`, as the TUI's Start qass in its ledger runs it: it starts qass in its own space,
+    /// or wakes it. Off the window's thread; what it says when it cannot is shown.
     pub(crate) fn start_qass(&mut self, cx: &mut Context<Self>) {
         if self.qass_starting() {
             return;
@@ -130,45 +129,205 @@ impl Desk {
         cx.notify();
     }
 
-    /// A chip: its words into qass's input, with no Enter, and the keys to the terminal.
-    fn type_into_qass(&mut self, words: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.back_to_live();
-        if let Some(term) = self.term.as_ref().filter(|_| self.connected) {
-            let terminal = term.terminal;
-            let _ = self.up.send(Up::Input(terminal, words.as_bytes().to_vec()));
-            self.typed_at.insert(terminal, std::time::Instant::now());
-            window.focus(&self.term_focus, cx);
+    /// Say `text` to qass, as the TUI's ask line does: pasted into its terminal and sent with
+    /// Enter when it is at rest (idle or done, ready, and nobody typing in it); else the words
+    /// stay where they were typed and the line says why. True when qass has them.
+    pub(crate) fn tell_qass(
+        &mut self,
+        text: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let said = match self.model.qass_row() {
+            None => Some("qass is not running: start it from its page."),
+            Some(_) if !self.connected => Some("qoop is not connected: your line is kept."),
+            Some(row) => {
+                let rest =
+                    matches!(row.state.as_str(), "idle" | "done") && row.readiness == "ready";
+                let quiet = self.typed_at.get(&row.terminal).is_none_or(|at| {
+                    at.elapsed().as_secs() >= qoop_runtime::asks::TYPED_QUIET_SECS.unsigned_abs()
+                });
+                (!(rest && quiet)).then_some(
+                    "qass is busy or waits on you: your line is kept, send it when it is free.",
+                )
+            }
+        };
+        if let Some(said) = said {
+            self.ask_said = Some(said.to_string());
+            cx.notify();
+            return false;
         }
+        if let Some(terminal) = self.qass_terminal() {
+            let _ = self.up.send(Up::Paste(terminal, text.into_bytes()));
+            let _ = self.up.send(Up::Input(terminal, b"\r".to_vec()));
+        }
+        self.ask_said = Some("Sent to qass.".into());
+        cx.notify();
+        true
     }
 
-    pub(crate) fn qass_page(&self, t: &Theme, focused: bool, cx: &mut Context<Self>) -> AnyElement {
-        let watching = self.model.qass_watch != Some(false);
-        let row = self
-            .term
-            .as_ref()
-            .and_then(|term| self.model.row(term.terminal));
-        let asleep = self.qass_space().is_some_and(|w| w.asleep);
-        let next = state::next_runs(&self.model.schedules, &self.model.rows, self.zone, 1)
+    /// The ask bar: its field and Send, or why qass cannot be asked. In the drawer it is the
+    /// drawer's own field.
+    pub(crate) fn ask_bar(&self, in_drawer: bool, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let stand = state::qass_stand(&self.model, &BTreeSet::new());
+        let (id, field) = if in_drawer {
+            ("chat-send", self.chat.ask.clone())
+        } else {
+            ("ask-send", self.qass_ask.clone())
+        };
+        let said = self.ask_said.clone();
+        let body: AnyElement = if stand.runs() {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().flex_1().min_w_0().child(field))
+                .child(
+                    ui::pill(id, "Send to qass", t)
+                        .debug_selector(move || id.to_string())
+                        .child("Send")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let ask = if in_drawer {
+                                this.chat.ask.clone()
+                            } else {
+                                this.qass_ask.clone()
+                            };
+                            let text = ask.read(cx).text.trim().to_string();
+                            if !text.is_empty() && this.tell_qass(text, window, cx) {
+                                ask.update(cx, |f, _| f.set_text(""));
+                            }
+                        })),
+                )
+                .into_any_element()
+        } else {
+            let line = match stand {
+                Stand::Asleep => "qass is asleep: wake it to ask it.",
+                _ if in_drawer => "qass is stopped. Close this and press Start qass to ask it.",
+                _ => "qass is stopped; start it from the top of this page to ask it.",
+            };
+            div()
+                .id("ask-off")
+                .debug_selector(|| "ask-off".to_string())
+                .role(Role::Status)
+                .aria_label(line)
+                .text_size(px(13.))
+                .text_color(c(t.t2))
+                .whitespace_normal()
+                .child(line)
+                .into_any_element()
+        };
+        div()
+            .id(if in_drawer { "chat-ask" } else { "ask-bar" })
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(body)
+            .when_some(said, |d, said| {
+                d.child(
+                    div()
+                        .id("ask-said")
+                        .role(Role::Status)
+                        .aria_label(said.clone())
+                        .text_size(px(12.5))
+                        .text_color(c(t.t2))
+                        .whitespace_normal()
+                        .child(said),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The computers not reached, for qass's line and for where it watches.
+    fn lost_machines(&self) -> BTreeSet<usize> {
+        state::machines(&self.model.spaces)
             .into_iter()
-            .find(|r| r.running.is_none())
-            .map(|r| format!("next {}", state::clock_at(r.at, self.now, self.zone)));
+            .map(|(m, _, _)| m)
+            .filter(|m| *m != 0 && state::unreached(self.machine_state(*m)))
+            .collect()
+    }
+
+    pub(crate) fn qass_page(
+        &self,
+        list: &Inbox,
+        t: &Theme,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lost = self.lost_machines();
+        let lost_names: Vec<String> = state::machines(&self.model.spaces)
+            .into_iter()
+            .filter(|(m, _, _)| lost.contains(m))
+            .map(|(_, name, _)| name)
+            .collect();
+        let stand = state::qass_stand(&self.model, &lost);
+        let seen = self.qass_seen.map(|at| state::clock(at, self.zone));
+        let said = state::qass_said(&stand, seen.as_deref(), &lost_names);
+        let watching = self.model.qass_watch != Some(false);
+        let asleep = matches!(stand, Stand::Asleep);
+        // The one control: Pause or Resume while it runs and its switch has answered (an older
+        // qoop has none), Wake or Start while it does not.
+        let control: Option<AnyElement> = match &stand {
+            Stand::Paused => Some(
+                ui::pill("qass-resume", "Resume qass", t)
+                    .debug_selector(|| "qass-resume".to_string())
+                    .child("Resume")
+                    .on_click(cx.listener(|this, _, _, cx| this.set_watch(true, cx)))
+                    .into_any_element(),
+            ),
+            Stand::Watching { .. } if self.model.qass_watch.is_some() => Some(
+                ui::pill("qass-pause", "Pause qass", t)
+                    .debug_selector(|| "qass-pause".to_string())
+                    .child("Pause")
+                    .on_click(cx.listener(|this, _, _, cx| this.set_watch(false, cx)))
+                    .into_any_element(),
+            ),
+            Stand::Watching { .. } => None,
+            Stand::Asleep => Some(
+                ui::pill("wake-qass", "Wake qass", t)
+                    .debug_selector(|| "wake-qass".to_string())
+                    .child("Wake qass")
+                    .on_click(cx.listener(|this, _, _, cx| this.wake_qass(cx)))
+                    .into_any_element(),
+            ),
+            Stand::None | Stand::Stopped if self.qass_starting() => Some(
+                ui::pill_off("start-qass", "Start qass, unavailable: qass is starting", t)
+                    .debug_selector(|| "start-qass".to_string())
+                    .child("Start qass")
+                    .into_any_element(),
+            ),
+            Stand::None | Stand::Stopped => Some(
+                ui::pill("start-qass", "Start qass", t)
+                    .debug_selector(|| "start-qass".to_string())
+                    .child("Start qass")
+                    .on_click(cx.listener(|this, _, _, cx| this.start_qass(cx)))
+                    .into_any_element(),
+            ),
+        };
+        let questions = list.items.iter().filter(|i| i.kind.from_qass()).count();
         let header = div()
             .flex_none()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(12.))
-            .p(px(14.))
-            .rounded(px(14.))
-            .bg(c(t.card))
-            .border_1()
-            .border_color(ca(t.hair))
-            .when_some(self.my_pet.as_ref(), |d, pet| d.child(ui::pet(pet, 2.5)))
+            .child(
+                div()
+                    .size(px(44.))
+                    .flex_none()
+                    .rounded(px(12.))
+                    .bg(ca(t.fill))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(ui::qass_mark(22., t)),
+            )
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(220.))
                     .flex()
                     .flex_col()
-                    .gap(px(3.))
                     .child(
                         div()
                             .flex()
@@ -176,229 +335,343 @@ impl Desk {
                             .gap(px(8.))
                             .child(
                                 div()
-                                    .text_size(px(16.))
+                                    .id("title")
+                                    .role(Role::Heading)
+                                    .aria_level(1)
+                                    .aria_label("qass")
+                                    .text_size(px(22.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("qass"),
                             )
-                            .when_some(row.map(Kind::of), |d, kind| {
-                                d.child(ui::mark(kind, t, 11.)).child(
-                                    div()
-                                        .text_size(px(12.5))
-                                        .text_color(c(ui::word_ink(kind, t)))
-                                        .child(kind.word()),
-                                )
-                            })
-                            .when_some(row.and_then(|r| r.program.clone()), |d, program| {
-                                d.child(ui::tag(&format!("runs on {program}"), t))
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.5))
-                            .text_color(c(t.t2))
-                            .child("the assistant that watches your agents"),
-                    ),
-            )
-            .child(
-                ui::link_button("nav-schedules", "Schedules", t)
-                    .when_some(next, |d, next| {
-                        d.child(div().text_size(px(11.5)).text_color(c(t.t2)).child(next))
-                    })
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open(Page::Schedules, window, cx)),
-                    ),
-            )
-            .child(div().text_size(px(12.5)).child("Watching"))
-            .child(
-                ui::switch("watch-head", "qass watching", watching, t)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_watch(!watching, cx))),
-            );
-        let body: AnyElement = match (&self.term, asleep) {
-            (Some(_), _) => div()
-                .flex_1()
-                .min_h_0()
-                .child(self.terminal_area(focused, cx))
-                .into_any_element(),
-            (None, true) => self
-                .qass_state(
-                    "qass is sleeping.",
-                    ("wake-qass", "Wake it"),
-                    true,
-                    cx.listener(|this, _, _, cx| this.wake_qass(cx)),
-                )
-                .into_any_element(),
-            (None, false) => self
-                .qass_state(
-                    "qass is not running.",
-                    ("start-qass", "Start it"),
-                    !self.qass_starting(),
-                    cx.listener(|this, _, _, cx| this.start_qass(cx)),
-                )
-                .into_any_element(),
-        };
-        div()
-            .size_full()
-            .flex()
-            .gap(px(12.))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .child(header)
-                    .when(!watching, |d| {
-                        d.child(
-                            div()
-                                .id("qass-off")
-                                .role(Role::Status)
-                                .aria_label("qass is not watching. Every question comes to you.")
-                                .px(px(4.))
-                                .text_size(px(13.))
-                                .text_color(c(t.needs_text))
-                                .child("qass is not watching. Every question comes to you."),
-                        )
-                    })
-                    .child(body)
-                    .when(self.term.is_some(), |d| d.child(self.qass_chips(t, cx))),
-            )
-            .child(ui::scroll(
-                div()
-                    .id("qass-side")
-                    .flex_none()
-                    .w(px(340.))
-                    .h_full()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .child(self.handled_card(t))
-                    .child(self.watch_card(watching, t, cx))
-                    .child(self.rules_card(t)),
-            ))
-            .into_any_element()
-    }
-
-    /// qass not running or asleep: the line, its button, and what `qoop qass` said.
-    fn qass_state(
-        &self,
-        line: &str,
-        (id, label): (&'static str, &'static str),
-        enabled: bool,
-        press: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-    ) -> impl IntoElement {
-        // The card is the terminal's ground, dark in both themes, and so is its button.
-        let d = &crate::theme::DARK;
-        div()
-            .flex_1()
-            .flex()
-            .flex_col()
-            .items_start()
-            .gap(px(10.))
-            .p(px(20.))
-            .rounded(px(14.))
-            .bg(c(crate::theme::TERMINAL_BG))
-            .child(
-                div()
-                    .text_size(px(14.))
-                    .text_color(c(d.t1))
-                    .child(line.to_string()),
-            )
-            .child(match enabled {
-                true => ui::pill(id, label, d).child(label).on_click(press),
-                false => ui::pill_off(id, &format!("{label}, unavailable: qass is starting"), d)
-                    .child(label),
-            })
-            .when_some(self.qass_said.clone(), |s, said| {
-                s.child(div().text_size(px(12.5)).text_color(c(d.t2)).child(said))
-            })
-    }
-
-    fn qass_chips(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex_none()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(6.))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(c(t.t2))
-                    .child("Type into qass:"),
-            )
-            .children(CHIPS.iter().enumerate().map(|(n, words)| {
-                ui::control(("qass-chip", n as u64), Role::Button, *words, t)
-                    .h(px(28.))
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .rounded_full()
-                    .map(|d| ui::paint(d, t.rest()))
-                    .hover(|s| ui::paint(s, t.pressed()))
-                    .text_size(px(12.5))
-                    .child(*words)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.type_into_qass(words, window, cx)
-                    }))
-            }))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(c(t.t2))
-                    .child("you press enter"),
-            )
-    }
-
-    /// What qass did on its own today: when, which agent, what. The why waits for step two.
-    fn handled_card(&self, t: &Theme) -> impl IntoElement {
-        side_card("Handled for you today", Some(self.acts.len()), t)
-            .when(self.acts.is_empty(), |d| {
-                d.child(quiet("Nothing yet today.", t))
-            })
-            .children(self.acts.iter().take(30).map(|a| {
-                // Named as the status line names it: space and title, never the daemon's tab.
-                let agent = a
-                    .terminal
-                    .and_then(|n| self.model.row(n))
-                    .map(|r| self.model.agent_name(r));
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.))
-                    .py(px(4.))
-                    .border_t_1()
-                    .border_color(ca(t.hair))
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(8.))
-                            .text_size(px(12.5))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(agent.unwrap_or_else(|| a.kind.clone())),
-                            )
-                            .child(
-                                div()
-                                    .font_family(MONO_FONT)
-                                    .text_size(px(11.5))
-                                    .text_color(c(t.t2))
-                                    .child(state::clock(a.at, self.zone)),
+                            .when_some(
+                                self.model.qass_row().and_then(|r| r.program.clone()),
+                                |d, program| d.child(ui::tag(&format!("runs on {program}"), t)),
                             ),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
-                            .text_color(c(t.t1))
-                            .child(self.model.act_text(a)),
-                    )
+                            .id("qass-said")
+                            .debug_selector(|| "qass-said".to_string())
+                            .role(Role::Status)
+                            .aria_label(said.clone())
+                            .text_size(px(12.5))
+                            .text_color(c(if matches!(stand, Stand::Stopped) {
+                                t.fail_text
+                            } else {
+                                t.t2
+                            }))
+                            .whitespace_normal()
+                            .child(said),
+                    ),
+            )
+            .when(self.qass_terminal().is_some(), |d| {
+                d.child(
+                    ui::pill("open-chat", "Open the chat with qass", t)
+                        .track_focus(&self.chat.button)
+                        .debug_selector(|| "open-chat".to_string())
+                        .child("Chat")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_chat(crate::chat::ChatTab::Chat, window, cx)
+                        })),
+                )
+            })
+            .when_some(control, |d, control| d.child(control));
+        let link = (questions > 0).then(|| {
+            ui::control(
+                "qass-questions",
+                Role::Link,
+                format!(
+                    "{questions} question{} from qass wait in your Inbox, opens From qass",
+                    if questions == 1 { "" } else { "s" }
+                ),
+                t,
+            )
+            .debug_selector(|| "qass-questions".to_string())
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(10.))
+            .py(px(8.))
+            .rounded(px(10.))
+            .map(|d| ui::paint(d, t.rest()))
+            .hover(|s| ui::paint(s, t.pressed()))
+            .child(ui::qass_mark(12., t))
+            .child(div().flex_1().min_w_0().whitespace_normal().child(format!(
+                "{questions} question{} from qass {} in your Inbox",
+                if questions == 1 { "" } else { "s" },
+                if questions == 1 { "waits" } else { "wait" }
+            )))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(c(t.t2))
+                    .child("opens From qass"),
+            )
+            .child(ui::icon(Icon::Chevron, 13., c(t.t2)))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.inbox_filter = crate::inbox::Filter::FromQass;
+                this.open(Page::Inbox, window, cx);
             }))
+        });
+        let (rules_count, rules) = state::rules_lines(self.lessons);
+        let did = state::did_today(&self.model, &self.acts, self.zone);
+        // Each schedule once, the next to run first; paused and finished ones after.
+        let mut schedules: Vec<&qoop_runtime::control::ScheduleInfo> =
+            self.model.schedules.iter().collect();
+        schedules.sort_by_key(|s| {
+            if s.paused {
+                i64::MAX
+            } else {
+                s.next_at.unwrap_or(i64::MAX - 1)
+            }
+        });
+        let held: Vec<String> = list
+            .with_qass
+            .iter()
+            .map(|t| {
+                let who = self.who_of(&state::Slot::Agent(*t));
+                match self
+                    .model
+                    .row(*t)
+                    .and_then(|r| r.menu.as_ref())
+                    .map(|m| m.question.clone())
+                    .filter(|q| !q.is_empty())
+                {
+                    Some(q) => format!("Holding a question for {who}: {q}"),
+                    None => format!("Holding a question for {who}"),
+                }
+            })
+            .collect();
+        let idle = match &stand {
+            Stand::Watching { .. } => "Holding nothing for you.",
+            Stand::Paused => "Paused, holding nothing.",
+            _ => "Not running, so nothing is held.",
+        };
+        let row = |lead: AnyElement, words: String, sub: Option<String>| {
+            div()
+                .flex()
+                .items_start()
+                .gap(px(10.))
+                .py(px(5.))
+                .child(lead)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().whitespace_normal().child(words))
+                        .when_some(sub, |d, sub| {
+                            d.child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(c(t.t2))
+                                    .whitespace_normal()
+                                    .child(sub),
+                            )
+                        }),
+                )
+        };
+        let head = |title: &str, count: Option<usize>, extra: Option<AnyElement>| {
+            div()
+                .flex()
+                .items_baseline()
+                .gap(px(8.))
+                .pt(px(14.))
+                .pb(px(2.))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title.to_string()),
+                )
+                .when_some(count, |d, n| {
+                    d.child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(c(t.t2))
+                            .child(n.to_string()),
+                    )
+                })
+                .child(div().flex_1())
+                .when_some(extra, |d, e| d.child(e))
+        };
+        let left =
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(head("Now", None, None))
+                .children(
+                    held.into_iter()
+                        .map(|line| row(ui::qass_mark(12., t).into_any_element(), line, None)),
+                )
+                .when(list.with_qass.is_empty(), |d| {
+                    d.child(div().id("qass-idle").text_color(c(t.t2)).child(idle))
+                })
+                .child(head(
+                    "Schedules",
+                    Some(self.model.schedules.len()),
+                    Some(
+                        ui::link_button("nav-schedules", "All schedules", t)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open(Page::Schedules, window, cx)
+                            }))
+                            .into_any_element(),
+                    ),
+                ))
+                .when(self.model.schedules.is_empty(), |d| {
+                    d.child(div().text_color(c(t.t2)).child("No schedules yet."))
+                })
+                .children(schedules.into_iter().map(|sch| {
+                    row(
+                        ui::icon(Icon::Clock, 14., c(t.t2)).into_any_element(),
+                        sch.name.clone(),
+                        Some(state::schedule_line(sch, self.now, self.zone)),
+                    )
+                }))
+                .child(head(
+                    "Rules",
+                    (rules_count > 0).then_some(rules_count),
+                    Some(
+                        ui::link_button("rules-edit", "What it watches", t)
+                            .debug_selector(|| "rules-edit".to_string())
+                            .aria_expanded(self.watch_open)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.watch_open = !this.watch_open;
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    ),
+                ))
+                .children(rules.into_iter().map(|(title, words)| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .py(px(5.))
+                        .child(div().whitespace_normal().child(title))
+                        .when(!words.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(c(t.t2))
+                                    .whitespace_normal()
+                                    .child(words),
+                            )
+                        })
+                }))
+                .when(self.watch_open, |d| {
+                    d.child(div().pt(px(8.)).child(self.watch_card(watching, t, cx)))
+                });
+        let right = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(head("Did today", Some(did.len()), None))
+            .when(did.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id("did-empty")
+                        .text_color(c(t.t2))
+                        .child("Nothing yet today."),
+                )
+            })
+            .children(did.into_iter().enumerate().map(|(i, d)| {
+                div()
+                    .id(("did", i as u64))
+                    .debug_selector(move || format!("did-{i}"))
+                    .flex()
+                    .items_start()
+                    .gap(px(10.))
+                    .py(px(5.))
+                    .child(
+                        div()
+                            .w(px(40.))
+                            .flex_none()
+                            .font_family(MONO_FONT)
+                            .text_size(px(12.))
+                            .text_color(c(t.t3))
+                            .child(d.at),
+                    )
+                    .child(div().flex_1().min_w_0().whitespace_normal().child(d.words))
+            }));
+        div()
+            .id("qass-page")
+            .debug_selector(|| "qass-page".to_string())
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(ui::scroll(
+                div()
+                    .id("qass-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .px(px(26.))
+                            .pt(px(18.))
+                            .pb(px(14.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .child(header)
+                            .when_some(link, |d, link| d.child(link))
+                            .when(
+                                !self.qass_said.clone().unwrap_or_default().is_empty(),
+                                |d| {
+                                    d.child(
+                                        div()
+                                            .id("qass-start-said")
+                                            .role(Role::Status)
+                                            .text_size(px(12.5))
+                                            .text_color(c(t.t2))
+                                            .whitespace_normal()
+                                            .child(self.qass_said.clone().unwrap_or_default()),
+                                    )
+                                },
+                            )
+                            .when(!watching && !asleep, |d| {
+                                d.child(
+                                    div()
+                                        .id("qass-off")
+                                        .role(Role::Status)
+                                        .aria_label(
+                                            "qass is not watching. Every question comes to you.",
+                                        )
+                                        .text_size(px(13.))
+                                        .text_color(c(t.needs_text))
+                                        .child(
+                                            "qass is not watching. Every question comes to you.",
+                                        ),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("qass-columns")
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_start()
+                                    .gap_x(px(28.))
+                                    .child(div().flex_1().min_w(px(300.)).child(left))
+                                    .child(div().flex_1().min_w(px(300.)).child(right)),
+                            ),
+                    ),
+            ))
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(26.))
+                    .pb(px(14.))
+                    .child(self.ask_bar(false, t, cx)),
+            )
+            .when(self.chat.open, |d| {
+                d.child(self.chat_drawer(t, focused, cx))
+            })
+            .into_any_element()
     }
 
     /// All, then each machine's spaces and their agents, each with its switch and what it
@@ -532,50 +805,6 @@ impl Desk {
             }))
             .into_any_element()
     }
-
-    /// Its rules: what stays the owner's, what qass answers alone, and how many lessons it
-    /// keeps, counted from the lessons file on this Mac.
-    fn rules_card(&self, t: &Theme) -> impl IntoElement {
-        let rule = |key: &str, text: String| {
-            div()
-                .flex()
-                .gap(px(10.))
-                .py(px(3.))
-                .text_size(px(12.5))
-                .child(
-                    div()
-                        .w(px(96.))
-                        .flex_none()
-                        .text_color(c(t.t2))
-                        .child(key.to_string()),
-                )
-                .child(div().flex_1().child(text))
-        };
-        let lessons = self.lessons.unwrap_or_default();
-        let count = state::count;
-        side_card("Its rules", None, t)
-            .child(rule(
-                "Always yours",
-                format!(
-                    "Deleting, releasing, production, money, anything external; {} you taught it",
-                    count(lessons.yours, "lesson")
-                ),
-            ))
-            .child(rule(
-                "Answers alone",
-                format!(
-                    "Read-only, or in-repo and reversible; never \"always allow\"; {}",
-                    count(lessons.alone, "lesson")
-                ),
-            ))
-            .child(rule(
-                "Lessons",
-                match self.lessons {
-                    Some(l) => format!("{} in lessons.md", l.all),
-                    None => "none yet: lessons.md is not there".into(),
-                },
-            ))
-    }
 }
 
 /// A card of the right column with its heading and an optional count.
@@ -611,13 +840,6 @@ fn side_card(title: &str, count: Option<usize>, t: &Theme) -> gpui::Div {
                     )
                 }),
         )
-}
-
-fn quiet(text: &str, t: &Theme) -> impl IntoElement {
-    div()
-        .text_size(px(12.5))
-        .text_color(c(t.t2))
-        .child(text.to_string())
 }
 
 /// One switch row: its name, what it means as visible subtext, a count, and the switch.

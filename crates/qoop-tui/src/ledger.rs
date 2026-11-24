@@ -145,7 +145,7 @@ pub fn said(stand: &Stand, env: &Env) -> String {
 /// What the rules file counts, in words.
 pub fn rules_words(rules: Option<crate::answers::Lessons>) -> String {
     match rules {
-        None => "not read here: ask qass what its rules are".to_string(),
+        None => "lessons.md could not be read".to_string(),
         Some(l) if l.all == 0 => "none written yet".to_string(),
         Some(l) => format!(
             "{}: {} it leaves to you, {} it answers alone",

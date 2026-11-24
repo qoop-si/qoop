@@ -29,6 +29,11 @@ pub enum Icon {
     Close,
     Phone,
     Server,
+    Search,
+    /// qass's mark, in two layers: the four lit corners of the nine-dot grid and the five dim
+    /// dots between them (`qass_mark` draws them together).
+    QassLit,
+    QassDim,
 }
 
 impl Icon {
@@ -44,6 +49,9 @@ impl Icon {
             Icon::Close => "icons/close.svg",
             Icon::Phone => "icons/phone.svg",
             Icon::Server => "icons/server.svg",
+            Icon::Search => "icons/search.svg",
+            Icon::QassLit => "icons/qass-lit.svg",
+            Icon::QassDim => "icons/qass-dim.svg",
         }
     }
 
@@ -70,6 +78,14 @@ impl Icon {
             }
             "icons/server.svg" => {
                 r#"<rect x="4" y="4" width="16" height="6.5" rx="1.5"/><rect x="4" y="13.5" width="16" height="6.5" rx="1.5"/><path d="M7.5 7.25h.01M7.5 16.75h.01"/>"#
+            }
+            "icons/search.svg" => r#"<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>"#,
+            // The grid's nine dots on a 24 box, r 2.9: the corners lit, the five between dim.
+            "icons/qass-lit.svg" => {
+                r##"<g fill="#000" stroke="none"><circle cx="3.43" cy="3.43" r="2.9"/><circle cx="20.57" cy="3.43" r="2.9"/><circle cx="3.43" cy="20.57" r="2.9"/><circle cx="20.57" cy="20.57" r="2.9"/></g>"##
+            }
+            "icons/qass-dim.svg" => {
+                r##"<g fill="#000" stroke="none"><circle cx="12" cy="3.43" r="2.9"/><circle cx="3.43" cy="12" r="2.9"/><circle cx="12" cy="12" r="2.9"/><circle cx="20.57" cy="12" r="2.9"/><circle cx="12" cy="20.57" r="2.9"/></g>"##
             }
             _ => return None,
         })
@@ -102,6 +118,27 @@ pub fn icon(which: Icon, size: f32, ink: impl Into<Hsla>) -> Svg {
         .size(px(size))
         .flex_none()
         .text_color(ink.into())
+}
+
+/// qass's mark: the nine dots of the grid, the four corners in the ink and the five between
+/// them faint. `size` px square.
+pub fn qass_mark(size: f32, t: &Theme) -> Div {
+    div()
+        .relative()
+        .size(px(size))
+        .flex_none()
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .child(icon(Icon::QassDim, size, ca(t.fill2))),
+        )
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .child(icon(Icon::QassLit, size, c(t.ink))),
+        )
 }
 
 /// A state's mark ink.
@@ -862,6 +899,19 @@ pub fn sheet(
 mod tests {
     use super::*;
     use crate::theme::{DARK, LIGHT};
+
+    /// qass's mark is served as two layers: four lit corners and the five dots between them.
+    #[test]
+    fn qass_mark_is_the_grid_with_four_corners_lit() {
+        let layer = |path: &str| {
+            let bytes = Assets.load(path).expect("loads").expect("an asset");
+            String::from_utf8(bytes.into_owned()).expect("svg text")
+        };
+        let lit = layer("icons/qass-lit.svg");
+        let dim = layer("icons/qass-dim.svg");
+        assert_eq!(lit.matches("<circle").count(), 4, "the corners");
+        assert_eq!(dim.matches("<circle").count(), 5, "the rest of the nine");
+    }
 
     /// The ring is the focus ink inside the edge with a `bg` band inside it: it never sets
     /// the fill or the text, and no shadow of it is drawn outside, where GPUI would paint it

@@ -125,13 +125,19 @@ pub enum Place {
 
 /// qass's rules as the lessons file counts them, `None` when no file can be read: no
 /// lessons file at all is an empty count, an unreadable one is none. At most 1 MB is read.
+/// Never under test, so the suite never depends on the developer's own qass.
 pub fn rules_read() -> Option<Lessons> {
-    use std::io::Read;
-    // Never under test, so the suite never depends on the developer's own qass.
     if cfg!(test) {
         return None;
     }
-    let path = qoop_runtime::paths::qass_config_dir().join("lessons.md");
+    rules_read_at(&qoop_runtime::paths::qass_config_dir().join("lessons.md"))
+}
+
+/// The rules in the lessons file at `path`: a file that is not there is an empty count (qass
+/// has taught nobody anything yet), one that cannot be read is `None`. Only the first 1 MiB is
+/// read. The one reader the TUI's ledger and the desktop's qass page share.
+pub fn rules_read_at(path: &std::path::Path) -> Option<Lessons> {
+    use std::io::Read;
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Lessons::default()),
@@ -247,6 +253,34 @@ pub fn keys_of(bytes: &[u8]) -> Vec<K> {
 
 /// The computers a name stands for: "This Mac", or the machine before the colon of a remote
 /// space's name.
+/// The computers the spaces are on, This Mac first, each once.
+pub fn computers(spaces: &[WorkspaceRow]) -> Vec<usize> {
+    let mut out = vec![0];
+    for s in spaces {
+        let m = machine_of(s.id);
+        if !out.contains(&m) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// The computer after `at` in [`computers`], round to This Mac; `at` itself when there is only
+/// one.
+pub fn next_computer(spaces: &[WorkspaceRow], at: usize) -> usize {
+    let all = computers(spaces);
+    let i = all.iter().position(|m| *m == at).unwrap_or(0);
+    all[(i + 1) % all.len()]
+}
+
+/// A space on `machine`, through which a request is carried to it (`Via`), if it has one.
+pub fn space_on(spaces: &[WorkspaceRow], machine: usize) -> Option<i64> {
+    spaces
+        .iter()
+        .find(|s| machine_of(s.id) == machine)
+        .map(|s| s.id)
+}
+
 pub fn machine_name(spaces: &[WorkspaceRow], machine: usize) -> String {
     if machine == 0 {
         return "This Mac".to_string();
@@ -1374,5 +1408,35 @@ mod place_tests {
                 "{seen}"
             );
         }
+    }
+
+    /// The lessons file: missing is none written yet, a folder where it should be (unreadable)
+    /// is none, and one that is there is counted.
+    #[test]
+    fn the_rules_file_missing_unreadable_and_present() {
+        let dir = std::env::temp_dir().join(format!("qoop-rules-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert_eq!(
+            rules_read_at(&dir.join("nothing.md")),
+            Some(Lessons::default()),
+            "no file: none written yet"
+        );
+        assert_eq!(rules_read_at(&dir), None, "a folder cannot be read");
+        let file = dir.join("lessons.md");
+        std::fs::write(
+            &file,
+            "- a release -> escalate (owner)\n- a test run -> do it (E7)\n- a bump -> wait (E9)\n",
+        )
+        .expect("file");
+        assert_eq!(
+            rules_read_at(&file),
+            Some(Lessons {
+                yours: 1,
+                alone: 1,
+                all: 3
+            })
+        );
+        std::fs::remove_file(&file).expect("clean");
+        std::fs::remove_dir(&dir).expect("clean");
     }
 }

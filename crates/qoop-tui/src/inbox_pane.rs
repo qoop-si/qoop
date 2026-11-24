@@ -278,6 +278,8 @@ pub struct Pane {
     pub filter: bool,
     /// The Board in place of the list (`tab`).
     pub board: bool,
+    /// The computer whose board shows (`m` turns to the next): 0 is This Mac.
+    pub computer: usize,
     /// A place beside the Inbox that has the pane: qass's ledger, a computer, the new agent
     /// box. The Inbox is under it and comes back when it is put away.
     pub place: Option<Place>,
@@ -1248,8 +1250,15 @@ impl Pane {
     }
 
     /// The Board has the keys: it only reads, so a key that answers does nothing here.
-    fn board_key(&mut self, key: Key) -> Out {
+    fn board_key(&mut self, key: Key, env: &Env) -> Out {
         match key {
+            // The next computer's board: the client reads it (through the mux, by `Via`). `c`, for
+            // computer: `m` keeps its one meaning in the Inbox, reading the whole card.
+            Key::Char(b'c') => {
+                self.computer = crate::places::next_computer(env.spaces, self.computer);
+                self.offset.set(0);
+                Out::Stay
+            }
             Key::Esc => Out::Closed,
             Key::Tab => {
                 self.show_board(false);
@@ -1272,6 +1281,7 @@ impl Pane {
     /// Show the Board in place of the list, or the list again.
     pub fn show_board(&mut self, on: bool) {
         self.board = on;
+        self.computer = 0;
         self.whole = false;
         self.stash_typing();
         self.offset.set(0);
@@ -1280,7 +1290,7 @@ impl Pane {
 
     fn act(&mut self, key: Key, env: &Env) -> Out {
         if self.board {
-            return self.board_key(key);
+            return self.board_key(key, env);
         }
         let inbox = self.inbox(env);
         let item = self.item(&inbox);
@@ -1910,7 +1920,25 @@ impl Pane {
         let height = rows.saturating_sub(head.len() + foot.len()).max(1);
         let (body, range) = if self.board {
             let handed: BTreeSet<u32> = inbox.with_qass.iter().copied().collect();
-            (crate::board::rows(env.beside.board, &handed, cols), None)
+            let name = crate::places::machine_name(env.spaces, self.computer);
+            let mut body = Vec::new();
+            // Which computer this is, when there is more than one to choose from.
+            if crate::places::computers(env.spaces).len() > 1 {
+                body.extend(wrapped(
+                    &format!("board of {name}  c turns to the next computer"),
+                    1,
+                    cols,
+                    Role::FaintText,
+                    false,
+                ));
+            }
+            body.extend(crate::board::rows_of(
+                env.beside.board,
+                &name,
+                &handed,
+                cols,
+            ));
+            (body, None)
         } else if self.whole {
             (self.whole_rows(item, env, cols), None)
         } else {
@@ -2035,7 +2063,12 @@ impl Pane {
                 faint("j k scroll"),
                 faint("n new agent"),
                 faint("esc closes"),
-            ];
+            ]
+            .into_iter()
+            .chain(
+                (crate::places::computers(env.spaces).len() > 1).then(|| faint("c next computer")),
+            )
+            .collect();
         }
         if self.whole {
             let mut out = vec![faint("j k scroll")];
@@ -3296,6 +3329,45 @@ mod tests {
         assert_eq!(pane.selected(&order), Some(order[1].clone()));
         press(&mut pane, &w, ready, b"\x1b[B");
         assert_eq!(pane.selected(&order), Some(order[2].clone()));
+    }
+
+    /// The Board turns to the next computer with `c` when there is more than one, says whose
+    /// board it is and offers the key; with only This Mac there is nothing to turn to.
+    #[test]
+    fn the_board_turns_to_the_next_computer_with_c() {
+        let mut w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        let remote = 1i64 << 40 | 1;
+        w.spaces.retain(|s| machine_of(s.id) == 0);
+        w.spaces.push(space(remote, "staging:work".into()));
+        assert_eq!(press(&mut pane, &w, ready, b"\t"), Out::Stay);
+        assert!(pane.board && pane.computer == 0);
+        let shown = pane.view(&env(&w, ready), 100, 40).plain.join("\n");
+        assert!(shown.contains("board of This Mac"), "{shown}");
+        assert!(shown.contains("c next computer"), "{shown}");
+        assert_eq!(press(&mut pane, &w, ready, b"c"), Out::Stay);
+        assert_eq!(
+            crate::places::machine_name(&w.spaces, pane.computer),
+            "staging"
+        );
+        let shown = pane.view(&env(&w, ready), 100, 40).plain.join("\n");
+        assert!(shown.contains("board of staging"), "{shown}");
+        // Round to This Mac, and back on the list the Board is This Mac's again.
+        press(&mut pane, &w, ready, b"c");
+        assert_eq!(pane.computer, 0);
+        press(&mut pane, &w, ready, b"c");
+        press(&mut pane, &w, ready, b"\t");
+        assert!(!pane.board && pane.computer == 0);
+        // Only This Mac: no key, no line.
+        w.spaces.retain(|s| machine_of(s.id) == 0);
+        press(&mut pane, &w, ready, b"\t");
+        let shown = pane.view(&env(&w, ready), 100, 40).plain.join("\n");
+        assert!(
+            !shown.contains("c next computer") && !shown.contains("board of"),
+            "{shown}"
+        );
+        press(&mut pane, &w, ready, b"c");
+        assert_eq!(pane.computer, 0);
     }
 
     #[test]

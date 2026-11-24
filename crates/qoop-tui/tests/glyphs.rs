@@ -75,6 +75,7 @@ const MATCHED: &[(&str, &str)] = &[
 const MAC_ONLY: &[(&str, &str)] = &[
     ("qoop-desktop/src/shell.rs", "\u{2318}"),
     ("qoop-desktop/src/inbox.rs", "\u{2318}"),
+    ("qoop-desktop/src/session.rs", "\u{2318}"),
 ];
 
 /// Files that make a character from a number, and why what they make is safe.
