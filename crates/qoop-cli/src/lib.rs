@@ -4131,6 +4131,23 @@ mod tests {
         }
     }
 
+    /// The notch reads only `agents --watch --json`, and counts a handed question by the row's
+    /// `with_qass`: the watch output carries it for a handed agent and omits it otherwise, so an
+    /// older notch and an older daemon both read an absent field as false.
+    #[test]
+    fn the_watch_json_carries_with_qass_for_a_handed_agent_only() {
+        let mut handed = row(1, Some("a"), Some("claude"));
+        handed.state = "blocked".into();
+        handed.with_qass = true;
+        let mut mine = row(2, Some("b"), Some("claude"));
+        mine.state = "blocked".into();
+        let sessions = super::supervise::Sessions::from([("s".to_string(), vec![handed, mine])]);
+        let said = super::watch_listing(&sessions, true, true).expect("a listing");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&said).expect("json");
+        assert_eq!(rows[0]["with_qass"], true, "{said}");
+        assert!(rows[1].get("with_qass").is_none(), "{said}");
+    }
+
     #[test]
     fn a_terminal_number_resolves_before_any_name() {
         let rows = vec![row(1, Some("1"), None), row(2, None, Some("sh"))];

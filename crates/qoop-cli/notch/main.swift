@@ -1,7 +1,8 @@
 // The notch: qoop's agents at the top of the screen.
 //
 // Closed, it is the camera housing grown two ears: the person's pet on the left with
-// a badge counting the agents that need them, and on the right how many are
+// a badge counting the agents that need them (blocked or failed, not the ones handed to
+// qass, and not finished work nobody has read), and on the right how many are finished,
 // working and idle. Clicked, it drops an inbox of every agent, grouped by what it is
 // doing; clicking a row switches the qoop interface to that terminal and brings its
 // window forward. With no qoop running, or no agents in it, the notch is left alone.
@@ -52,6 +53,9 @@ struct Row: Decodable, Equatable, Identifiable {
     /// What every surface shows for the row, decided once by the daemon (`AgentRow.status`).
     /// Absent from a qoop that predates it, whose raw state is read instead.
     let status: String?
+    /// Set while qass holds this agent's question: handed out, so it is no longer the
+    /// person's to answer and leaves the count. Absent from a qoop that predates it.
+    let with_qass: Bool?
 
     /// The row's state in the words read below: the daemon's status, else the raw state.
     var shown: String {
@@ -64,11 +68,16 @@ struct Row: Decodable, Equatable, Identifiable {
         }
     }
 
-    enum Kind { case waiting, done, working, idle }
+    enum Kind { case waiting, handed, done, working, idle }
+
+    /// Blocked and handed to qass: the question is qass's now, and it comes back to the
+    /// person as a card if qass cannot settle it. A failed agent is never handed out.
+    var handed: Bool { with_qass == true && shown == "blocked" }
 
     var kind: Kind {
         switch shown {
-        case "blocked", "failed": return .waiting
+        case "blocked": return handed ? .handed : .waiting
+        case "failed": return .waiting
         case "working": return .working
         case "done": return .done
         default: return status == nil && news == true ? .done : .idle
@@ -82,8 +91,8 @@ struct Row: Decodable, Equatable, Identifiable {
         switch kind {
         case .working: return .working
         case .waiting: return shown == "failed" ? .failed : .wants
+        case .handed, .idle: return .idle
         case .done: return .done
-        case .idle: return .idle
         }
     }
 
@@ -91,6 +100,7 @@ struct Row: Decodable, Equatable, Identifiable {
     var place: String { cwd.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "" }
     var detail: String {
         if shown == "failed" { return "failed" }
+        if handed { return agent_title ?? "with qass" }
         return agent_title ?? (kind == .waiting ? "needs you" : "")
     }
     /// Blocked or Failed for a row that needs you, its state's green once done, nothing
@@ -195,11 +205,15 @@ final class Store: ObservableObject {
     var waiting: Int { rows.filter { $0.kind == .waiting }.count }
     /// The worst state that needs you, as the TUI ranks them: blocked, then failed.
     var needKind: DotMark.Kind {
-        rows.contains { $0.shown == "failed" } && !rows.contains { $0.shown == "blocked" } ? .failed : .wants
+        let asking = rows.filter { $0.kind == .waiting }
+        return asking.contains { $0.shown == "failed" } && !asking.contains { $0.shown == "blocked" } ? .failed : .wants
     }
     var needInk: Color { DotMark.ink(needKind) }
     var working: Int { rows.filter { $0.kind == .working }.count }
     var idle: Int { rows.filter { $0.kind == .idle }.count }
+    /// Agents whose question qass holds. Quiet: they are in the island's own section and in
+    /// no count, which is the rule every other place counts by.
+    var handed: Int { rows.filter { $0.kind == .handed }.count }
     /// Finished while the person was elsewhere, as the qoop interface shows it.
     var finished: Int { rows.filter { $0.kind == .done }.count }
     /// Whether the rows come from more than one session, so each says which.
@@ -1052,13 +1066,19 @@ struct RowView: View {
                 .foregroundStyle(.white.opacity(0.45))
                 .rotationEffect(.degrees(open ? 90 : 0))
             DotMark(kind: row.dotKind, size: 11)
+            // Never cut: a long name or title wraps onto more lines and the row grows with it.
             Text(row.label)
                 .fontWeight(.medium)
-                .foregroundStyle(row.ink ?? (row.kind == .idle ? .white.opacity(0.6) : .white))
+                .foregroundStyle(row.ink ?? (row.kind == .idle || row.kind == .handed ? .white.opacity(0.6) : .white))
+                .fixedSize(horizontal: false, vertical: true)
+                // A name wider than `labelMax` wraps inside it, so the detail beside it keeps its room;
+                // a shorter one keeps its own width.
+                .frame(width: !(row.place.isEmpty && row.detail.isEmpty) && Geometry.textWidth(row.label, size: 13, weight: .medium) > Geometry.labelMax ? Geometry.labelMax : nil, alignment: .leading)
+                .layoutPriority(1)
             Text([row.place, row.detail].filter { !$0.isEmpty }.joined(separator: " \u{00b7} "))
                 .foregroundStyle(.white.opacity(0.42))
-                .lineLimit(1)
-                .truncationMode(.tail)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(minWidth: Geometry.detailMin, alignment: .leading)
             Spacer(minLength: 8)
             Text(session ? "\(row.session)  \(row.terminal)" : "\(row.terminal)")
                 .font(.system(size: 11, design: .monospaced))
@@ -1068,7 +1088,8 @@ struct RowView: View {
         }
         .font(.system(size: 13))
         .padding(.horizontal, 8)
-        .frame(height: 30)
+        .padding(.vertical, 4)
+        .frame(minHeight: Geometry.rowHeight)
         .background(RoundedRectangle(cornerRadius: 8).fill(
             row.ink?.opacity(over || open ? 0.18 : 0.1) ?? .white.opacity(over || open ? 0.08 : 0)))
         // The space's rail down the row's left edge, so rows of one space read as a block.
@@ -1337,7 +1358,7 @@ struct TermPeek: View {
             }
             HStack(spacing: 8) {
                 if let note = store.note {
-                    Text(note).foregroundStyle(blocked).lineLimit(1).truncationMode(.tail)
+                    Text(note).foregroundStyle(blocked).fixedSize(horizontal: false, vertical: true)
                 } else {
                     Text(typing ? "typing into terminal \(row.terminal); click outside to stop" : "click to type into terminal \(row.terminal)")
                         .foregroundStyle(typing ? focus.opacity(0.9) : .white.opacity(0.4))
@@ -1387,13 +1408,24 @@ struct Island: View {
                 Text(note)
                     .font(.system(size: 12))
                     .foregroundStyle(blocked)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 6)
                     .transition(.opacity)
             }
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 0) {
                     section("needs you", .waiting, s.needKind)
+                    // The notch reads only the agents, so a question qass could not settle, a card
+                    // of its own, or a plan to approve is in no number here: it is in the Inbox.
+                    // Said whenever the island is open, since those cards exist whether or not an
+                    // agent is handed out (a hand qass turns into a card is no longer `with_qass`).
+                    Text("questions from qass are in the Inbox")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.42))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(height: Geometry.qassLine - 8, alignment: .leading)
+                        .padding(.vertical, 4)
+                    section("with qass", .handed, .idle)
                     section("done", .done, .done)
                     section("working", .working, .working)
                     section("idle", .idle, .idle)
@@ -1625,8 +1657,7 @@ struct SettingsView: View {
             LabeledContent("File") {
                 Text(c.exists ? c.path : "no file yet: every setting is its default")
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
             HStack {
@@ -1688,6 +1719,15 @@ struct Geometry {
     var notch: CGSize
     static let openWidth: CGFloat = 500
     static let rowHeight: CGFloat = 30
+    /// The line that points to the Inbox for qass's questions, always drawn while the island is open.
+    static let qassLine: CGFloat = 22
+    /// The least width the detail beside a row's name keeps, so a long name wraps itself
+    /// before it squeezes the detail below this.
+    static let detailMin: CGFloat = 96
+    /// The widest a row's name gets beside a detail: the row's inner width, less its chevron, mark
+    /// and gaps, a number's room and the detail's minimum. A longer name wraps, so the detail
+    /// keeps its 96 and the panel grows rather than scrolling.
+    static let labelMax: CGFloat = openWidth - 40 - 16 - (9 + 11 + 6 * 5 + 8) - 44 - detailMin - 8
     /// What a sentence has to wrap inside the peek's box: the open island, less the
     /// island's own padding and the box's.
     static let peekText: CGFloat = openWidth - 40 - 16
@@ -1714,11 +1754,42 @@ struct Geometry {
         return notch.width + 2 * ear
     }
 
+    /// The width AppKit gives `text` on one line, at a font.
+    static func textWidth(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, mono: Bool = false) -> CGFloat {
+        let font = mono ? NSFont.monospacedSystemFont(ofSize: size, weight: weight) : NSFont.systemFont(ofSize: size, weight: weight)
+        return ceil(NSAttributedString(string: text, attributes: [.font: font]).size().width)
+    }
+
+    /// How many lines a row's words take at the island's width. Nothing is cut, so a long name
+    /// or title wraps and the row grows; the panel is sized before SwiftUI lays the island out,
+    /// so it asks AppKit the same question. A wrong guess hides nothing: past `openMaxHeight`
+    /// the island scrolls.
+    func rowLines(_ r: Row, session: Bool) -> Int {
+        let inner = Geometry.openWidth - 40 - 16
+        // The chevron, the mark and the gaps between the pieces of a row.
+        let chrome: CGFloat = 9 + 11 + 6 * 5 + 8
+        let number = Geometry.textWidth(session ? "\(r.session)  \(r.terminal)" : "\(r.terminal)", size: 11, mono: true)
+        let label = Geometry.textWidth(r.label, size: 13, weight: .medium)
+        let detail = Geometry.textWidth([r.place, r.detail].filter { !$0.isEmpty }.joined(separator: " \u{00b7} "), size: 13)
+        let room = inner - chrome - number
+        // With a detail the name gets `labelMax` at most and the detail what is left, never less
+        // than its minimum.
+        let labelRoom = detail == 0 ? room : min(room - Geometry.detailMin - 8, Geometry.labelMax)
+        let labelLines = Int(ceil(label / max(labelRoom, 1)))
+        let beside = min(label, labelRoom)
+        let detailLines = detail == 0 ? 1 : Int(ceil(detail / max(room - beside - 8, Geometry.detailMin)))
+        return max(1, labelLines, detailLines)
+    }
+
     func openHeight(_ s: Store) -> CGFloat {
-        let sections = [Row.Kind.waiting, .done, .working, .idle].filter { k in s.rows.contains { $0.kind == k } }.count
+        let sections = [Row.Kind.waiting, .handed, .done, .working, .idle].filter { k in s.rows.contains { $0.kind == k } }.count
         let peek: CGFloat = s.expanded == nil ? 0 : TermPeek.height + 6 + 18 + 12
-        let note: CGFloat = s.note == nil || s.expanded != nil ? 0 : 26
-        let full = notch.height + 20 + CGFloat(sections) * 25 + CGFloat(s.rows.count) * Geometry.rowHeight + 4 + peek + note
+        let noteLines = s.note.map { Int(ceil(Geometry.textWidth($0, size: 12) / (Geometry.openWidth - 40))) } ?? 1
+        let note: CGFloat = s.note == nil || s.expanded != nil ? 0 : CGFloat(12 + 15 * max(noteLines, 1))
+        // The line that says qass's questions are in the Inbox, under the section of what it holds.
+        let qass = Geometry.qassLine
+        let wrapped = s.rows.reduce(CGFloat(0)) { $0 + CGFloat(rowLines($1, session: s.mixed) - 1) * 16 }
+        let full = notch.height + 20 + CGFloat(sections) * 25 + CGFloat(s.rows.count) * Geometry.rowHeight + wrapped + qass + 4 + peek + note
         return min(full, Geometry.openMaxHeight)
     }
 
@@ -1753,7 +1824,7 @@ struct NotchView: View {
                     if s.open {
                         Text(personName)
                             .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
-                            .lineLimit(1)
+                            .fixedSize()
                             .padding(.leading, 12)
                             .transition(.opacity)
                     }
