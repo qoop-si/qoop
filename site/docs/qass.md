@@ -15,8 +15,9 @@ qoop qass
 It opens qass in its own space on the agent `qoop settings` names (`qass runs on`: claude by
 default, codex, gemini, opencode, or one of your own `[agents]` lines, such as
 `claudes = "claude --model sonnet"`), or shows or wakes the one you have. `ctrl-a Q` goes there
-and back. The desktop app shows qass on its qass page, with a drawer for the chat. Close it as
-any tab: `ctrl-a x` in it, or `qoop close`.
+and back. In the desktop app, qass in the sidebar opens qass's own agent page; while qass is not
+running it says so, with Start. What qass watches, per space and per agent, is in the app's
+Settings. Close it as any tab: `ctrl-a x` in it, or `qoop close`.
 
 ## When it acts
 

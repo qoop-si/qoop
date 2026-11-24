@@ -705,7 +705,12 @@ impl Desk {
         };
         let row = self.model.row(terminal)?;
         let menu = row.menu.as_ref().filter(|_| Kind::of(row).needs_you())?;
-        Some((terminal, state::offers(menu), menu.seal, row.menu_seal))
+        Some((
+            terminal,
+            self.model.offers(row, menu),
+            menu.seal,
+            row.menu_seal,
+        ))
     }
 
     /// Open the field for the owner's own answer to `terminal`'s menu, or to its card `card`.
@@ -1094,7 +1099,7 @@ impl Desk {
             return div().into_any_element();
         };
         let terminal = row.terminal;
-        let offers = state::offers(menu);
+        let offers = self.model.offers(row, menu);
         let words = state::text_key(menu).is_some() && self.takes_words(row);
         // Its machine is not reached: the question is the last one seen, neutral, not answerable.
         let as_of = self.as_of(row.workspace);

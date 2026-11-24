@@ -1,8 +1,8 @@
 //! The window: routing between pages, the shell around them (`shell.rs`), the prefix keys, and
 //! what the link brings in.
 //!
-//! Pages are the Inbox (where the window opens), a Session (one terminal), qass (its own
-//! terminal), Schedules, Settings and a Computer. The prefix from `config.toml` (default
+//! Pages are the Inbox (where the window opens), a Session (one terminal; qass's place is its
+//! own terminal's), qass while it does not run, Schedules, Settings and a Computer. The prefix from `config.toml` (default
 //! `ctrl-a`) belongs to the app: `ctrl-a c` New agent, `ctrl-a i` the Inbox (and back),
 //! `ctrl-a tab` the agent that has waited longest, the prefix twice sends it to the terminal on
 //! screen. Cmd-J (next waiting) and Cmd-N (New agent) are the app's and never reach a terminal.
@@ -23,7 +23,7 @@ use gpui::{
 use qoop_domain::Viewport;
 use qoop_runtime::avatar::Avatar;
 use qoop_runtime::control::{
-    AgentMenu, AskInfo, ControlRequest, ControlResponse, EventMessage, QassAct, TerminalStream,
+    AgentMenu, AskInfo, ControlRequest, ControlResponse, EventMessage, TerminalStream,
 };
 use qoop_runtime::daemon::SnapshotWire;
 use qoop_runtime::schedule::Zone;
@@ -31,8 +31,7 @@ use qoop_tui::seen;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::board::BoardPage;
-use crate::chat::ChatDrawer;
-use crate::element::{BACKGROUND, Cells, FOREGROUND, TerminalElement, cells};
+use crate::element::{BACKGROUND, Cells, FOREGROUND, cells};
 use crate::keys::{self, Press};
 use crate::link::{self, Down, Latest, Up};
 use crate::newwork::NewWork;
@@ -40,7 +39,7 @@ use crate::question::{OwnAnswer, Said};
 use crate::review::Review;
 use crate::shell::{self, Edge};
 use crate::state::{self, Model};
-use crate::theme::{TERMINAL_BG, TOP_GLOW, Theme, UI_FONT, c, ca};
+use crate::theme::{TOP_GLOW, Theme, UI_FONT, c, ca};
 use crate::ui;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,28 +170,17 @@ pub struct Desk {
     pub(crate) own: Option<OwnAnswer>,
     /// The question card opened in place on the Session page; `None` opens the oldest.
     pub(crate) card_open: Option<String>,
-    /// qass's cards waiting on the owner, and what qass did on its own today.
+    /// qass's cards waiting on the owner.
     pub asks: Vec<AskInfo>,
     /// The last few cards that ended, newest first: with `asks`, what Answered today reads.
     pub ended: Vec<AskInfo>,
-    pub acts: Vec<QassAct>,
-    /// qass's lessons file counted, read when its page opens; `None` when there is none.
-    pub lessons: Option<state::Lessons>,
     /// What starting qass said, while it starts or when it could not.
     pub(crate) qass_said: Option<String>,
-    /// The Board (the Inbox's second view), the chat drawer on the qass page, and the field of
-    /// the ask bar; what the last line to qass said; when this window last saw qass running;
-    /// and whether the page lists what it watches.
+    /// The Board (the Inbox's second view), and what the last line to qass said.
     pub(crate) board: BoardPage,
-    pub(crate) chat: ChatDrawer,
-    pub(crate) qass_ask: Entity<crate::field::Field>,
     pub(crate) ask_said: Option<String>,
-    pub(crate) qass_seen: Option<i64>,
-    pub(crate) watch_open: bool,
     /// The one timer of the holds is running.
     pub(crate) ticking: bool,
-    /// qass's lessons file, read when its page opens.
-    pub lessons_path: std::path::PathBuf,
     /// The person's `config.toml` and their pet's file: the settings page reads and writes
     /// these (tests point them at their own).
     pub config_path: std::path::PathBuf,
@@ -313,18 +301,13 @@ impl Desk {
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty());
         let nowhere = std::path::PathBuf::from("/nonexistent/qoop");
-        let (lessons_path, config_path, pet_path) = if owner {
+        let (config_path, pet_path) = if owner {
             (
-                qoop_runtime::paths::qass_config_dir().join("lessons.md"),
                 qoop_tui::config::path(),
                 qoop_runtime::avatar::avatar_path(),
             )
         } else {
-            (
-                nowhere.join("lessons.md"),
-                nowhere.join("config.toml"),
-                nowhere.join("avatar.json"),
-            )
+            (nowhere.join("config.toml"), nowhere.join("avatar.json"))
         };
         Desk {
             model: Model {
@@ -371,26 +354,11 @@ impl Desk {
             card_open: None,
             asks: Vec::new(),
             ended: Vec::new(),
-            acts: Vec::new(),
-            lessons: None,
             qass_said: None,
             board: BoardPage::new(cx),
-            chat: ChatDrawer::new(cx),
-            qass_ask: {
-                let ask = cx.new(|cx| {
-                    let mut f = crate::field::Field::new("Ask qass, or tell it what to do", cx);
-                    f.label = Some("Ask qass".into());
-                    f
-                });
-                cx.observe(&ask, |_, _, cx| cx.notify()).detach();
-                ask
-            },
             ask_said: None,
-            qass_seen: None,
-            watch_open: false,
             ticking: false,
             schedule_page: Default::default(),
-            lessons_path,
             config_path,
             pet_path,
             settings: Default::default(),
@@ -511,26 +479,13 @@ impl Desk {
                 self.answer(*answer, window, cx)
             }
             Down::Event(EventMessage::Focus { terminal, .. }) => {
-                let qass = self
-                    .model
-                    .row(terminal)
-                    .and_then(|r| self.model.space(r.workspace))
-                    .is_some_and(|w| w.name == state::QASS_SPACE);
-                let page = if qass {
-                    Page::Qass
-                } else {
-                    Page::Session(terminal)
-                };
-                self.open(page, window, cx);
+                self.open(Page::Session(terminal), window, cx);
                 window.activate_window();
             }
             Down::Event(EventMessage::TasksChanged) => {
                 self.ask_strip();
                 self.ask_watch();
                 self.board_changed();
-            }
-            Down::Event(EventMessage::MessagesChanged { terminal, .. }) => {
-                self.chat_changed(terminal);
             }
             Down::Event(EventMessage::AsksChanged) => self.ask_inbox(),
             Down::Event(EventMessage::SchedulesChanged) => self.refresh_remote(),
@@ -543,7 +498,6 @@ impl Desk {
             || self.report_came(&answer, window, cx)
             || self.remote_setting_came(&answer)
             || self.board_answered(&answer, cx)
-            || self.chat_came(&answer, cx)
         {
             return;
         }
@@ -556,6 +510,7 @@ impl Desk {
                     &agents,
                     &self.model.spaces,
                 ));
+                let qass_was = self.qass_terminal();
                 let before = std::mem::replace(&mut self.model.rows, agents);
                 self.model.splits = splits;
                 // A new question on a row: "Sent: Yes, 18:16" was the old one's.
@@ -567,13 +522,6 @@ impl Desk {
                 }
                 self.note_hand();
                 self.listed = true;
-                if self.model.qass_row().is_some() {
-                    self.qass_seen = Some(unix_now());
-                }
-                // An agent that waited works again: maybe qass wrote to it, an act to show.
-                if self.page == Page::Qass && state::woke(&before, &self.model.rows) {
-                    self.ask_acts();
-                }
                 self.answered_elsewhere(&before);
                 self.rows_changed();
                 self.menus_changed(cx);
@@ -582,13 +530,16 @@ impl Desk {
                 if self.qass_terminal().is_some() {
                     self.qass_starting_until = None;
                 }
-                // The qass page follows qass both ways: its terminal comes on when qass starts
-                // or wakes, and goes when qass's agent leaves it (a plain shell is not qass), so
-                // "Start it" shows at once.
-                if self.page == Page::Qass
-                    && self.term.as_ref().map(|t| t.terminal)
-                        != self.chat.terminal().then(|| self.qass_terminal()).flatten()
-                {
+                // qass's place follows qass both ways: its agent page when qass starts or wakes,
+                // "Start it" once its agent leaves its terminal (a plain shell is not qass). A
+                // terminal of This Mac's qass space is qass's place even when this window never
+                // saw qass run in it.
+                let place = match self.page {
+                    Page::Qass => true,
+                    Page::Session(t) => Some(t) == qass_was || self.model.in_qass_space(t),
+                    _ => false,
+                };
+                if place && self.page != self.qass_terminal().map_or(Page::Qass, Page::Session) {
                     self.open(Page::Qass, window, cx);
                 }
                 // New agent's agent is listed: the sheet closes on it.
@@ -609,7 +560,6 @@ impl Desk {
                     ),
                 });
             }
-            ControlResponse::QassActs { acts, .. } => self.acts = acts,
             ControlResponse::Tasks {
                 id,
                 tasks,
@@ -703,6 +653,12 @@ impl Desk {
     /// from a session keeps that session's terminal shown behind it, so coming back is the same
     /// screen, scrollback and size, and the keys never reach it meanwhile.
     pub fn open(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        // qass's place is its agent page while it runs; the qass page says it does not.
+        let page = if page == Page::Qass {
+            self.qass_terminal().map_or(Page::Qass, Page::Session)
+        } else {
+            page
+        };
         let keep = page == Page::Inbox
             && matches!(self.page, Page::Session(_) | Page::Inbox)
             && self.term.is_some();
@@ -711,8 +667,6 @@ impl Desk {
         }
         let terminal = match page {
             Page::Session(t) => Some(t),
-            Page::Qass if self.chat.terminal() => self.qass_terminal(),
-            Page::Qass => None,
             _ if keep => self.term.as_ref().map(|t| t.terminal),
             _ => None,
         };
@@ -722,13 +676,9 @@ impl Desk {
             self.strip = None;
         }
         self.page = page;
-        if page == Page::Qass {
-            self.read_lessons();
-            self.ask_watch();
-            self.ask_acts();
-        }
         if page == Page::Settings {
             self.read_settings();
+            self.ask_watch();
         }
         if page == Page::Schedules && self.schedule_page.via.is_none() {
             let ids: Vec<i64> = self.model.schedules.iter().map(|s| s.id).collect();
@@ -900,11 +850,11 @@ impl Desk {
         if self.schedule_sheet_key(event, window, cx) {
             return;
         }
-        // Enter and Escape in the Board's and the chat's fields, which are theirs.
+        // Enter and Escape in the Board's fields, which are theirs.
         if !k.modifiers.control
             && !k.modifiers.platform
             && !k.modifiers.alt
-            && (self.board_key(&k.key, window, cx) || self.chat_key(&k.key, window, cx))
+            && self.board_key(&k.key, window, cx)
         {
             cx.stop_propagation();
             return;
@@ -940,9 +890,7 @@ impl Desk {
 
     /// Whether the page draws a terminal that can take the keys.
     pub(crate) fn term_drawn(&self) -> bool {
-        self.term.is_some()
-            && (matches!(self.page, Page::Session(_))
-                || (self.page == Page::Qass && self.chat.terminal()))
+        self.term.is_some() && matches!(self.page, Page::Session(_))
     }
 
     /// Whether any text field of the window has the keys: the own words, New agent's task, the
@@ -970,8 +918,6 @@ impl Desk {
                 .add
                 .as_ref()
                 .is_some_and(|a| on(&a.field, window, cx))
-            || on(&self.qass_ask, window, cx)
-            || on(&self.chat.ask, window, cx)
             || self.own.as_ref().is_some_and(|o| on(&o.field, window, cx))
             || self.sheet.as_ref().is_some_and(|s| on(&s.task, window, cx))
             || self
@@ -1098,24 +1044,11 @@ impl Desk {
         });
     }
 
-    /// qass's cards and what it did today, read again.
+    /// qass's cards, read again.
     pub(crate) fn ask_inbox(&self) {
         self.ask(ControlRequest::AskRead {
             id: link::fresh_id("asks"),
             all: false,
-        });
-        self.ask_acts();
-    }
-
-    /// What qass did today, read again: no event says qass wrote to an agent, so the qass page
-    /// and the Inbox ask when they open and when an agent they show starts working again.
-    pub(crate) fn ask_acts(&self) {
-        let wall = (self.zone.local)(unix_now()).secs();
-        let midnight = qoop_runtime::schedule::Naive::from_secs(wall - wall.rem_euclid(86_400));
-        let today = (self.zone.unix)(midnight);
-        self.ask(ControlRequest::QassActs {
-            id: link::fresh_id("acts"),
-            since: today,
         });
     }
 
@@ -1431,7 +1364,6 @@ impl Desk {
         self.now = now;
         self.ping_machines();
         let board_moved = self.board_tick(now);
-        self.chat_tick();
         let states: Vec<state::MachineState> = state::machines(&self.model.spaces)
             .into_iter()
             .map(|(m, _, _)| self.machine_state(m))
@@ -1506,48 +1438,6 @@ impl Desk {
         }
     }
 
-    pub(crate) fn terminal_area(&self, focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let term = self.term.as_ref();
-        let up = self.up.clone();
-        div()
-            .id("terminal")
-            .role(Role::Terminal)
-            .aria_label("Terminal")
-            .key_context("Terminal")
-            .track_focus(&self.term_focus)
-            .on_key_down(cx.listener(Self::term_key))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    window.focus(&this.term_focus, cx);
-                    this.marked = None;
-                }),
-            )
-            .size_full()
-            .rounded(px(12.))
-            .overflow_hidden()
-            .bg(c(TERMINAL_BG))
-            .p(px(8.))
-            .child(TerminalElement {
-                pane: 0,
-                terminal: term.map(|t| t.terminal),
-                screen: term.and_then(|t| t.screen.clone()),
-                cells: self.cells.clone(),
-                focused,
-                stale: term.is_none_or(|t| self.term_stale(t.terminal)),
-                sent: term.map_or_else(|| Rc::new(Cell::new((0, 0))), |t| t.sent.clone()),
-                viewport: term.map_or_else(|| Rc::new(Cell::new(None)), |t| t.viewport.clone()),
-                resize: Rc::new(move |t, cols, rows| {
-                    let _ = up.send(Up::Resize(t, cols, rows));
-                }),
-                input: Some((self.term_focus.clone(), cx.entity())),
-                selection: None,
-                area: None,
-                lift: px(0.),
-                gauge: None,
-            })
-    }
-
     /// The page: its header where it has none of its own, and its body, in the main column.
     fn centre(
         &self,
@@ -1572,7 +1462,8 @@ impl Desk {
                 .child(padded(self.session(inbox, t, focused, cx)))
                 .into_any_element(),
             Page::Qass => body
-                .child(self.qass_page(inbox, t, focused, cx))
+                .child(self.page_header(t))
+                .child(padded(self.qass_page(cx)))
                 .into_any_element(),
             Page::Schedules => body
                 .child(self.page_header(t))
