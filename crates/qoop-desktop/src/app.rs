@@ -1,10 +1,11 @@
-//! The window: routing between pages, the sidebar, the top bar, the status line, the right
-//! panel, the prefix keys, and what the link brings in.
+//! The window: routing between pages, the shell around them (`shell.rs`), the prefix keys, and
+//! what the link brings in.
 //!
-//! Pages are Home, a Session (one terminal), qass (its own terminal), Schedules and Settings;
-//! the Inbox opens as the right panel on any of them. The prefix from `config.toml` (default
-//! `ctrl-a`) belongs to the app: `ctrl-a c` New work, `ctrl-a i` Inbox, the prefix twice
-//! sends it to the terminal on screen.
+//! Pages are the Inbox (where the window opens), a Session (one terminal), qass (its own
+//! terminal), Schedules, Settings and a Computer. The prefix from `config.toml` (default
+//! `ctrl-a`) belongs to the app: `ctrl-a c` New agent, `ctrl-a i` the Inbox (and back),
+//! `ctrl-a tab` the agent that has waited longest, the prefix twice sends it to the terminal on
+//! screen. Cmd-J (next waiting) and Cmd-N (New agent) are the app's and never reach a terminal.
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -14,7 +15,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, Bounds, Context, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
+    AnyElement, App, Bounds, Context, Entity, EntityInputHandler, FocusHandle, Focusable,
     KeyDownEvent, MouseButton, Pixels, Render, Role, Subscription, TitlebarOptions, UTF16Selection,
     Window, WindowAppearance, WindowBounds, WindowOptions, div, linear_color_stop, linear_gradient,
     point, prelude::*, px, size,
@@ -35,17 +36,20 @@ use crate::link::{self, Down, Latest, Up};
 use crate::newwork::NewWork;
 use crate::question::{OwnAnswer, Said};
 use crate::review::Review;
-use crate::state::{self, Chip, Model};
-use crate::theme::{MONO_FONT, TERMINAL_BG, TOP_GLOW, Theme, UI_FONT, c, ca};
-use crate::ui::{self, Icon};
+use crate::shell::{self, Edge};
+use crate::state::{self, Model};
+use crate::theme::{TERMINAL_BG, TOP_GLOW, Theme, UI_FONT, c, ca};
+use crate::ui;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
-    Home,
+    Inbox,
     Session(TerminalStream),
     Qass,
     Schedules,
     Settings,
+    /// A computer by its machine number: how it is reached, and its agents.
+    Computer(usize),
 }
 
 /// A terminal on screen, with what its pane remembers between frames.
@@ -110,8 +114,34 @@ impl Term {
 pub struct Desk {
     pub model: Model,
     pub page: Page,
-    pub inbox: bool,
-    pub chip: Chip,
+    /// The page `ctrl-a i` and Escape go back to from the Inbox.
+    pub(crate) back: Page,
+    /// The chip over the Inbox's list, the card with its ring, and where in the list it was.
+    pub(crate) inbox_filter: crate::inbox::Filter,
+    pub(crate) inbox_cursor: Option<state::Slot>,
+    pub(crate) cursor_at: usize,
+    /// What this client answered itself: agent menus leave no card, so Answered today reads it.
+    pub(crate) own_answers: Vec<qoop_tui::inbox::OwnAnswer>,
+    /// When the person's day began, for Answered today; looked up again once a day.
+    pub(crate) day_start: i64,
+    /// The spaces the sidebar lists in full instead of folded.
+    pub(crate) expanded: BTreeSet<i64>,
+    /// The sidebar's and the drawers' widths as dragged, the window's width as last drawn, and
+    /// the divider being dragged.
+    pub(crate) side_w: f32,
+    pub(crate) drawer_w: f32,
+    pub(crate) review_w: f32,
+    pub(crate) win_w: f32,
+    pub(crate) drag: Option<Edge>,
+    /// When the person last typed into each terminal: a held reply is never typed into a line
+    /// they began after it was held.
+    pub(crate) typed_at: HashMap<TerminalStream, Instant>,
+    /// Words typed for a card whose field closed or whose reply was not sent, kept per card.
+    pub(crate) drafts: HashMap<state::Slot, String>,
+    /// Finished and Answered today listed in full, not their first lines.
+    pub(crate) quiet_all: bool,
+    /// One focus handle per Inbox card: the ring follows the keyboard into a card's controls.
+    pub(crate) card_focus: std::cell::RefCell<HashMap<state::Slot, FocusHandle>>,
     pub sheet: Option<NewWork>,
     /// New work closed with a task typed in it, given back on the next open.
     pub work_draft: Option<NewWork>,
@@ -123,8 +153,6 @@ pub struct Desk {
     pub(crate) strip_ask: Option<String>,
     /// The strip drawn as a vertical timeline.
     pub timeline: bool,
-    /// The corner note: another agent that turned Needs you while this session is open.
-    pub note: Option<TerminalStream>,
     pub review: Option<Review>,
     pub review_focus: FocusHandle,
     /// Picks waiting out their 3 s, and what became of each sent one, per agent.
@@ -138,6 +166,8 @@ pub struct Desk {
     pub(crate) card_open: Option<String>,
     /// qass's cards waiting on the owner, and what qass did on its own today.
     pub asks: Vec<AskInfo>,
+    /// The last few cards that ended, newest first: with `asks`, what Answered today reads.
+    pub ended: Vec<AskInfo>,
     pub acts: Vec<QassAct>,
     /// qass's lessons file counted, read when its page opens; `None` when there is none.
     pub lessons: Option<state::Lessons>,
@@ -176,10 +206,8 @@ pub struct Desk {
     drawn_states: Vec<state::MachineState>,
     /// No `qoop` on this Mac (`state::qoop_bin`), looked at when the window opens.
     pub(crate) qoop_missing: bool,
-    /// The agent list came at least once: before it, Home draws skeleton rows.
+    /// The agent list came at least once: before it, the Inbox and the sidebar draw skeletons.
     pub(crate) listed: bool,
-    /// Home's one field while there is no agent yet.
-    pub(crate) first_run: Option<Entity<crate::field::Field>>,
     /// The schedules page: machine, runs, day, the report open, the sheet.
     pub schedule_page: crate::schedules::SchedulePage,
     /// The person's `config.toml`: the prefix byte and the theme (auto follows the system).
@@ -196,8 +224,6 @@ pub struct Desk {
     pub connected: bool,
     pub focus: FocusHandle,
     pub term_focus: FocusHandle,
-    /// The Inbox's heading: where `ctrl-a i` puts the keys, so Tab goes on into the panel.
-    pub inbox_focus: FocusHandle,
     /// Kept for the window's life: focus that falls out of the frame comes back (WEB-09).
     _focus_lost: Subscription,
     /// Text the input method composes for the terminal; what it commits is typed.
@@ -253,8 +279,9 @@ impl Desk {
             }
         }
         let theme_pref = config.config.theme;
-        // This Mac's hand id, read but never made here: another Mac's hand is told apart from
-        // this Mac's own from the first list on (the first remote hand makes the file).
+        // This Mac's hand id, read here and not made: another Mac's hand is told apart from this
+        // Mac's own from the first list on. The shared hand rules make the file once a remote
+        // row or a hand needs it, as the terminal interface does.
         let hand_id = qoop_runtime::paths::qass_data_dir()
             .and_then(|dir| {
                 std::fs::read_to_string(dir.join(qoop_runtime::paths::HAND_ID_FILE)).ok()
@@ -263,12 +290,29 @@ impl Desk {
             .filter(|id| !id.is_empty());
         Desk {
             model: Model {
-                hand_id,
+                hand: qoop_tui::answers::HandInput {
+                    hand_id,
+                    ..Default::default()
+                },
                 ..Model::default()
             },
-            page: Page::Home,
-            inbox: false,
-            chip: Chip::All,
+            page: Page::Inbox,
+            back: Page::Inbox,
+            inbox_filter: Default::default(),
+            inbox_cursor: None,
+            cursor_at: 0,
+            own_answers: Vec::new(),
+            day_start: 0,
+            expanded: BTreeSet::new(),
+            side_w: shell::SIDE_DEFAULT,
+            drawer_w: shell::DRAWER_DEFAULT,
+            review_w: shell::REVIEW_DEFAULT,
+            win_w: 1440.,
+            drag: None,
+            typed_at: HashMap::new(),
+            drafts: HashMap::new(),
+            quiet_all: false,
+            card_focus: Default::default(),
             sheet: None,
             work_draft: None,
             term: None,
@@ -276,7 +320,6 @@ impl Desk {
             strip: None,
             strip_ask: None,
             timeline: false,
-            note: None,
             review: None,
             review_focus: cx.focus_handle(),
             holds: state::Holds::default(),
@@ -285,6 +328,7 @@ impl Desk {
             own: None,
             card_open: None,
             asks: Vec::new(),
+            ended: Vec::new(),
             acts: Vec::new(),
             lessons: None,
             qass_said: None,
@@ -307,7 +351,6 @@ impl Desk {
             drawn_states: Vec::new(),
             listed: false,
             qoop_missing: state::qoop_bin().is_none(),
-            first_run: None,
             prefix: config.config.prefix,
             theme_pref,
             appearance: window.appearance(),
@@ -319,7 +362,6 @@ impl Desk {
             connected: false,
             focus,
             term_focus: cx.focus_handle(),
-            inbox_focus: cx.focus_handle(),
             _focus_lost: focus_lost,
             marked: None,
             last_input: None,
@@ -456,17 +498,15 @@ impl Desk {
                         self.said.remove(&slot);
                     }
                 }
-                self.model.note_qass(self.now);
+                self.note_hand();
                 self.listed = true;
                 // An agent that waited works again: maybe qass wrote to it, an act to show.
-                if (self.page == Page::Qass || self.inbox) && state::woke(&before, &self.model.rows)
-                {
+                if self.page == Page::Qass && state::woke(&before, &self.model.rows) {
                     self.ask_acts();
                 }
-                self.first_run_field(cx);
                 self.answered_elsewhere(&before);
-                self.rows_changed(&before);
-                self.menus_changed();
+                self.rows_changed();
+                self.menus_changed(cx);
                 // qass started or woke while its page is open: its terminal comes on.
                 if self.qass_terminal().is_some() {
                     self.qass_starting_until = None;
@@ -480,16 +520,10 @@ impl Desk {
                     self.open(Page::Qass, window, cx);
                 }
             }
-            ControlResponse::Asks { live, .. } => {
-                // The agents qass's open cards are about: a remote hand with one is over.
-                self.model.carded = live
-                    .iter()
-                    .filter(|a| a.status == "open")
-                    .filter_map(|a| a.agent.as_deref())
-                    .filter_map(qoop_runtime::asks::agent_key)
-                    .map(|(key, _)| key)
-                    .collect();
+            ControlResponse::Asks { live, ended, .. } => {
                 self.asks = live;
+                self.ended = ended;
+                self.note_hand();
             }
             ControlResponse::SleepSettings { problem, .. } => {
                 self.read_settings();
@@ -544,6 +578,7 @@ impl Desk {
                 let down = &self.reach.down_since;
                 self.pet_asks.retain(|_, m| !down.contains_key(m));
                 self.model.spaces = workspaces;
+                self.note_hand();
                 self.ping_machines();
                 self.machines_back(&back);
             }
@@ -559,7 +594,7 @@ impl Desk {
             }
             ControlResponse::QassWatch { on, .. } => {
                 self.model.qass_watch = Some(on);
-                self.model.note_qass(self.now);
+                self.note_hand();
             }
             ControlResponse::TerminalCreated { id, terminal } => {
                 self.started(&id, terminal, window, cx)
@@ -590,20 +625,26 @@ impl Desk {
         }
     }
 
-    /// Go to a page, showing its terminal's screens and dropping the last one's.
+    /// Go to a page, showing its terminal's screens and dropping the last one's. The Inbox opened
+    /// from a session keeps that session's terminal shown behind it, so coming back is the same
+    /// screen, scrollback and size, and the keys never reach it meanwhile.
     pub fn open(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        let keep = page == Page::Inbox
+            && matches!(self.page, Page::Session(_) | Page::Inbox)
+            && self.term.is_some();
+        if page == Page::Inbox && self.page != Page::Inbox {
+            self.back = self.page;
+        }
         let terminal = match page {
             Page::Session(t) => Some(t),
             Page::Qass => self.qass_terminal(),
+            _ if keep => self.term.as_ref().map(|t| t.terminal),
             _ => None,
         };
         if self.term.as_ref().map(|t| t.terminal) != terminal {
             self.marked = None;
             self.review = None;
             self.strip = None;
-            if self.note == terminal {
-                self.note = None;
-            }
         }
         self.page = page;
         if page == Page::Qass {
@@ -618,20 +659,33 @@ impl Desk {
             let ids: Vec<i64> = self.model.schedules.iter().map(|s| s.id).collect();
             self.ask_runs(&ids);
         }
-        self.set_panes(terminal);
+        if !keep {
+            self.set_panes(terminal);
+        }
         if matches!(page, Page::Session(_)) {
             self.ask_strip();
-        } else {
+        } else if !keep {
             self.strip = None;
             self.strip_ask = None;
-            self.note = None;
         }
-        if self.term.is_some() {
+        if self.term_drawn() {
             window.focus(&self.term_focus, cx);
         } else {
             window.focus(&self.focus, cx);
         }
         cx.notify();
+    }
+
+    /// Every card read, open or ended: what the Inbox and the hand rules read.
+    pub(crate) fn cards(&self) -> Vec<AskInfo> {
+        self.asks.iter().chain(&self.ended).cloned().collect()
+    }
+
+    /// The shared hand rules' input, brought up to date after a list, a card read or a switch.
+    pub(crate) fn note_hand(&mut self) {
+        let cards = self.cards();
+        self.model.note_qass(&cards, self.now);
+        qoop_tui::inbox_pane::day_start(&mut self.day_start, unix_now());
     }
 
     fn qass_terminal(&self) -> Option<TerminalStream> {
@@ -691,20 +745,23 @@ impl Desk {
             cx.stop_propagation();
             if self.is_prefix(k) {
                 if let Some(term) = &self.term
-                    && self.page != Page::Home
+                    && self.term_drawn()
                     && self.connected
                 {
-                    let _ = self.up.send(Up::Input(term.terminal, vec![self.prefix]));
+                    let terminal = term.terminal;
+                    let _ = self.up.send(Up::Input(terminal, vec![self.prefix]));
+                    self.typed_at.insert(terminal, Instant::now());
                 }
                 return;
             }
             match keys::typed(k) {
                 "c" => self.new_work(None, window, cx),
+                // The closed question's card goes.
                 "x" => {
                     self.closed_card = None;
-                    self.dismiss_note(cx)
+                    cx.notify();
                 }
-                "tab" => self.open_note(window, cx),
+                "tab" => self.next_waiting(window, cx),
                 // The keyboard off the terminal, as the TUI's `ctrl-a a` puts it on the agents
                 // column: `tab` then goes round the controls. Again: back on the terminal.
                 "a" => {
@@ -720,17 +777,14 @@ impl Desk {
                 // The character the layout typed, or shift with the D key where none came.
                 "D" => self.toggle_review(window, cx),
                 "d" if k.modifiers.shift => self.toggle_review(window, cx),
-                // Open: the keys go into the panel, so a Tab meant for it never reaches the
-                // agent. Closed: back where they belong.
+                // The Inbox, and back to the page it was opened from.
                 "i" => {
-                    self.inbox = !self.inbox;
-                    if self.inbox {
-                        self.ask_acts();
-                        window.focus(&self.inbox_focus, cx);
+                    let to = if self.page == Page::Inbox {
+                        self.back
                     } else {
-                        self.focus_home(window, cx);
-                    }
-                    cx.notify();
+                        Page::Inbox
+                    };
+                    self.open(to, window, cx);
                 }
                 _ => {}
             }
@@ -741,6 +795,29 @@ impl Desk {
             cx.stop_propagation();
             return;
         }
+        // The app's own chords, before any terminal or field hears them: Cmd-J the next agent
+        // that waits, Cmd-N a new agent.
+        if k.modifiers.platform && !k.modifiers.control && !k.modifiers.alt && !k.modifiers.shift {
+            match k.key.as_str() {
+                // Taken either way (the terminal never hears them); they act only with no sheet
+                // open over the page.
+                "j" => {
+                    if self.sheet.is_none() && !self.schedule_sheet_open() {
+                        self.next_waiting(window, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "n" => {
+                    if !self.schedule_sheet_open() {
+                        self.new_work(None, window, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.sheet.is_some() {
             self.sheet_key(event, window, cx);
             return;
@@ -748,15 +825,16 @@ impl Desk {
         if self.schedule_sheet_key(event, window, cx) {
             return;
         }
-        // Escape closes the Inbox before the terminal hears it: an Escape typed into an agent
-        // interrupts its turn.
-        if self.inbox && keys::typed(k) == "escape" {
-            self.inbox = false;
-            if !self.term_focus.is_focused(window) {
-                self.focus_home(window, cx);
-            }
+        // Escape leaves the Inbox for the page before it, and the terminal never hears it: an
+        // Escape typed into an agent interrupts its turn. Not from the field for one's own
+        // words, which keeps its keys.
+        if self.page == Page::Inbox
+            && self.back != Page::Inbox
+            && keys::typed(k) == "escape"
+            && !self.own_typing(window, cx)
+        {
+            self.open(self.back, window, cx);
             cx.stop_propagation();
-            cx.notify();
             return;
         }
         self.answer_key(event, window, cx);
@@ -781,8 +859,47 @@ impl Desk {
         self.term.is_some() && matches!(self.page, Page::Session(_) | Page::Qass)
     }
 
-    /// The keys' resting place: an open sheet's first stop, else the open Inbox, else the terminal
-    /// on screen, else the window. Where focus goes when its control leaves the frame or a panel closes.
+    /// Whether any text field of the window has the keys: the own words, New agent's task, the
+    /// settings find, a schedule sheet's fields. The window's one-letter keys and digits are
+    /// theirs then.
+    pub(crate) fn typing_in_field(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let on = |field: &Entity<crate::field::Field>, window: &Window, cx: &Context<Self>| {
+            field.read(cx).focus.is_focused(window)
+        };
+        let schedule = self
+            .schedule_page
+            .sheet
+            .as_ref()
+            .filter(|_| self.page == Page::Schedules)
+            .is_some_and(|s| {
+                [&s.name, &s.time, &s.cron, &s.folder, &s.prompt]
+                    .into_iter()
+                    .any(|f| on(f, window, cx))
+            });
+        schedule
+            || self.own.as_ref().is_some_and(|o| on(&o.field, window, cx))
+            || self.sheet.as_ref().is_some_and(|s| on(&s.task, window, cx))
+            || self
+                .settings
+                .find
+                .as_ref()
+                .is_some_and(|f| on(f, window, cx))
+    }
+
+    /// Whether a schedule sheet is open over the page.
+    fn schedule_sheet_open(&self) -> bool {
+        self.page == Page::Schedules && self.schedule_page.sheet.is_some()
+    }
+
+    /// Whether the field for the owner's own words has the keys.
+    pub(crate) fn own_typing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.own
+            .as_ref()
+            .is_some_and(|own| own.field.read(cx).focus.is_focused(window))
+    }
+
+    /// The keys' resting place: an open sheet's first stop, else the terminal on screen, else
+    /// the window. Where focus goes when its control leaves the frame or a panel closes.
     pub(crate) fn focus_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let schedule_sheet = self
             .schedule_page
@@ -792,9 +909,6 @@ impl Desk {
         let to = match (&self.sheet, schedule_sheet) {
             (Some(sheet), _) => sheet.stops[0].clone(),
             (None, Some(sheet)) => sheet.name.read(cx).focus.clone(),
-            // A card answered in the open Inbox leaves it: the keys stay in the Inbox, never
-            // in the agent on screen behind it.
-            (None, None) if self.inbox => self.inbox_focus.clone(),
             (None, None) if self.term_drawn() => self.term_focus.clone(),
             (None, None) => self.focus.clone(),
         };
@@ -802,47 +916,56 @@ impl Desk {
         cx.notify();
     }
 
-    /// While a question card is on screen: a digit picks its answer, `u` undoes the pick,
-    /// Enter in the own-answer field holds those words. Other keys go on as before.
+    /// While a question card is on screen or the Inbox is: a digit picks its answer, `u` undoes
+    /// the pick, Enter in the own-answer field holds those words. Other keys go on as before.
     fn answer_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &event.keystroke;
         if k.modifiers.control || k.modifiers.platform || k.modifiers.alt {
             return;
         }
-        if k.key == "enter" && (self.own_enter(window, cx) || self.first_run_enter(window, cx)) {
+        if k.key == "enter" && self.own_enter(window, cx) {
             cx.stop_propagation();
             return;
         }
-        // The own-answer field keeps every key it is given.
-        let typing = self
-            .own
-            .as_ref()
-            .is_some_and(|own| own.field.read(cx).focus.is_focused(window));
-        if typing {
+        // A text field keeps every key it is given.
+        if self.typing_in_field(window, cx) {
             return;
         }
-        // `u` belongs to Undo while anything is on hold, wherever its line shows (card, corner
-        // note, Inbox): the card's agent's pick, else the newest. It never reaches the terminal
-        // then.
+        let on_inbox = self.page == Page::Inbox;
+        // `u` belongs to Undo while anything is on hold, wherever its line shows (card, Inbox):
+        // the focused card's pick, else the newest. It never reaches the terminal then.
         if keys::typed(k) == "u" && !self.holds.held.is_empty() {
-            let card = self
-                .card_offers()
-                .map(|(t, ..)| state::Slot::Agent(t))
-                .filter(|slot| self.holds.of(slot).is_some());
-            self.undo(card.as_ref(), cx);
+            let focused = if on_inbox {
+                let list = self.inbox();
+                let items: Vec<_> = list
+                    .items
+                    .iter()
+                    .filter(|i| self.inbox_filter_holds(i))
+                    .collect();
+                self.cursor_slot(&items)
+            } else {
+                self.card_offers().map(|(t, ..)| state::Slot::Agent(t))
+            };
+            let slot = focused.filter(|slot| self.holds.of(slot).is_some());
+            self.undo(slot.as_ref(), cx);
             cx.stop_propagation();
             return;
         }
-        if self.own.is_some() || self.card_offers().is_none() {
-            return;
-        }
-        // Digits only while the keys are the terminal's: a control keeps its own.
-        if !self.term_focus.is_focused(window) {
-            return;
-        }
-        let taken = match keys::typed(k) {
+        let digit = match keys::typed(k) {
             d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {
-                self.digit(d.as_bytes()[0] - b'0', window, cx)
+                Some(d.as_bytes()[0] - b'0')
+            }
+            _ => None,
+        };
+        let taken = match digit {
+            Some(d) if on_inbox && self.sheet.is_none() => self.inbox_digit(d, window, cx),
+            // Digits only while the keys are the terminal's: a control keeps its own.
+            Some(d)
+                if self.own.is_none()
+                    && self.card_offers().is_some()
+                    && self.term_focus.is_focused(window) =>
+            {
+                self.digit(d, window, cx)
             }
             _ => false,
         };
@@ -956,7 +1079,9 @@ impl Desk {
             option_is_meta: false,
         };
         if let Some(bytes) = keys::encode(press, app_cursor) {
-            let _ = self.up.send(Up::Input(term.terminal, bytes));
+            let terminal = term.terminal;
+            let _ = self.up.send(Up::Input(terminal, bytes));
+            self.typed_at.insert(terminal, Instant::now());
             cx.stop_propagation();
             // Typing goes back to the live screen, as a terminal does.
             if term.scroll > 0 || term.selection.is_some() {
@@ -1195,6 +1320,7 @@ impl Desk {
             .collect();
         let redraw = redraw || states != self.drawn_states;
         self.drawn_states = states;
+        qoop_tui::inbox_pane::day_start(&mut self.day_start, now);
         let redraw = self.follow_config() || redraw;
         let finish = match self.page {
             Page::Session(t) => self.model.finish(t),
@@ -1226,424 +1352,9 @@ impl Desk {
         }
     }
 
-    fn sidebar(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let nav = |id: &'static str,
-                   icon: Icon,
-                   label: &'static str,
-                   page: Page,
-                   cx: &mut Context<Self>| {
-            let on = self.page == page;
-            ui::control(id, Role::Link, label, t)
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .h(px(32.))
-                .px(px(10.))
-                .rounded(px(10.))
-                .text_size(px(13.5))
-                .text_color(c(t.t1))
-                .when(on, |d| ui::current(d, t))
-                .hover(|s| ui::paint(s, t.hover()))
-                .child(ui::icon(icon, 16., c(t.t2)))
-                .child(label)
-                .on_click(cx.listener(move |this, _, window, cx| this.open(page, window, cx)))
-        };
-        let next = state::next_runs(&self.model.schedules, &self.model.rows, self.zone, 1)
-            .into_iter()
-            .find(|r| r.running.is_none())
-            .map(|r| format!("next {}", state::clock_at(r.at, self.now, self.zone)));
-        div()
-            .id("sidebar")
-            .role(Role::Navigation)
-            .aria_label("qoop")
-            .absolute()
-            .left_0()
-            .top_0()
-            .bottom_0()
-            .w(px(248.))
-            .pt(px(40.))
-            .px(px(10.))
-            .pb(px(10.))
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .bg(c(t.sidebar))
-            .border_r_1()
-            .border_color(ca(t.hair))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(9.))
-                    .px(px(10.))
-                    .pt(px(4.))
-                    .pb(px(10.))
-                    .child(ui::logo(24.))
-                    .child(
-                        div()
-                            .text_size(px(21.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("qoop"),
-                    ),
-            )
-            // The links, the spaces and the phone line scroll as one list, and a Tab stop
-            // below the fold scrolls into view.
-            .child(ui::scroll(
-                div()
-                    .id("sidebar-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.))
-                    .child(nav("nav-home", Icon::Home, "Home", Page::Home, cx))
-                    .child(
-                        nav(
-                            "nav-schedules",
-                            Icon::Clock,
-                            "Schedules",
-                            Page::Schedules,
-                            cx,
-                        )
-                        .when_some(next, |d, next| {
-                            d.child(
-                                div()
-                                    .ml_auto()
-                                    .text_size(px(11.5))
-                                    .text_color(c(t.t2))
-                                    .child(next),
-                            )
-                        }),
-                    )
-                    .child(nav(
-                        "nav-settings",
-                        Icon::Gear,
-                        "Settings",
-                        Page::Settings,
-                        cx,
-                    ))
-                    .child(div().mt(px(8.)).child(self.tree(t, cx)))
-                    .when(self.model.phone_here(), |d| {
-                        d.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(7.))
-                                .pt(px(12.))
-                                .px(px(10.))
-                                .text_size(px(12.))
-                                .text_color(c(t.t2))
-                                .child(ui::icon(Icon::Phone, 14., c(t.t2)))
-                                .child("iPhone, seen now"),
-                        )
-                    }),
-            ))
-    }
-
-    /// The spaces with their agents, on every page. A space of another machine names it and
-    /// how it is reached; a machine with no agent in any space gets one quiet line at the end.
-    fn tree(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let shown = self.term.as_ref().map(|term| term.terminal);
-        let groups = self.model.groups(Chip::All);
-        let empty: Vec<(usize, String)> = state::machines(&self.model.spaces)
-            .into_iter()
-            .filter(|(m, _, _)| {
-                *m != 0 && !groups.iter().any(|g| state::machine_of(g.space.id) == *m)
-            })
-            .map(|(m, name, _)| (m, name))
-            .collect();
-        // One Retry now per machine, on its first space: three spaces are one machine to retry.
-        let mut machines_seen = std::collections::BTreeSet::new();
-        let firsts: Vec<i64> = groups
-            .iter()
-            .filter(|g| machines_seen.insert(state::machine_of(g.space.id)))
-            .map(|g| g.space.id)
-            .collect();
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .children(groups.into_iter().map(|g| {
-                let slot = state::space_slot(g.space);
-                let id = g.space.id;
-                let m = state::machine_of(id);
-                let (name, label) = if m == 0 {
-                    (g.space.name.clone(), g.space.name.clone())
-                } else {
-                    let name = state::short_space(g.space);
-                    let machine = state::machine_name(g.space);
-                    let word = state::reach_words(self.machine_state(m), self.zone);
-                    let label = format!("{name}, on {machine}, {word}");
-                    (name, label)
-                };
-                // The machine's line sits beside the heading, not in it: its Retry now is a
-                // button of its own.
-                let reach =
-                    (m != 0).then(|| {
-                        self.reach_line(m, state::machine_name(g.space), "", firsts.contains(&id), t, cx)
-                    });
-                // Its own id: a machine's line under each of its spaces stays apart.
-                div()
-                    .id(("side-group", id as u64))
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .id(("side-space", id as u64))
-                            .debug_selector(move || format!("side-space-{id}"))
-                            .role(Role::Heading)
-                            .aria_level(2)
-                            .aria_label(label)
-                            .pt(px(10.))
-                            .pb(px(3.))
-                            .px(px(10.))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(12.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.space(slot))
-                            .child(name),
-                    )
-                    .when_some(reach, |d, reach| {
-                        d.child(div().px(px(10.)).pb(px(3.)).child(reach))
-                    })
-                    .children(g.rows.into_iter().map(|entry| {
-                        let kind = self.shown_kind(entry);
-                        let terminal = entry.terminal();
-                        let on = shown == Some(terminal);
-                        let row = ui::control(
-                            ("tree-row", terminal as u64),
-                            Role::Link,
-                            self.model.row_label(entry, self.now),
-                            t,
-                        )
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .min_h(px(28.))
-                        .px(px(10.))
-                        .rounded(px(10.))
-                        .text_size(px(13.))
-                        .when(on, |d| ui::current(d, t))
-                        .hover(|s| ui::paint(s, t.hover()))
-                        .child(ui::mark(kind, t, 11.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(entry.title()),
-                        )
-                        .when_some(self.card_count(entry, "tree", t), |d, n| d.child(n))
-                        .when_some(entry.age(self.now), |d, age| {
-                            d.child(div().text_size(px(11.5)).text_color(c(t.t2)).child(age))
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open(Page::Session(terminal), window, cx)
-                        }))
-                        .into_any_element();
-                        if !kind.needs_you() {
-                            return row;
-                        }
-                        // A Needs you row: its question, except while the corner note shows
-                        // it, and the quiet hand-off line (live once answering lands).
-                        let question = match entry {
-                            state::Entry::Live(r) if self.note != Some(terminal) => r
-                                .menu
-                                .as_ref()
-                                .map(|m| m.question.clone())
-                                .filter(|q| !q.is_empty()),
-                            _ => None,
-                        };
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(row)
-                            .when_some(question, |d, q| {
-                                d.child(
-                                    div()
-                                        .pl(px(29.))
-                                        .pr(px(10.))
-                                        .text_size(px(12.))
-                                        .text_color(c(t.t2))
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .child(q),
-                                )
-                            })
-                            .child({
-                                let live = match entry {
-                                    state::Entry::Live(r) => Some(r),
-                                    _ => None,
-                                };
-                                // Handed and held: "With qass"; handed while qass is gone:
-                                // "With qass, not running", in the Needs you ink (C-3).
-                                let held = live.and_then(|r| self.model.qass_words(r));
-                                let with = live.is_some_and(|r| self.model.with_qass(r));
-                                let stranded = held.is_some() && !with;
-                                let why = live.and_then(|r| self.qass_reason(r));
-                                let words = held.unwrap_or_else(|| "Let qass handle it".into());
-                                ui::control(
-                                    ("qass-line", terminal as u64),
-                                    Role::Button,
-                                    match &why {
-                                        Some(why) => format!("{words}, unavailable: {why}"),
-                                        None => words.to_string(),
-                                    },
-                                    t,
-                                )
-                                // A click only: the keyboard has option 5 on the card, and a
-                                // stop per waiting agent doubled the Tab path on every page.
-                                .tab_stop(false)
-                                .tooltip(ui::tip(
-                                    "qass answers if its rules allow; otherwise it comes back to you as a card",
-                                    *t,
-                                ))
-                                .flex()
-                                .items_center()
-                                .gap(px(6.))
-                                .h(px(24.))
-                                .pl(px(29.))
-                                .rounded(px(8.))
-                                .text_size(px(12.))
-                                .text_color(c(if stranded {
-                                    t.needs_text
-                                } else if why.is_some() {
-                                    t.t3
-                                } else {
-                                    t.t2
-                                }))
-                                .when(why.is_none() && !with, |d| {
-                                    d.hover(|s| ui::paint(s, t.hover()))
-                                })
-                                .child(ui::icon(Icon::Eye, 12., c(t.t2)))
-                                .child(words.clone())
-                                .when(why.is_none() && !with, |d| {
-                                    d.on_click(cx.listener(move |this, _, window, cx| {
-                                        let qass = state::Offer {
-                                            digit: None,
-                                            label: "Let qass handle it".into(),
-                                            detail: None,
-                                            pick: state::Pick::Qass,
-                                        };
-                                        this.pick(terminal, &qass, window, cx)
-                                    }))
-                                })
-                            })
-                            .into_any_element()
-                    }))
-            }))
-            // ponytail: one line per machine with no agent, in the space list itself; Settings'
-            // machine chips stay as they are.
-            .children(empty.into_iter().map(|(m, name)| {
-                div()
-                    .id(("side-machine", m as u64))
-                    .debug_selector(move || format!("side-machine-{m}"))
-                    .role(Role::Group)
-                    .aria_label(format!(
-                        "{name}, {}, no agents",
-                        state::reach_words(self.machine_state(m), self.zone)
-                    ))
-                    .pt(px(10.))
-                    .px(px(10.))
-                    .child(self.reach_line(m, name, ", no agents", true, t, cx))
-            }))
-    }
-
-    /// Machine `m` and how it is reached, in the words the banner uses, as a dot and its word:
-    /// green online, grey parked or retrying, amber not reached with Retry now beside it. Why
-    /// its link is down (the ssh error) is in the tooltip. `tail` follows the word.
-    fn reach_line(
-        &self,
-        m: usize,
-        name: String,
-        tail: &'static str,
-        retry: bool,
-        t: &Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let reach = self.machine_state(m);
-        let up = reach == state::MachineState::Live;
-        let away = state::unreached(reach);
-        let retrying = reach == state::MachineState::Retrying;
-        // While This Mac's daemon is down a retry of another machine goes nowhere: none offered.
-        let behind = matches!(reach, state::MachineState::Behind { .. });
-        let (dot, ink) = if up {
-            (t.done, t.done_text)
-        } else if away {
-            (t.needs, t.needs_text)
-        } else {
-            (t.t3, t.t2)
-        };
-        let word = state::reach_words(reach, self.zone);
-        let reason = self.link_reasons.get(&m).cloned();
-        div()
-            .id(("reach", m as u64))
-            .debug_selector(move || format!("machine-{m}"))
-            .when_some(reason.filter(|_| !up), |d, why| {
-                d.tooltip(ui::tip_text(why, *t))
-            })
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_x(px(6.))
-            .min_h(px(22.))
-            .text_size(px(11.5))
-            .child(
-                div()
-                    .size(px(7.))
-                    .flex_none()
-                    .rounded_full()
-                    .when(up || away, |d| d.bg(c(dot)))
-                    .when(!up && !away, |d| d.border_1().border_color(c(dot))),
-            )
-            .when_some(self.pet_of(m), |d, pet| d.child(pet))
-            .child(div().text_color(c(t.t1)).child(name.clone()))
-            // The longest word ("not reached while This Mac is down, as of 22:36") wraps in the
-            // sidebar's width rather than run out of it uncut.
-            .child(
-                div()
-                    .debug_selector(move || format!("reach-word-{m}"))
-                    .min_w_0()
-                    .whitespace_normal()
-                    .text_color(c(ink))
-                    .child(format!("{word}{tail}")),
-            )
-            .when(retry && (away || retrying) && !behind, |d| {
-                d.child(
-                    ui::control(
-                        ("retry", m as u64),
-                        Role::Button,
-                        format!("Retry now, {name}"),
-                        t,
-                    )
-                    .debug_selector(move || format!("retry-{m}"))
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .px(px(6.))
-                    .h(px(22.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(6.))
-                    .text_color(c(t.t1))
-                    .hover(|s| ui::paint(s, t.pressed()))
-                    .child("Retry now")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.retry_machine(m);
-                        cx.notify();
-                    })),
-                )
-            })
-    }
-
     pub(crate) fn title(&self) -> (String, Option<String>) {
         match self.page {
-            Page::Home => ("All agents".into(), Some(self.model.summary())),
+            Page::Inbox => ("Inbox".into(), None),
             Page::Session(t) => {
                 let row = self.model.row(t);
                 let space = row
@@ -1655,6 +1366,13 @@ impl Desk {
                 )
             }
             Page::Qass => ("qass".into(), None),
+            Page::Computer(m) => (
+                state::machines(&self.model.spaces)
+                    .into_iter()
+                    .find(|(n, _, _)| *n == m)
+                    .map_or_else(|| "Computer".to_string(), |(_, name, _)| name),
+                None,
+            ),
             Page::Schedules => (
                 "Schedules".into(),
                 Some(state::schedules_line(&self.model.schedules)),
@@ -1668,229 +1386,6 @@ impl Desk {
                 },
             ),
         }
-    }
-
-    fn top_bar(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let (title, sub) = self.title();
-        let badge = self.badge();
-        div()
-            .id("top")
-            .role(Role::Banner)
-            .absolute()
-            .left(px(248.))
-            .right_0()
-            .top_0()
-            .h(px(56.))
-            .flex()
-            .items_center()
-            .px(px(22.))
-            .border_b_1()
-            .border_color(ca(t.line))
-            .child(
-                div()
-                    .id("title")
-                    .role(Role::Heading)
-                    .aria_level(1)
-                    .aria_label(title.clone())
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_baseline()
-                    .gap(px(12.))
-                    .child(
-                        div()
-                            .text_size(px(19.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .whitespace_nowrap()
-                            .child(title),
-                    )
-                    .when_some(sub, |d, sub| {
-                        d.child(
-                            div()
-                                .text_size(px(13.))
-                                .text_color(c(t.t2))
-                                .whitespace_nowrap()
-                                .child(sub),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        ui::control(
-                            "qass-pill",
-                            Role::Button,
-                            match self.model.qass_line().as_str() {
-                                "not running" => "qass not running, press to start it".to_string(),
-                                line => format!("qass, {line}"),
-                            },
-                            t,
-                        )
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .h(px(34.))
-                        .px(px(14.))
-                        .rounded_full()
-                        .map(|d| ui::paint(d, t.rest()))
-                        .hover(|s| ui::paint(s, t.pressed()))
-                        .text_size(px(13.))
-                        .child(ui::icon(Icon::Eye, 15., c(t.t1)))
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child("qass"))
-                        .child(
-                            div()
-                                .text_size(px(12.5))
-                                .text_color(c(if self.model.qass_line().starts_with("watching") {
-                                    t.work_text
-                                } else {
-                                    t.t2
-                                }))
-                                .child(self.model.qass_line()),
-                        )
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open(Page::Qass, window, cx)),
-                        ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        ui::pill("new-work", "New work", t)
-                            .child(ui::icon(Icon::Plus, 15., c(t.t1)))
-                            .child("New work")
-                            .child(ui::kbd(&format!("{} c", self.prefix_name()), t))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.new_work(None, window, cx)),
-                            ),
-                    )
-                    .child(
-                        ui::pill(
-                            "inbox",
-                            &match badge {
-                                0 => "Inbox".to_string(),
-                                n => format!("Inbox, {n} waiting"),
-                            },
-                            t,
-                        )
-                        .aria_expanded(self.inbox)
-                        .when(self.inbox, |d| ui::paint(d, t.pressed()))
-                        .child(ui::icon(Icon::Inbox, 15., c(t.t1)))
-                        .child("Inbox")
-                        .when(badge > 0, |d| {
-                            d.child(
-                                div()
-                                    .min_w(px(18.))
-                                    .h(px(18.))
-                                    .px(px(5.))
-                                    .rounded_full()
-                                    .bg(c(t.needs))
-                                    .text_color(c(t.badge_fg))
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .flex()
-                                    .justify_center()
-                                    .child(badge.to_string()),
-                            )
-                        })
-                        .child(ui::kbd(&format!("{} i", self.prefix_name()), t))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.inbox = !this.inbox;
-                            if this.inbox {
-                                this.ask_acts();
-                            }
-                            cx.notify();
-                        })),
-                    ),
-            )
-    }
-
-    fn status_line(&self, t: &Theme, focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let right = if self.inbox { 360. } else { 0. };
-        div()
-            .absolute()
-            .left(px(248.))
-            .right(px(right))
-            .bottom(px(4.))
-            .min_h(px(20.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap(px(10.))
-            .font_family(MONO_FONT)
-            .text_size(px(11.5))
-            .text_color(c(t.t2))
-            .whitespace_nowrap()
-            .when_some(self.banner(), |d, banner| {
-                d.child(
-                    div()
-                        .id("reach-banner")
-                        .role(Role::Status)
-                        .aria_label(banner.clone())
-                        .flex_shrink(1.)
-                        .min_w_0()
-                        .whitespace_normal()
-                        .text_color(c(t.t1))
-                        .child(banner),
-                )
-            })
-            // This Mac's daemon down: the step, where the state is said (FLOW-20).
-            .when(self.lost_at.is_some(), |d| {
-                d.child(
-                    ui::link_button("start-qoop", "Start qoop", t)
-                        .debug_selector(|| "start-qoop".into())
-                        .flex_none()
-                        .font_family(UI_FONT)
-                        .on_click(cx.listener(|this, _, _, cx| this.start_qoop(cx))),
-                )
-                .when_some(self.qoop_said.clone(), |d, said| {
-                    d.child(
-                        div()
-                            .id("qoop-said")
-                            .role(Role::Status)
-                            .aria_label(said.clone())
-                            .child(said),
-                    )
-                })
-            })
-            .when(!self.connected && self.lost_at.is_none(), |d| {
-                // No qoop here at all: nothing will ever answer, so say how to get it.
-                d.child(if self.qoop_missing {
-                    format!(
-                        "qoop is not installed. Install it with the one-line install: {}",
-                        state::INSTALL_LINE
-                    )
-                } else {
-                    "connecting to the daemon".to_string()
-                })
-            })
-            .when_some(
-                self.model.status_line().filter(|_| self.connected),
-                |d, line| d.child(div().text_color(c(t.needs_text)).child(line)),
-            )
-            .child(format!(
-                "{}: [c new work] [i inbox] [a keys {} the terminal]{}",
-                self.prefix_name(),
-                if self.term_drawn() && !focused {
-                    "back to"
-                } else {
-                    "off"
-                },
-                if let Page::Session(t) = self.page
-                    && self.here(t).is_some()
-                {
-                    " [D changes]"
-                } else {
-                    ""
-                }
-            ))
     }
 
     pub(crate) fn terminal_area(&self, focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1934,36 +1429,45 @@ impl Desk {
             })
     }
 
-    fn centre(&self, t: &Theme, focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let right = if self.inbox { 360. } else { 0. };
+    /// The page: its header where it has none of its own, and its body, in the main column.
+    fn centre(
+        &self,
+        inbox: &qoop_tui::inbox::Inbox,
+        t: &Theme,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let body = div()
             .id("centre")
             .role(Role::Main)
-            .absolute()
-            .left(px(248.))
-            .top(px(56.))
-            .right(px(right))
-            .bottom(px(26.));
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .flex_col();
+        let padded = |page: AnyElement| div().flex_1().min_h_0().p(px(12.)).child(page);
         match self.page {
-            Page::Home => {
-                ui::scroll(body.overflow_y_scroll().child(self.home(t, cx))).into_any_element()
-            }
+            Page::Inbox => body.child(self.inbox_page(inbox, t, cx)).into_any_element(),
             Page::Session(_) => body
-                .p(px(12.))
-                .child(self.session(t, focused, cx))
+                .pt(px(12.))
+                .child(padded(self.session(inbox, t, focused, cx)))
                 .into_any_element(),
             Page::Qass => body
-                .p(px(12.))
-                .child(self.qass_page(t, focused, cx))
+                .pt(px(12.))
+                .child(padded(self.qass_page(t, focused, cx)))
                 .into_any_element(),
             Page::Schedules => body
-                .p(px(12.))
-                .child(self.schedules_page(t, cx))
+                .child(self.page_header(t))
+                .child(padded(self.schedules_page(t, cx)))
                 .into_any_element(),
             Page::Settings => body
-                .p(px(12.))
-                .child(self.settings_page(t, cx))
+                .child(self.page_header(t))
+                .child(padded(self.settings_page(t, cx)))
                 .into_any_element(),
+            Page::Computer(m) => {
+                ui::scroll(body.overflow_y_scroll().child(self.computer_page(m, t, cx)))
+                    .into_any_element()
+            }
         }
     }
 }
@@ -2028,9 +1532,9 @@ impl EntityInputHandler for Desk {
             && self.connected
             && !text.is_empty()
         {
-            let _ = self
-                .up
-                .send(Up::Input(term.terminal, text.as_bytes().to_vec()));
+            let terminal = term.terminal;
+            let _ = self.up.send(Up::Input(terminal, text.as_bytes().to_vec()));
+            self.typed_at.insert(terminal, Instant::now());
         }
     }
 
@@ -2090,6 +1594,11 @@ impl Render for Desk {
             cx.set_global(t);
         }
         let focused = self.term_focus.is_focused(window);
+        // The widths the dividers set are held to the window as it is now.
+        self.win_w = f32::from(window.viewport_size().width);
+        let inbox = self.inbox();
+        self.follow_card_focus(&inbox, window, cx);
+        let side = self.side_px();
         let mut root = div()
             .id("desk")
             .role(Role::Application)
@@ -2101,9 +1610,40 @@ impl Render for Desk {
             .capture_any_mouse_down(
                 cx.listener(|this, _, _, _| this.last_input = Some(Instant::now())),
             )
+            // A divider follows the mouse while the button is down, wherever it goes.
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                match (this.drag, event.pressed_button) {
+                    (Some(edge), Some(MouseButton::Left)) => {
+                        this.drag_to(edge, f32::from(event.position.x));
+                        cx.notify();
+                    }
+                    (Some(_), _) => {
+                        this.drag = None;
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .relative()
             .size_full()
             .overflow_hidden()
+            .flex()
             .bg(c(t.bg))
             .font_family(UI_FONT)
             .text_size(px(13.5))
@@ -2117,13 +1657,19 @@ impl Render for Desk {
                     ),
                 ))
             })
-            .child(self.sidebar(&t, cx))
-            .child(self.top_bar(&t, cx))
-            .child(self.centre(&t, focused, cx))
-            .child(self.status_line(&t, focused, cx));
-        if self.inbox {
-            root = root.child(self.inbox_panel(&t, cx));
-        }
+            .child(self.sidebar(side, &inbox, &t, cx))
+            .child(self.divider(Edge::Side, "Resize the sidebar", &t, cx))
+            .child(
+                div()
+                    .id("main")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .when_some(self.banner_strip(&t, cx), |d, banner| d.child(banner))
+                    .child(self.centre(&inbox, &t, focused, cx)),
+            );
         if self.sheet.is_some() {
             root = root.child(self.sheet_view(&t, cx));
         }

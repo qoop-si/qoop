@@ -1603,9 +1603,17 @@ fn priority_rows(c: &Column) -> Vec<Row> {
             .filter(|i| i.terminal == Some(terminal))
             .count();
         let mut entry = agent_entry(c, agent, false);
-        if asks > 1 {
-            entry.suffix = Some(format!("({asks} asks)"));
-        }
+        // How long it has waited, by the Inbox's own reckoning (the desktop's sidebar says the
+        // same), not by when the agent was last active.
+        let waited = c
+            .list
+            .since_of(terminal)
+            .map(|at| crate::asks::age_short(c.now_unix.saturating_sub(at)));
+        entry.suffix = match (asks > 1, waited) {
+            (true, Some(w)) => Some(format!("({asks} asks) {w}")),
+            (true, None) => Some(format!("({asks} asks)")),
+            (false, w) => w,
+        };
         needs.push(entry);
     }
     // The title is the Inbox's count, the same everywhere; a search counts what it shows.
@@ -7183,10 +7191,24 @@ mod tests {
         let at = line.text.find("(2 asks)").expect("the words");
         let col = crate::width::width(&line.text[..at]);
         assert!(
-            line.runs
-                .contains(&(col, "(2 asks)".len(), crate::theme::Role::Blocked)),
+            line.runs.iter().any(|(c, len, role)| *c == col
+                && *len >= "(2 asks)".len()
+                && *role == crate::theme::Role::Blocked),
             "{:?}",
             line.runs
+        );
+        // Each says how long it has waited, by the Inbox's reckoning: the oldest of its items
+        // (1 since 100, 2 since 150), not when the agent was last active.
+        let waited = |since: i64| crate::asks::age_short(c.now_unix.saturating_sub(since));
+        assert!(
+            line.text.trim_end().ends_with(&waited(100)),
+            "{:?}",
+            line.text
+        );
+        assert!(
+            of(2)[0].0.text.trim_end().ends_with(&waited(150)),
+            "{:?}",
+            of(2)[0].0.text
         );
         assert_eq!(
             items(&c)

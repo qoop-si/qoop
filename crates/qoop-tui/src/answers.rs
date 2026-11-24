@@ -1329,4 +1329,46 @@ mod tests {
         assert!(holds.menus(&[row(4, 1, "blocked")], t0).is_empty());
         assert_eq!(holds.held.len(), 1);
     }
+
+    #[test]
+    fn refusals_read_as_words() {
+        let key = Pick::Key("1".into());
+        assert_eq!(
+            refusal_words("already_answered", "This Mac", &key),
+            "Someone already answered this question."
+        );
+        assert_eq!(
+            refusal_words("qass_not_running", "staging", &Pick::Qass),
+            "qass is not running on staging, so it cannot take this."
+        );
+        let old = "this daemon is older than the client that called it: it does not know the \
+                   method that was asked for (unknown variant `AnswerMenuText`)";
+        let words = Pick::Text {
+            key: "4".into(),
+            text: "x".into(),
+        };
+        assert_eq!(
+            refusal_words(old, "staging", &words),
+            "qoop on staging is too old for typed answers."
+        );
+        assert_eq!(
+            refusal_words(old, "staging", &Pick::Qass),
+            "qoop on staging is too old to hand questions to qass."
+        );
+        // Every code the daemon sends reads as a sentence, never as the code.
+        for code in [
+            "busy",
+            "no_such_answer",
+            "not_at_input",
+            "no_text_field",
+            "empty",
+            "too_long",
+            "not_a_person",
+            "not_watching",
+            "skipped",
+        ] {
+            let said = refusal_words(code, "This Mac", &key);
+            assert!(said.ends_with('.') && !said.contains('_'), "{code}: {said}");
+        }
+    }
 }

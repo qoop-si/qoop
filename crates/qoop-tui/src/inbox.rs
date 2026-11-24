@@ -14,7 +14,7 @@ use qoop_domain::status::Status;
 use qoop_runtime::control::{AgentRow, AskInfo};
 use serde::Deserialize;
 
-use crate::answers::{HandInput, Kind, Slot, can_hand, handed};
+use crate::answers::{HandInput, Hold, Kind, Pick, Slot, can_hand, handed};
 use crate::asks::plan_card;
 use crate::mux::machine_of;
 
@@ -125,6 +125,30 @@ pub struct OwnAnswer {
     pub card: Option<String>,
 }
 
+/// How many answers a client keeps for Answered today.
+pub const OWN_MOST: usize = 50;
+
+/// Keep `hold` as an answer this client sent (`to`: the agent or card it was for, `at`: now),
+/// oldest dropped past [`OWN_MOST`]. A card put away is no answer; a hand-off to qass is one
+/// (the person decided who answers). Every client records its sent holds through this one rule.
+pub fn record_own(own: &mut Vec<OwnAnswer>, hold: &Hold, to: String, at: i64) {
+    if matches!(hold.pick, Pick::PutAway { .. }) {
+        return;
+    }
+    own.push(OwnAnswer {
+        at,
+        label: hold.label.clone(),
+        to,
+        card: match &hold.slot {
+            Slot::Card(id) => Some(id.clone()),
+            Slot::Agent(_) => None,
+        },
+    });
+    if own.len() > OWN_MOST {
+        own.remove(0);
+    }
+}
+
 /// One line of Answered today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Answered {
@@ -230,6 +254,17 @@ impl Inbox {
         (0..self.items.len())
             .map(|k| &self.items[(at + k) % self.items.len()])
             .find(|i| i.terminal != Some(focused))
+    }
+
+    /// Since when `terminal` has waited: the oldest of its items (`since` of a menu and of a card
+    /// about it differ). `None` when it has none, or none the daemon stamped. Every surface
+    /// words the wait from this, not from the agent's last activity.
+    pub fn since_of(&self, terminal: u32) -> Option<i64> {
+        self.items
+            .iter()
+            .filter(|i| i.terminal == Some(terminal))
+            .filter_map(|i| i.since)
+            .min()
     }
 
     /// The terminals of the counted items that name an agent, oldest first.
@@ -454,6 +489,101 @@ mod tests {
     }
 
     /// The design's records in every state give the list, count and sections the design draws.
+    /// A terminal's wait is the oldest of its items, whatever mix of menu and card it has, and
+    /// none for one that waits on nothing.
+    #[test]
+    fn since_of_is_the_oldest_item_of_the_terminal() {
+        let items = vec![
+            Item {
+                slot: Slot::Agent(1),
+                kind: ItemKind::Menu,
+                terminal: Some(1),
+                since: Some(300),
+                hand_to_qass: false,
+                lost: false,
+            },
+            Item {
+                slot: Slot::Card("Q1".into()),
+                kind: ItemKind::Agent,
+                terminal: Some(1),
+                since: Some(200),
+                hand_to_qass: false,
+                lost: false,
+            },
+            Item {
+                slot: Slot::Agent(2),
+                kind: ItemKind::Failed,
+                terminal: Some(2),
+                since: None,
+                hand_to_qass: false,
+                lost: false,
+            },
+        ];
+        let list = Inbox {
+            count: items.len(),
+            items,
+            ..Inbox::default()
+        };
+        assert_eq!(list.since_of(1), Some(200), "the card's, the older");
+        assert_eq!(list.since_of(2), None, "never stamped");
+        assert_eq!(list.since_of(3), None, "waits on nothing");
+    }
+
+    /// What a sent hold records for Answered today: a put away is no answer, a hand-off is, and
+    /// the oldest go past the cap.
+    #[test]
+    fn a_sent_hold_is_recorded_by_one_rule() {
+        let hold = |slot: Slot, pick: Pick, label: &str| Hold {
+            slot,
+            generation: None,
+            menu_seal: None,
+            seal: 0,
+            pick,
+            label: label.into(),
+            until: std::time::Instant::now(),
+        };
+        let mut own = Vec::new();
+        record_own(
+            &mut own,
+            &hold(
+                Slot::Card("Q1".into()),
+                Pick::PutAway { card: "Q1".into() },
+                "Put away",
+            ),
+            "x".into(),
+            10,
+        );
+        assert!(own.is_empty(), "put away is not an answer");
+        record_own(
+            &mut own,
+            &hold(Slot::Agent(3), Pick::Qass, "Hand to qass"),
+            "a/b".into(),
+            11,
+        );
+        assert_eq!(own.len(), 1, "a hand-off is");
+        assert_eq!(
+            (own[0].label.as_str(), own[0].card.clone()),
+            ("Hand to qass", None)
+        );
+        for at in 0..(OWN_MOST as i64 + 5) {
+            record_own(
+                &mut own,
+                &hold(
+                    Slot::Card("Q2".into()),
+                    Pick::Card {
+                        card: "Q2".into(),
+                        option: "a".into(),
+                    },
+                    "Yes",
+                ),
+                "y".into(),
+                100 + at,
+            );
+        }
+        assert_eq!(own.len(), OWN_MOST, "capped");
+        assert_eq!(own[0].at, 105, "the oldest six went");
+    }
+
     #[test]
     fn the_golden_fixture_gives_the_designs_inbox_in_every_state() {
         let fixture = fixture();

@@ -1,10 +1,9 @@
 //! The session page: the space's tabs, the tab's panes as the daemon keeps them (read only),
-//! the task strip, the corner note for another agent that turned Needs you, and d-review.
+//! the task strip beside them (its width is dragged, see `shell.rs`), and d-review.
 //!
-//! The terminal keeps the keys: the strip, the note and the review are driven by clicks and
-//! by the prefix (`ctrl-a x` dismisses the note, `ctrl-a tab` opens its agent); inside the
-//! review, which takes the focus while open, `x` marks the finish read and `n` opens the next
-//! file.
+//! The terminal keeps the keys: the strip and the review are driven by clicks and by the
+//! prefix; inside the review, which takes the focus while open, `x` marks the finish read and
+//! `n` opens the next file.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -22,13 +21,10 @@ use crate::app::{Desk, Page, Term};
 use crate::element::TerminalElement;
 use crate::link::{self, Up};
 use crate::review::{self, Mark, Review};
+use crate::shell::Edge;
 use crate::state::{self, Kind};
 use crate::theme::{DARK, MONO_FONT, TERMINAL_BG, Theme, c, ca};
 use crate::ui::{self, Icon};
-
-/// The task column's width, and the review's when it takes that place.
-const STRIP_W: f32 = 300.;
-const REVIEW_W: f32 = 560.;
 
 /// The most diff rows the open file draws; the rest are in the editor.
 const DIFF_ROWS: usize = 600;
@@ -99,29 +95,12 @@ impl Desk {
         }
     }
 
-    /// After a new agent list: the corner note for another agent that turned Needs you, gone
-    /// once its agent no longer needs the owner; the panes follow a split made or undone.
-    pub(crate) fn rows_changed(&mut self, before: &[qoop_runtime::control::AgentRow]) {
+    /// After a new agent list: the panes follow a split made or undone.
+    pub(crate) fn rows_changed(&mut self) {
         let Page::Session(_) = self.page else {
             return;
         };
         let shown = self.term.as_ref().map(|t| t.terminal);
-        let on_screen: Vec<TerminalStream> = self
-            .term
-            .iter()
-            .chain(&self.others)
-            .map(|t| t.terminal)
-            .collect();
-        // No note while the Inbox is open: its card already shows the question.
-        if !self.inbox
-            && let Some(t) = self.model.turned_needs(before, &on_screen)
-        {
-            self.note = Some(t);
-        }
-        let needs = |t: TerminalStream| self.model.row(t).is_some_and(|r| Kind::of(r).needs_you());
-        if self.note.is_some_and(|t| !needs(t)) {
-            self.note = None;
-        }
         if let Some(focus) = shown {
             let held: Vec<TerminalStream> = self
                 .term
@@ -227,7 +206,8 @@ impl Desk {
     }
 
     fn pane_drag(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if event.pressed_button != Some(MouseButton::Left) {
+        // A divider being dragged across the terminal selects nothing in it.
+        if event.pressed_button != Some(MouseButton::Left) || self.drag.is_some() {
             return;
         }
         let Some(cell) = self
@@ -284,7 +264,9 @@ impl Desk {
         if let Some(term) = self.term.as_ref().filter(|_| self.connected)
             && !text.is_empty()
         {
-            let _ = self.up.send(Up::Paste(term.terminal, text.into_bytes()));
+            let terminal = term.terminal;
+            let _ = self.up.send(Up::Paste(terminal, text.into_bytes()));
+            self.typed_at.insert(terminal, std::time::Instant::now());
         }
         self.back_to_live();
     }
@@ -382,22 +364,14 @@ impl Desk {
         }
     }
 
-    /// `ctrl-a x`: the corner note goes; the agent still waits in the Inbox.
-    pub(crate) fn dismiss_note(&mut self, cx: &mut Context<Self>) {
-        if self.note.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// `ctrl-a tab`: the corner note's agent opens.
-    pub(crate) fn open_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(t) = self.note.take() {
-            self.open(Page::Session(t), window, cx);
-        }
-    }
-
     /// The centre of a session page.
-    pub fn session(&self, t: &Theme, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+    pub fn session(
+        &self,
+        inbox: &qoop_tui::inbox::Inbox,
+        t: &Theme,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(term) = self.term.as_ref() else {
             return div().into_any_element();
         };
@@ -431,7 +405,7 @@ impl Desk {
                         .child(self.task_column(t, cx)),
                 )
                 .into_any_element(),
-            (None, None) => match self.questions(term.terminal, t, cx) {
+            (None, None) => match self.questions(term.terminal, inbox, t, cx) {
                 // The agent's question cards over its task.
                 Some(questions) => div()
                     .size_full()
@@ -487,20 +461,16 @@ impl Desk {
                                 },
                             ),
                     )
+                    .child(self.divider(Edge::Drawer, "Resize the side panel", t, cx))
                     .child(
                         div()
                             .flex_none()
                             .h_full()
-                            .w(px(if self.review.is_some() {
-                                REVIEW_W
-                            } else {
-                                STRIP_W
-                            }))
+                            .w(px(self.drawer_px()))
                             .flex()
                             .flex_col()
                             .gap(px(10.))
-                            .child(div().flex_1().min_h_0().flex().flex_col().child(right))
-                            .when_some(self.note, |d, note| d.child(self.corner_note(note, t, cx))),
+                            .child(div().flex_1().min_h_0().flex().flex_col().child(right)),
                     ),
             )
             .into_any_element()
@@ -815,6 +785,7 @@ impl Desk {
     fn questions(
         &self,
         terminal: TerminalStream,
+        inbox: &qoop_tui::inbox::Inbox,
         t: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -862,7 +833,11 @@ impl Desk {
             .child(section("Questions", Some(cards.len().to_string()), t))
             .children(cards.iter().enumerate().map(|(i, card)| {
                 if card.card == open {
-                    return self.card_block(i, card, true, t, cx);
+                    // Hand to qass only where the shared Inbox rules offer it for this card.
+                    let hand = inbox.items.iter().any(|item| {
+                        item.slot == state::Slot::Card(card.card.clone()) && item.hand_to_qass
+                    });
+                    return self.card_block(i, card, hand, t, cx);
                 }
                 let id = card.card.clone();
                 ui::control(
@@ -889,9 +864,7 @@ impl Desk {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
+                        .whitespace_normal()
                         .child(card.body.asks.clone()),
                 )
                 .child(div().text_color(c(t.t2)).child(state::short_span(
@@ -1054,143 +1027,6 @@ impl Desk {
                 .border_color(ca(t.hair))
                 .child(body),
         )
-    }
-
-    /// The corner note: another agent turned Needs you while this session is open. Shown once;
-    /// it then waits in the Inbox.
-    fn corner_note(
-        &self,
-        terminal: TerminalStream,
-        t: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(row) = self.model.row(terminal) else {
-            return div().into_any_element();
-        };
-        let title = state::title_of(row);
-        let space = self.model.space(row.workspace);
-        let menu = row.menu.as_ref();
-        let prefix = self.prefix_name();
-        div()
-            .id("corner-note")
-            .debug_selector(|| "corner-note".to_string())
-            .role(Role::Alert)
-            .aria_label(format!("Needs you: {title}"))
-            .flex_none()
-            .w_full()
-            .min_w_0()
-            .overflow_hidden()
-            .p(px(12.))
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .rounded(px(14.))
-            .bg(c(t.card2))
-            .border_1()
-            .border_color(ca(t.needs_line))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(7.))
-                    .text_size(px(12.5))
-                    .child(ui::mark(Kind::of(row), t, 11.))
-                    .child(div().text_color(c(t.needs_text)).child("Needs you"))
-                    .when_some(state::age_of(row, self.now), |d, age| {
-                        d.child(div().text_color(c(t.t2)).child(age))
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        ui::control("note-close", Role::Button, "Dismiss", t)
-                            .size(px(24.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.))
-                            .child(ui::icon(Icon::Close, 13., c(t.t2)))
-                            .on_click(cx.listener(|this, _, _, cx| this.dismiss_note(cx))),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_baseline()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .text_size(px(13.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title.clone()),
-                    )
-                    .when_some(space, |d, w| {
-                        d.child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(t.space(state::space_slot(w)))
-                                .child(w.name.clone()),
-                        )
-                    }),
-            )
-            .when_some(menu.filter(|m| !m.question.is_empty()), |d, m| {
-                d.child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(c(t.t1))
-                        .child(m.question.clone()),
-                )
-            })
-            .when_some(menu, |d, m| {
-                d.child(
-                    div()
-                        .id("note-options")
-                        .role(Role::Group)
-                        .aria_label("Answers")
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.))
-                        .children(
-                            state::offers(m)
-                                .iter()
-                                .take(5)
-                                .enumerate()
-                                .map(|(n, o)| self.offer_button(terminal, o, ("note", n), t, cx)),
-                        ),
-                )
-            })
-            .when_some(
-                self.said_line(&state::Slot::Agent(terminal), t, cx),
-                |d, line| d.child(line),
-            )
-            .child(quiet(
-                "Clicks only; the terminal keeps the keys. Shown once, then it waits in the Inbox.",
-                t,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        ui::pill("note-dismiss", "Dismiss", t)
-                            .h(px(28.))
-                            .child("Dismiss")
-                            .child(ui::kbd(&format!("{prefix} x"), t))
-                            .on_click(cx.listener(|this, _, _, cx| this.dismiss_note(cx))),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        ui::pill("note-open", &format!("Open {title}"), t)
-                            .debug_selector(|| "note-open".to_string())
-                            .h(px(28.))
-                            .child("Open")
-                            .child(ui::kbd(&format!("{prefix} tab"), t))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_note(window, cx)),
-                            ),
-                    ),
-            )
-            .into_any_element()
     }
 
     /// d-review: the files the tab's checkout changed against its base, one open.

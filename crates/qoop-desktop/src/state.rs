@@ -5,13 +5,11 @@
 //! orders, counts and words what it was told. It never classifies a state on its own.
 
 use std::collections::{BTreeSet, HashMap};
-use std::time::{Duration, Instant};
 
-use qoop_domain::shell::quote as shell_quote;
 use qoop_domain::status::{self, Status};
 use qoop_runtime::control::{
-    AgentMenu, AgentRow, AskInfo, ItemCardInfo, LinkState, Pane, QassAct, ScheduleInfo,
-    ScheduleRun, SleepingTab, StepInfo, TaskEventInfo, TaskInfo, TerminalStream, WorkspaceRow,
+    AgentRow, AskInfo, ItemCardInfo, LinkState, Pane, QassAct, ScheduleInfo, ScheduleRun,
+    SleepingTab, StepInfo, TaskEventInfo, TaskInfo, TerminalStream, WorkspaceRow,
 };
 use qoop_runtime::schedule::{Cron, Naive, Zone, next_slot};
 
@@ -101,69 +99,6 @@ pub fn mark_dots(kind: Kind, frame: Option<u32>) -> Vec<(u8, u8)> {
     }
 }
 
-/// The filter chips over home's list. Never a space filter: it could hide a space whose
-/// agent needs you.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Chip {
-    All,
-    NeedsYou,
-    Working,
-    Done,
-    Sleeping,
-}
-
-impl Chip {
-    pub const ALL: [Chip; 5] = [
-        Chip::All,
-        Chip::NeedsYou,
-        Chip::Working,
-        Chip::Done,
-        Chip::Sleeping,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Chip::All => "All",
-            Chip::NeedsYou => "Needs you",
-            Chip::Working => "Working",
-            Chip::Done => "Done",
-            Chip::Sleeping => "sleeping",
-        }
-    }
-
-    pub fn holds(self, kind: Kind) -> bool {
-        match self {
-            Chip::All => true,
-            Chip::NeedsYou => kind.needs_you(),
-            Chip::Working => matches!(kind, Kind::Status(Status::Working | Status::Starting)),
-            Chip::Done => kind == Kind::Status(Status::Done),
-            Chip::Sleeping => kind == Kind::Sleeping,
-        }
-    }
-
-    /// What the list says when the chip holds nothing.
-    pub fn empty(self) -> &'static str {
-        match self {
-            Chip::All => "No agents yet. New work starts one.",
-            Chip::NeedsYou => "Nothing needs you.",
-            Chip::Working => "Nothing is working.",
-            Chip::Done => "Nothing is done.",
-            Chip::Sleeping => "Nothing is sleeping.",
-        }
-    }
-
-    /// The mark the chip wears: the state it filters by.
-    pub fn kind(self) -> Option<Kind> {
-        match self {
-            Chip::All => None,
-            Chip::NeedsYou => Some(Kind::Status(Status::Blocked)),
-            Chip::Working => Some(Kind::Status(Status::Working)),
-            Chip::Done => Some(Kind::Status(Status::Done)),
-            Chip::Sleeping => Some(Kind::Sleeping),
-        }
-    }
-}
-
 /// The space qass lives in on this machine, kept off the owner's lists.
 pub const QASS_SPACE: &str = "qass";
 
@@ -175,23 +110,13 @@ pub struct Model {
     pub schedules: Vec<ScheduleInfo>,
     /// qass's switch as `QassWatch` read it; `None` before the first answer.
     pub qass_watch: Option<bool>,
-    pub folded: BTreeSet<i64>,
     /// The tabs split into panes, as the daemon keeps them (`Agents::splits`).
     pub splits: Vec<Pane>,
-    /// Machines whose qoop refused a hand for This Mac's qass as too old: no option 5 there.
+    /// Machines whose qoop refused a hand for This Mac's qass as too old: no hand there.
     pub no_hands: BTreeSet<usize>,
-    /// Since when (the window's clock) This Mac's qass has run and watched, and which agent
-    /// that is (its tab and generation): a restart starts the clock again.
-    pub qass_up: Option<(i64, (u32, Option<u64>))>,
-    /// Each row's hand for another machine's qass as last seen (`qass_away.at`), and when the
-    /// window first saw that hand: `None` for one already there in its machine's first list.
-    pub away_seen: HashMap<u32, (i64, Option<i64>)>,
-    /// The machines the last agent list had rows of.
-    pub listed_machines: BTreeSet<usize>,
-    /// The agents qass's open cards are about, as their keys (`T5`, `staging/T2`).
-    pub carded: Vec<String>,
-    /// This Mac's hand id (`paths::hand_id`), once known.
-    pub hand_id: Option<String>,
+    /// What the shared answer rules read about qass and the hands to it (`qoop_tui::answers`):
+    /// kept current by `Desk::note_hand` after every list, card read and switch.
+    pub hand: qoop_tui::answers::HandInput,
 }
 
 /// One line of home's lists: an awake agent's row, or a sleeping tab that held an agent.
@@ -238,14 +163,6 @@ impl<'a> Entry<'a> {
             Entry::Asleep(tab, _) => tab.label().to_string(),
         }
     }
-
-    pub fn sub(self) -> String {
-        match self {
-            Entry::Live(row) => sub_of(row),
-            Entry::Asleep(..) => SLEEPING_SUB.into(),
-        }
-    }
-
     /// How long it has been as it is; a sleeping tab's list carries no time.
     pub fn age(self, now: i64) -> Option<String> {
         match self {
@@ -299,10 +216,9 @@ impl Model {
         out
     }
 
-    /// Home's groups: spaces in the daemon's order, each with its agents by rank and then in
-    /// the daemon's order (oldest first), as the TUI lists them. A space with no agent the
-    /// chip holds is left out, and so is an empty one.
-    pub fn groups(&self, chip: Chip) -> Vec<Group<'_>> {
+    /// The spaces in the daemon's order, each with its agents by rank and then in the daemon's
+    /// order (oldest first), as the TUI lists them. An empty space is left out.
+    pub fn groups(&self) -> Vec<Group<'_>> {
         let agents = self.agents();
         self.spaces
             .iter()
@@ -315,7 +231,6 @@ impl Model {
                     .collect();
                 all.sort_by_key(|e| e.kind().rank());
                 let count = all.len();
-                all.retain(|e| chip.holds(e.kind()));
                 (!all.is_empty()).then_some(Group {
                     space,
                     rows: all,
@@ -323,54 +238,6 @@ impl Model {
                 })
             })
             .collect()
-    }
-
-    pub fn count(&self, chip: Chip) -> usize {
-        self.agents()
-            .iter()
-            .filter(|e| chip.holds(e.kind()))
-            .count()
-    }
-
-    /// The terminals of the agents that need the owner: a question qass holds is not one, one
-    /// it no longer holds is again (`with_qass`). The one count behind the header, the badge,
-    /// the chip and the status line.
-    pub fn asking(&self) -> Vec<u32> {
-        self.live()
-            .filter(|r| Kind::of(r).needs_you() && !self.with_qass(r))
-            .map(|r| r.terminal)
-            .collect()
-    }
-
-    /// The agents whose question qass holds now.
-    pub fn handed(&self) -> usize {
-        self.live()
-            .filter(|r| Kind::of(r).needs_you() && self.with_qass(r))
-            .count()
-    }
-
-    /// The agents that failed: the rest of the Inbox badge.
-    pub fn failed(&self) -> usize {
-        self.live()
-            .filter(|r| Kind::of(r) == Kind::Status(Status::Failed))
-            .count()
-    }
-
-    /// "7 in 3 spaces on 2 machines".
-    pub fn summary(&self) -> String {
-        let agents = self.agents();
-        // Nothing yet: not "0 in 0 spaces on 0 machines" beside machines that are connected.
-        if agents.is_empty() {
-            return count(0, "agent");
-        }
-        let spaces: BTreeSet<i64> = agents.iter().map(|e| e.workspace()).collect();
-        let machines: BTreeSet<usize> = spaces.iter().map(|w| machine_of(*w)).collect();
-        format!(
-            "{} in {} on {}",
-            agents.len(),
-            count(spaces.len(), "space"),
-            count(machines.len(), "machine")
-        )
     }
 
     pub fn space(&self, id: i64) -> Option<&WorkspaceRow> {
@@ -385,28 +252,7 @@ impl Model {
         self.space(id).map_or_else(String::new, |w| w.name.clone())
     }
 
-    /// The agent the status line points at: the first that needs you, else the first that
-    /// failed, in home's order.
-    pub fn next_up(&self) -> Option<&AgentRow> {
-        let mut agents: Vec<&AgentRow> = self.live().filter(|r| !self.with_qass(r)).collect();
-        agents.sort_by_key(|r| Kind::of(r).rank());
-        agents
-            .into_iter()
-            .find(|r| matches!(Kind::of(r), Kind::Status(Status::Blocked | Status::Failed)))
-    }
-
-    /// "next: acme-web/review-pr needs you", or nothing when nothing waits. By the agent's
-    /// own title: two claude tabs in one space would read the same by their program.
-    pub fn status_line(&self) -> Option<String> {
-        let row = self.next_up()?;
-        Some(format!(
-            "next: {} {}",
-            self.agent_name(row),
-            Kind::of(row).word().to_lowercase()
-        ))
-    }
-
-    /// An agent as the status line names it: "acme-web/review-pr".
+    /// An agent as the Inbox and the hold bar name it: "acme-web/review-pr".
     pub fn agent_name(&self, row: &AgentRow) -> String {
         format!("{}/{}", self.space_name(row.workspace), title_of(row))
     }
@@ -484,33 +330,18 @@ impl Model {
         format!("watching {watched} of {}", agents.len())
     }
 
-    /// After a new agent list or switch read at `now` (the window's clock): since when This
-    /// Mac's qass runs and watches, and when each hand for another machine's qass was first
-    /// seen. `first`: the window's first list, whose hands are older than anything it knows.
-    pub fn note_qass(&mut self, now: i64) {
-        let up = self.qass_line().starts_with("watching");
-        let who = self.qass_row().map(|r| (r.terminal, r.generation));
-        self.qass_up = match (up, who, self.qass_up) {
-            (true, Some(who), Some((since, was))) if was == who => Some((since, who)),
-            (true, Some(who), _) => Some((now, who)),
-            _ => None,
-        };
-        let mut seen = HashMap::new();
-        for r in &self.rows {
-            if let Some(away) = &r.qass_away {
-                // A machine's first list in this window (a remote's comes after the window
-                // opens) holds hands older than anything the window knows.
-                let first = !self.listed_machines.contains(&machine_of(r.workspace));
-                let when = match self.away_seen.get(&r.terminal) {
-                    Some((at, when)) if *at == away.at => *when,
-                    _ if first => None,
-                    _ => Some(now),
-                };
-                seen.insert(r.terminal, (away.at, when));
-            }
-        }
-        self.away_seen = seen;
-        self.listed_machines = self.rows.iter().map(|r| machine_of(r.workspace)).collect();
+    /// After a new agent list, card read or switch read at `now` (the window's clock): the
+    /// shared hand rules' input (`qoop_tui::inbox_pane::update_hand`) is brought up to date.
+    pub fn note_qass(&mut self, cards: &[AskInfo], now: i64) {
+        qoop_tui::inbox_pane::update_hand(
+            &mut self.hand,
+            &self.spaces,
+            &self.rows,
+            cards,
+            &self.no_hands,
+            self.qass_watch,
+            now,
+        );
     }
 
     /// Why This Mac's qass takes nothing now: it is not running, or not watching. The part of
@@ -523,7 +354,7 @@ impl Model {
         }
     }
 
-    /// Why "Let qass handle it" cannot be pressed for `row`, or `None` when it can. One rule
+    /// Why "Hand to qass" cannot be pressed for `row`, or `None` when it can. One rule
     /// for every place that offers it: This Mac's qass takes every machine's questions.
     pub fn qass_reason(&self, row: &AgentRow) -> Option<String> {
         if row.qass_skip {
@@ -546,27 +377,10 @@ impl Model {
     /// has run and watched since the window first saw that hand (a restart never heard of it),
     /// and no card of qass's is about that agent (then the card is what waits on the owner).
     pub fn with_qass(&self, row: &AgentRow) -> bool {
-        if !row.with_qass || self.qass_reason(row).is_some() {
-            return false;
-        }
-        let Some(away) = &row.qass_away else {
-            return true;
-        };
-        // Another Mac's hand: its qass was told, as far as this window can know.
-        if self.hand_id.as_ref().is_some_and(|me| *me != away.by) {
-            return true;
-        }
-        let seen = self
-            .away_seen
-            .get(&row.terminal)
-            .filter(|(at, _)| *at == away.at)
-            .and_then(|(_, when)| *when);
-        let up = self.qass_up.map(|(since, _)| since);
-        matches!((up, seen), (Some(up), Some(seen)) if up <= seen)
-            && !self.carded.contains(&self.agent_key(row))
+        qoop_tui::answers::handed(row, &self.hand)
     }
 
-    /// What a handed row says where "Let qass handle it" would be: "With qass", or with why
+    /// What a handed row says where "Hand to qass" would be: "With qass", or with why
     /// nobody takes it now ("With qass, not running"). `None` when it is not handed, or its
     /// hand is no longer one qass holds.
     pub fn qass_words(&self, row: &AgentRow) -> Option<String> {
@@ -580,27 +394,6 @@ impl Model {
             line @ ("not running" | "not watching") => Some(format!("With qass, {line}")),
             _ => None,
         }
-    }
-
-    /// The agent as qass's cards key it: `T5` on This Mac, `staging/T2` on another machine.
-    pub fn agent_key(&self, row: &AgentRow) -> String {
-        let n = qoop_tui::mux::daemon_terminal(row.terminal);
-        match self.space(row.workspace).filter(|w| machine_of(w.id) != 0) {
-            Some(space) => format!("{}/T{n}", machine_name(space)),
-            None => format!("T{n}"),
-        }
-    }
-
-    /// The row a card of qass's is about: by its terminal on This Mac, else by its key.
-    pub fn card_row(&self, card: &AskInfo) -> Option<u32> {
-        if let Some(t) = card.terminal {
-            return Some(t);
-        }
-        let (key, _) = qoop_runtime::asks::agent_key(card.agent.as_deref()?)?;
-        self.rows
-            .iter()
-            .find(|r| self.agent_key(r) == key)
-            .map(|r| r.terminal)
     }
 
     /// The finish a person looks at when `terminal` is on screen: its turn end, while its
@@ -636,23 +429,44 @@ impl Model {
             .filter(|r| r.workspace == workspace && !inner.contains(&r.terminal))
             .collect()
     }
+}
 
-    /// The agent a corner note is for: one of the owner's that was listed in `before` and has
-    /// turned Needs you since, outside the panes on screen (`shown`). A row that was not listed
-    /// (a remote back, the first list) is no turn.
-    pub fn turned_needs(&self, before: &[AgentRow], shown: &[u32]) -> Option<u32> {
-        let was_calm = |t: u32| {
-            before
-                .iter()
-                .any(|r| r.terminal == t && !Kind::of(r).needs_you())
+/// How many waiting agents the sidebar lists under a space before its "N more".
+pub const SIDE_SHOWN: usize = 2;
+
+/// What the sidebar lists of one space.
+#[derive(Debug)]
+pub struct Fold<'a> {
+    pub shown: Vec<Entry<'a>>,
+    /// The agents of the space that are not listed: its "N more".
+    pub more: usize,
+    /// Nothing waits here and the open agent is elsewhere: the space is one line.
+    pub quiet: bool,
+}
+
+/// A space as the sidebar folds it: the agent on screen (`open`) first, then the agents that
+/// wait for the person (`waiting`, oldest first, at most [`SIDE_SHOWN`]), the rest behind
+/// "N more". Expanded, every agent of the space, sleepers included.
+pub fn fold<'a>(group: &Group<'a>, waiting: &[u32], open: Option<u32>, expanded: bool) -> Fold<'a> {
+    if expanded {
+        return Fold {
+            shown: group.rows.clone(),
+            more: 0,
+            quiet: false,
         };
-        // A question qass holds is not put to the owner a second time.
-        self.live()
-            .filter(|r| {
-                !shown.contains(&r.terminal) && Kind::of(r).needs_you() && !self.with_qass(r)
-            })
-            .map(|r| r.terminal)
-            .find(|&t| was_calm(t))
+    }
+    let find = |t: u32| group.rows.iter().find(|e| e.terminal() == t).copied();
+    let mut shown: Vec<Entry<'a>> = open.and_then(find).into_iter().collect();
+    for entry in waiting.iter().filter_map(|t| find(*t)) {
+        let held = shown.iter().any(|e| e.terminal() == entry.terminal());
+        if !held && shown.len() < SIDE_SHOWN + usize::from(open.and_then(find).is_some()) {
+            shown.push(entry);
+        }
+    }
+    Fold {
+        more: group.rows.len() - shown.len(),
+        quiet: shown.is_empty(),
+        shown,
     }
 }
 
@@ -769,253 +583,10 @@ pub fn selected_text(lines: &[String], a: (usize, usize), b: (usize, usize)) -> 
         .join("\n")
 }
 
-/// What the window types for "Explain this in more detail", pinned to the daemon's copy by a
-/// test (`qoop_runtime::menu::EXPLAIN`).
-pub const EXPLAIN: &str = "Explain this in more detail before I decide: what it will do, why, and \
-                           what it changes. Then ask me again.";
-
-/// How long a pick waits before it is sent, for Undo.
-pub const HOLD: Duration = Duration::from_secs(3);
-
-/// A menu younger than this takes no digit: a key meant for the screen before it.
-pub const ARMING: Duration = Duration::from_millis(500);
-
-/// What a pick sends once its hold is up.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Pick {
-    /// One of the agent's own options, by its key (`AnswerMenu`).
-    Key(String),
-    /// Words typed through the option `key`, a `tell` or `input` one (`AnswerMenuText`):
-    /// Explain, or the person's own answer.
-    Text { key: String, text: String },
-    /// The question handed to qass (`HandToQass`).
-    Qass,
-    /// An option of one of qass's cards (`AskWrite` `Answer`), which qass types to the agent.
-    Card { card: String, option: String },
-    /// The owner's own words for a card (`AskWrite` `Answer` with text).
-    CardText { card: String, text: String },
-    /// A card handed to qass to decide (`AskWrite` `Answer` with `to_qass`).
-    CardQass { card: String },
-}
-
-/// What a pick is about: an agent's menu, or one of qass's cards.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Slot {
-    Agent(u32),
-    Card(String),
-}
-
-/// One answer the question card offers: its digit (none for a standing permission, which is
-/// click only), its words and what it sends.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Offer {
-    pub digit: Option<u8>,
-    pub label: String,
-    pub detail: Option<String>,
-    pub pick: Pick,
-}
-
-/// Whether an option grants a standing permission: Claude Code's "Yes, and always allow
-/// access to src/" and "Yes, and don't ask again for cargo test commands in /repo", Codex's
-/// "Yes, and don't ask again for this command". Click only: no digit to press by habit.
-pub fn standing(label: &str) -> bool {
-    let words = label.to_lowercase().replace('\u{2019}', "'");
-    ["always", "don't ask again", "do not ask again"]
-        .iter()
-        .any(|w| words.contains(w))
-}
-
-/// The card's answers: the agent's own options (its field for an answer of one's own is the
-/// card's text field, not an option), then "Explain this in more detail" when the menu takes
-/// words, then "Let qass handle it"; digits in that order, skipping standing permissions. A
-/// multiple choice menu offers nothing here: the card says the question and Open.
-pub fn offers(menu: &AgentMenu) -> Vec<Offer> {
-    if menu.multi {
-        return Vec::new();
-    }
-    let mut out: Vec<Offer> = menu
-        .options
-        .iter()
-        .filter(|o| !o.input)
-        .map(|o| Offer {
-            digit: None,
-            label: o.label.clone(),
-            detail: o.detail.clone(),
-            pick: Pick::Key(o.key.clone()),
-        })
-        .collect();
-    if let Some(key) = text_key(menu) {
-        out.push(Offer {
-            digit: None,
-            label: "Explain this in more detail".into(),
-            detail: None,
-            pick: Pick::Text {
-                key,
-                text: EXPLAIN.into(),
-            },
-        });
-    }
-    out.push(Offer {
-        digit: None,
-        label: "Let qass handle it".into(),
-        detail: None,
-        pick: Pick::Qass,
-    });
-    let mut next = 1u8;
-    for offer in &mut out {
-        if !standing(&offer.label) && next <= 9 {
-            offer.digit = Some(next);
-            next += 1;
-        }
-    }
-    out
-}
-
-/// The option words go through: the agent's own answer field, else its "tell it what to do
-/// differently"; `None` when the menu takes no words.
-pub fn text_key(menu: &AgentMenu) -> Option<String> {
-    menu.options
-        .iter()
-        .find(|o| o.input)
-        .or_else(|| menu.options.iter().find(|o| o.tell))
-        .map(|o| o.key.clone())
-}
-
-/// A pick waiting out its hold.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Hold {
-    pub slot: Slot,
-    pub generation: Option<u64>,
-    pub seal: u64,
-    pub pick: Pick,
-    /// What the card says it sends: "Yes".
-    pub label: String,
-    pub until: Instant,
-}
-
-impl Hold {
-    /// The agent's terminal, for a pick on its menu.
-    pub fn terminal(&self) -> Option<u32> {
-        match self.slot {
-            Slot::Agent(t) => Some(t),
-            Slot::Card(_) => None,
-        }
-    }
-}
-
-/// The picks on hold, one per agent or card, oldest first, and when each menu was first seen
-/// (for the arming).
-#[derive(Clone, Debug, Default)]
-pub struct Holds {
-    pub held: Vec<Hold>,
-    seen: HashMap<u32, (u64, Instant)>,
-}
-
-impl Holds {
-    /// The menus on the rows now: a new one starts its arming; an answer whose menu changed or
-    /// went is dropped and returned, so the card can say who answered.
-    pub fn menus(&mut self, rows: &[AgentRow], now: Instant) -> Vec<Hold> {
-        let shown: HashMap<u32, u64> = rows
-            .iter()
-            .filter_map(|r| Some((r.terminal, r.menu.as_ref()?.seal)))
-            .collect();
-        self.seen.retain(|t, (seal, _)| shown.get(t) == Some(seal));
-        for (&t, &seal) in &shown {
-            self.seen.entry(t).or_insert((seal, now));
-        }
-        let (kept, dropped): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.held)
-            .into_iter()
-            .partition(|h| match (&h.pick, h.terminal()) {
-                (Pick::Key(_) | Pick::Text { .. }, Some(t)) => shown.get(&t) == Some(&h.seal),
-                _ => true,
-            });
-        self.held = kept;
-        dropped
-    }
-
-    /// Whether the menu `seal` of `terminal` takes a digit yet.
-    pub fn armed(&self, terminal: u32, seal: u64, now: Instant) -> bool {
-        self.seen
-            .get(&terminal)
-            .is_some_and(|&(s, at)| s == seal && now.duration_since(at) >= ARMING)
-    }
-
-    /// Hold `hold`, in place of any other pick for the same agent or card.
-    pub fn start(&mut self, hold: Hold) {
-        self.held.retain(|h| h.slot != hold.slot);
-        self.held.push(hold);
-    }
-
-    /// Undo `slot`'s pick; with none, the newest pick, and every pick held with it (one
-    /// shared Undo for a hand-off of several). Whether anything was on hold.
-    pub fn undo(&mut self, slot: Option<&Slot>) -> bool {
-        let before = self.held.len();
-        match slot {
-            Some(slot) => self.held.retain(|h| &h.slot != slot),
-            None => {
-                if let Some(newest) = self.held.last().map(|h| h.until) {
-                    self.held.retain(|h| h.until != newest);
-                }
-            }
-        }
-        self.held.len() != before
-    }
-
-    /// Undo the hand-off to qass: every agent held to be handed over, nothing else.
-    pub fn undo_hand_off(&mut self) -> bool {
-        let before = self.held.len();
-        self.held.retain(|h| h.pick != Pick::Qass);
-        self.held.len() != before
-    }
-
-    /// The picks whose hold is up, taken out to be sent.
-    pub fn due(&mut self, now: Instant) -> Vec<Hold> {
-        let (due, kept): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.held)
-            .into_iter()
-            .partition(|h| h.until <= now);
-        self.held = kept;
-        due
-    }
-
-    /// Every pick on hold, to be sent now: the window is closing.
-    pub fn flush(&mut self) -> Vec<Hold> {
-        std::mem::take(&mut self.held)
-    }
-
-    pub fn of(&self, slot: &Slot) -> Option<&Hold> {
-        self.held.iter().find(|h| &h.slot == slot)
-    }
-}
-
-/// How a refusal of `pick` reads on the card, as a sentence.
-pub fn refusal_words(reason: &str, machine: &str, pick: &Pick) -> String {
-    let here = machine == "This Mac";
-    let max = qoop_runtime::menu::TEXT_MAX;
-    match reason {
-        "already_answered" => "Someone already answered this question.".into(),
-        "busy" => "The agent was still taking keys. Try again in a moment.".into(),
-        "no_such_answer" => "That answer is no longer on the agent's screen.".into(),
-        "not_at_input" => "The agent did not open its answer field, so nothing was typed.".into(),
-        "no_text_field" => "This question takes no typed answer.".into(),
-        "empty" => "There were no words to send.".into(),
-        "too_long" => format!("The answer is too long. Keep it under {max} characters."),
-        "not_a_person" => {
-            "Only a person's window can answer, and this one was not taken as one.".into()
-        }
-        "qass_not_running" if here => "qass is not running, so it cannot take this.".into(),
-        "qass_not_running" => format!("qass is not running on {machine}, so it cannot take this."),
-        "not_watching" => "qass is not watching, so it cannot take this.".into(),
-        "skipped" => "qass leaves this agent alone, so it cannot take this.".into(),
-        r if r.contains("unknown variant") => match pick {
-            Pick::Qass | Pick::CardQass { .. } => {
-                format!("qoop on {machine} is too old to hand questions to qass.")
-            }
-            Pick::Text { .. } => format!("qoop on {machine} is too old for typed answers."),
-            _ => format!("qoop on {machine} is too old for this answer."),
-        },
-        other => other.to_string(),
-    }
-}
+pub use qoop_tui::answers::{
+    HOLD, Hold, Holds, Lessons, Offer, Pick, Slot, branch_or_clock, clean_prompt, daemon_space,
+    lessons_of, offers, refusal_words, takes_prompt, text_key, worktree_agents, worktree_line,
+};
 
 /// A local day, as days since 1970-01-01 on the wall clock of `zone`.
 pub fn day_of(at: i64, zone: Zone) -> i64 {
@@ -1170,39 +741,6 @@ pub fn took(run: &ScheduleRun) -> Option<String> {
         s if s < 3600 => format!("{} min", s / 60),
         s => format!("{} h {} min", s / 3600, s % 3600 / 60),
     })
-}
-
-/// Home's "Last:" line for this machine's schedules: the newest run that started, as
-/// "Last: nightly-tests, Fri 02:00, Done, tab 11". `words` says how the run reads, by the rule
-/// its report reads by (Needs you while its agent asks).
-pub fn last_run_line(
-    schedules: &[ScheduleInfo],
-    runs: &[ScheduleRun],
-    now: i64,
-    zone: Zone,
-    words: impl Fn(&ScheduleRun) -> String,
-) -> Option<String> {
-    let run = runs
-        .iter()
-        .filter(|r| !r.result.starts_with("skipped") && r.result != "claimed")
-        .max_by_key(|r| r.started_at)?;
-    let name = schedules
-        .iter()
-        .find(|s| s.id == run.schedule)?
-        .name
-        .clone();
-    let word = words(run);
-    let mut line = format!(
-        "Last: {name}, {}, {word}",
-        clock_at(run.started_at, now, zone)
-    );
-    if let Some(tab) = run.terminal {
-        line.push_str(&format!(
-            ", tab {}",
-            qoop_tui::mux::daemon_terminal(tab as u32)
-        ));
-    }
-    Some(line)
 }
 
 /// How a setting is changed on the page.
@@ -1494,16 +1032,19 @@ pub fn link_reasons(spaces: &[WorkspaceRow]) -> HashMap<usize, String> {
 /// The terminals whose menu is new since `before` (none then, or another seal): what was said
 /// of their last answer belongs to the old question.
 pub fn new_menus(before: &[AgentRow], now: &[AgentRow]) -> Vec<TerminalStream> {
+    // A menu is new by its turn (`menu_seal`, which changes every time one comes up) as well as
+    // its text: the same question asked again is a new one.
+    let key = |r: &AgentRow| r.menu.as_ref().map(|m| (m.seal, r.menu_seal));
     now.iter()
-        .filter_map(|r| {
-            let seal = r.menu.as_ref()?.seal;
-            let was = before
-                .iter()
-                .find(|b| b.terminal == r.terminal)
-                .and_then(|b| b.menu.as_ref())
-                .map(|m| m.seal);
-            (was != Some(seal)).then_some(r.terminal)
+        .filter(|r| {
+            key(r).is_some()
+                && before
+                    .iter()
+                    .find(|b| b.terminal == r.terminal)
+                    .and_then(key)
+                    != key(r)
         })
+        .map(|r| r.terminal)
         .collect()
 }
 
@@ -1858,41 +1399,6 @@ pub fn answered_elsewhere(before: &AgentRow, now: &AgentRow, zone: Zone) -> Opti
     ))
 }
 
-/// qass's rules as its lessons file counts them: the lessons that keep a question the owner's
-/// (`escalate`, `ask first`), the ones it answers alone (`do it`), and every lesson. A lesson
-/// is a line `- <when> -> <action> (<source>)`, as `skills/qass/SKILL.md` writes them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Lessons {
-    pub yours: usize,
-    pub alone: usize,
-    pub all: usize,
-}
-
-pub fn lessons_of(text: &str) -> Lessons {
-    let mut out = Lessons::default();
-    for line in text.lines() {
-        let Some(entry) = line.trim_start().strip_prefix("- ") else {
-            continue;
-        };
-        let Some((_, action)) = entry.rsplit_once(" -> ") else {
-            continue;
-        };
-        let action = action
-            .split(" (")
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_lowercase();
-        out.all += 1;
-        match action.as_str() {
-            "escalate" | "ask first" => out.yours += 1,
-            "do it" => out.alone += 1,
-            _ => {}
-        }
-    }
-    out
-}
-
 /// A unix time as "15:58" in `zone`.
 pub fn clock(at: i64, zone: Zone) -> String {
     (zone.local)(at).clock()
@@ -1912,22 +1418,6 @@ pub fn title_of(row: &AgentRow) -> String {
     .unwrap_or("shell")
     .to_string()
 }
-
-const SLEEPING_SUB: &str = "Wakes on a click";
-
-/// A row's second line.
-pub fn sub_of(row: &AgentRow) -> String {
-    match Kind::of(row) {
-        Kind::Status(Status::Blocked) => "in Inbox".into(),
-        Kind::Sleeping => SLEEPING_SUB.into(),
-        _ => match (&row.task, &row.activity) {
-            (Some(task), _) => format!("Task #{}: {}", task.id, task.goal),
-            (None, Some(activity)) => activity.clone(),
-            (None, None) => row.cwd.clone().map(|c| tilde(&c)).unwrap_or_default(),
-        },
-    }
-}
-
 /// How long the row has been as it is: "32s", "4m", "2h", "3d".
 pub fn age_of(row: &AgentRow, now: i64) -> Option<String> {
     let since = row.slept_at_unix.or(row.last_active_at_unix)?;
@@ -1997,195 +1487,6 @@ pub fn kind_pet(program: Option<&str>) -> Option<qoop_runtime::avatar::Avatar> {
     let program = program?;
     let (_, seed) = KIND_SEEDS.iter().find(|(kind, _)| *kind == program)?;
     Some(qoop_runtime::avatar::Deal::new(*seed).pet())
-}
-
-// New work: the line typed into a new shell in the space's folder, ported from the phone's
-// `worktree.ts` so both start an agent the same way and the CLI does every check.
-
-/// The longest first prompt typed this way.
-pub const PROMPT_MOST: usize = 4000;
-
-/// The longest line typed. A new shell may still be starting when it arrives, with the
-/// terminal in line mode, and macOS keeps about 1023 bytes of an unfinished line and drops
-/// the rest: measured, 929 bytes typed a second before zsh read them ran, 1229 lost the end
-/// (the quote, `&& exit`, the Enter) and ran nothing.
-pub const LINE_MOST: usize = 1000;
-
-/// The prompt as typed: control characters to spaces, trimmed, cut at [`PROMPT_MOST`].
-pub fn clean_prompt(prompt: &str) -> String {
-    let mut out = String::new();
-    let mut gap = false;
-    for c in prompt.chars() {
-        if c.is_control() {
-            gap = true;
-        } else {
-            if gap && !out.is_empty() {
-                out.push(' ');
-            }
-            gap = false;
-            out.push(c);
-        }
-    }
-    out.trim()
-        .chars()
-        .take(PROMPT_MOST)
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
-
-/// A branch named after the prompt's first words: `feat/fix-the-login-page`. Letters with
-/// marks keep their base letter, so `giriş sayfasını düzelt` is `feat/giris-sayfasini-duzelt`.
-/// Empty when no Latin letter or digit is left (a task in Japanese): see [`branch_or_clock`].
-pub fn branch_for(prompt: &str) -> String {
-    let plain: String = prompt
-        .chars()
-        .filter(|c| *c != '\'' && *c != '\u{2019}')
-        // Lowercase first, so the table needs only lowercase letters; `İ` alone, whose
-        // lowercase adds a combining dot.
-        .map(|c| if c == 'İ' { 'i' } else { c })
-        .flat_map(char::to_lowercase)
-        .map(|c| match c {
-            'ç' => 'c',
-            'ğ' => 'g',
-            'ı' | 'í' | 'ì' | 'î' | 'ï' => 'i',
-            'ö' | 'ó' | 'ò' | 'ô' | 'õ' => 'o',
-            'ş' | 'ß' => 's',
-            'ü' | 'ú' | 'ù' | 'û' => 'u',
-            'á' | 'à' | 'â' | 'ä' | 'ã' => 'a',
-            'é' | 'è' | 'ê' | 'ë' => 'e',
-            'ñ' => 'n',
-            c => c,
-        })
-        .collect();
-    let words: Vec<&str> = plain
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .take(5)
-        .collect();
-    if words.is_empty() {
-        String::new()
-    } else {
-        format!("feat/{}", words.join("-"))
-    }
-}
-
-/// The task's branch, or `feat/work-<at>` (unix seconds) when its words give none.
-pub fn branch_or_clock(prompt: &str, at: i64) -> String {
-    let branch = branch_for(prompt);
-    if branch.is_empty() {
-        format!("feat/work-{at}")
-    } else {
-        branch
-    }
-}
-
-/// What is wrong with a branch name the CLI would take as something else.
-pub fn branch_problem(branch: &str) -> Option<&'static str> {
-    if branch.is_empty() {
-        Some("Name the branch.")
-    } else if branch.starts_with('-') {
-        Some("A branch cannot start with -.")
-    } else if branch.contains("@{") {
-        Some("A branch cannot hold @{.")
-    } else if branch.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        Some("A branch has no spaces.")
-    } else {
-        None
-    }
-}
-
-fn program_of(command: &str) -> &str {
-    // Past any `NAME=value` in front, as the TUI's schedule form reads a launcher.
-    let first = command
-        .split_whitespace()
-        .find(|w| !w.contains('=') && *w != "env")
-        .unwrap_or("");
-    first.rsplit('/').next().unwrap_or("")
-}
-
-/// A launcher typed as it is: plain words, nothing the shell reads as more than words.
-fn plain(command: &str) -> bool {
-    let safe = |c: char| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c);
-    let trimmed = command.trim();
-    !trimmed.is_empty()
-        && !trimmed.contains("  ")
-        && trimmed
-            .split(' ')
-            .all(|w| !w.is_empty() && w.chars().all(safe))
-}
-
-/// How an agent takes its first prompt on its command line.
-fn prompted(program: &str, prompt: &str) -> Option<Vec<String>> {
-    match program {
-        "claude" | "codex" => Some(vec![prompt.to_string()]),
-        "gemini" => Some(vec!["-i".into(), prompt.to_string()]),
-        "opencode" => Some(vec!["--prompt".into(), prompt.to_string()]),
-        _ => None,
-    }
-}
-
-/// The launchers that can start in a worktree, by name and command: every one typed as plain
-/// words, since `&& exit` follows it on the line.
-pub fn worktree_agents(offers: &[(String, String)]) -> Vec<(String, String)> {
-    offers
-        .iter()
-        .filter(|(_, command)| plain(command))
-        .cloned()
-        .collect()
-}
-
-/// Whether the agent takes the task as its first prompt; one qoop does not know starts
-/// without it, and the task only names the branch.
-pub fn takes_prompt(command: &str) -> bool {
-    prompted(program_of(command), "").is_some()
-}
-
-/// The agent's command with its first prompt on it when it takes one, or why it cannot start.
-pub fn prompted_line(command: &str, prompt: &str) -> Result<String, &'static str> {
-    let said = clean_prompt(prompt);
-    if said.is_empty() {
-        return Err("Say what the agent should do.");
-    }
-    if said.starts_with('-') {
-        return Err("The prompt cannot start with -.");
-    }
-    if !plain(command) {
-        return Err("That agent cannot start this way.");
-    }
-    let mut line = vec![command.trim().to_string()];
-    if let Some(words) = prompted(program_of(command), &said) {
-        line.extend(words.iter().map(|w| shell_quote(w)));
-    }
-    Ok(line.join(" "))
-}
-
-/// The line typed into the new shell, or why there is none. `space` is the space's number in
-/// the daemon of the machine the shell runs on, as the CLI there reads it.
-pub fn worktree_line(
-    branch: &str,
-    space: Option<i64>,
-    command: &str,
-    prompt: &str,
-) -> Result<String, &'static str> {
-    if let Some(problem) = branch_problem(branch) {
-        return Err(problem);
-    }
-    let agent = prompted_line(command, prompt)?;
-    let space = space.map_or_else(String::new, |s| format!(" --space {s}"));
-    let line = format!(
-        "qoop worktree new {}{space} -- {agent} && exit",
-        shell_quote(branch)
-    );
-    if line.len() >= LINE_MOST {
-        return Err("The task is too long to type: shorten it.");
-    }
-    Ok(line)
-}
-
-/// A space's number in its own machine's daemon: the mux numbers a remote one above 2^40.
-pub fn daemon_space(workspace: i64) -> i64 {
-    workspace & ((1 << 40) - 1)
 }
 
 /// One line of home's Next runs card.
@@ -2262,18 +1563,6 @@ pub fn clock_at(at: i64, now: i64, zone: Zone) -> String {
             DAYS[(day(wall) + 4).rem_euclid(7) as usize],
             wall.clock()
         )
-    }
-}
-
-/// "in 3 m", "in 1 h 58 m", "in 1 d 10 h".
-pub fn until(at: i64, now: i64) -> String {
-    let s = (at - now).max(0);
-    let (d, h, m) = (s / 86_400, s % 86_400 / 3600, s % 3600 / 60);
-    match (d, h) {
-        (0, 0) => format!("in {} m", m.max(1)),
-        (0, h) if m > 0 => format!("in {h} h {m} m"),
-        (0, h) => format!("in {h} h"),
-        (d, h) => format!("in {d} d {h} h"),
     }
 }
 
@@ -2379,7 +1668,10 @@ pub(crate) mod tests {
                 ),
             ],
             // Never the owner's own file: a test's hand for a remote agent names this.
-            hand_id: Some("testmac".into()),
+            hand: qoop_tui::answers::HandInput {
+                hand_id: Some("testmac".into()),
+                ..Default::default()
+            },
             ..Model::default()
         }
     }
@@ -2391,26 +1683,31 @@ pub(crate) mod tests {
         let mut m = fixture();
         m.spaces
             .push(sleepy_space(7, "docs", &[(70, 70, Some("codex"), "")]));
-        let docs = m
-            .groups(Chip::Sleeping)
-            .into_iter()
+        let sleeping = |m: &Model| {
+            m.agents()
+                .iter()
+                .filter(|e| e.kind() == Kind::Sleeping)
+                .count()
+        };
+        let groups = m.groups();
+        let docs = groups
+            .iter()
             .find(|g| g.space.name == "docs")
             .expect("the sleeping space is listed");
         assert_eq!(docs.rows.len(), 1);
         assert_eq!(docs.rows[0].title(), "codex", "no name: the agent");
-        assert_eq!(m.count(Chip::Sleeping), 2);
-        assert_eq!(m.summary(), "8 in 4 spaces on 2 machines");
+        assert_eq!(sleeping(&m), 2);
         let mut old = row(70, 7, "unknown", "codex", "");
         old.state = "sleeping".into();
         old.agent = false;
         m.rows.push(old);
-        assert_eq!(m.count(Chip::Sleeping), 2, "listed both ways, counted once");
+        assert_eq!(sleeping(&m), 2, "listed both ways, counted once");
     }
 
     #[test]
     fn home_groups_by_space_and_orders_by_rank_then_oldest() {
         let m = fixture();
-        let groups = m.groups(Chip::All);
+        let groups = m.groups();
         let names: Vec<&str> = groups.iter().map(|g| g.space.name.as_str()).collect();
         assert_eq!(
             names,
@@ -2442,75 +1739,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn chips_count_and_filter_and_say_when_empty() {
+    fn the_hold_bar_names_the_agent_and_row_labels_say_the_state_words() {
         let m = fixture();
-        assert_eq!(m.count(Chip::All), 7);
-        assert_eq!(m.count(Chip::NeedsYou), 1);
-        assert_eq!(m.count(Chip::Working), 3);
-        assert_eq!(m.count(Chip::Done), 2);
-        assert_eq!(m.count(Chip::Sleeping), 1);
-        let working = m.groups(Chip::Working);
-        assert_eq!(working.len(), 3);
         assert_eq!(
-            working[0].count, 3,
-            "the header counts every agent of the space"
+            m.agent_name(m.row(2).expect("row")),
+            format!("acme-web/{}", title_of(m.row(2).expect("row")))
         );
-        let mut quiet = m.clone();
-        quiet
-            .rows
-            .retain(|r| r.status.as_deref() != Some("working"));
-        assert!(quiet.groups(Chip::Working).is_empty());
-        assert_eq!(Chip::Working.empty(), "Nothing is working.");
-    }
-
-    #[test]
-    fn the_asking_and_the_failed_are_counted_apart() {
-        let mut m = fixture();
-        assert_eq!((m.asking().len(), m.failed()), (1, 0));
-        m.rows[0].status = Some("failed".into());
-        assert_eq!((m.asking().len(), m.failed()), (1, 1));
-        m.rows
-            .retain(|r| !matches!(r.status.as_deref(), Some("failed" | "blocked")));
-        assert_eq!((m.asking().len(), m.failed()), (0, 0));
-    }
-
-    #[test]
-    fn the_summary_counts_agents_spaces_and_machines() {
-        let m = fixture();
-        assert_eq!(m.summary(), "7 in 3 spaces on 2 machines");
-        let one = Model {
-            rows: vec![row(1, 1, "working", "claude", "x")],
-            spaces: vec![space(1, "a")],
-            ..Model::default()
-        };
-        assert_eq!(one.summary(), "1 in 1 space on 1 machine");
-        // A first open: one plain shell tab is no agent, and nothing counts 0 machines.
-        let mut shell = row(1, 1, "idle", "zsh", "");
-        shell.agent = false;
-        let empty = Model {
-            rows: vec![shell],
-            spaces: vec![space(1, "a")],
-            ..Model::default()
-        };
-        assert!(empty.agents().is_empty());
-        assert_eq!(empty.summary(), "0 agents");
-        assert_eq!(Chip::All.empty(), "No agents yet. New work starts one.");
-    }
-
-    #[test]
-    fn the_status_line_and_row_labels_say_the_state_words() {
-        let mut m = fixture();
-        assert_eq!(
-            m.status_line().as_deref(),
-            Some(
-                format!(
-                    "next: acme-web/{} needs you",
-                    title_of(m.row(2).expect("row"))
-                )
-                .as_str()
-            )
-        );
-        // Another claude tab in the same space working: the line still names the one that waits.
+        // Another claude tab in the same space working: the name still tells them apart.
         assert_ne!(
             title_of(m.row(1).expect("row")),
             title_of(m.row(2).expect("row"))
@@ -2522,8 +1757,30 @@ pub(crate) mod tests {
             m.row_label(Entry::Live(&b), 1240),
             "README Coupons section, claude, acme-web, Needs you, 4m"
         );
-        m.rows.retain(|r| r.terminal != 2);
-        assert_eq!(m.status_line(), None);
+    }
+
+    /// The sidebar lists what waits and the open agent, folds the rest behind "N more", and
+    /// leaves a space where nothing waits as one line; expanded it lists every agent.
+    #[test]
+    fn the_sidebar_fold_lists_what_waits_and_the_open_agent() {
+        let m = fixture();
+        let groups = m.groups();
+        let (web, api) = (&groups[0], &groups[1]);
+        let ids = |f: &Fold<'_>| f.shown.iter().map(|e| e.terminal()).collect::<Vec<_>>();
+        let f = fold(web, &[2], None, false);
+        assert_eq!((ids(&f), f.more, f.quiet), (vec![2], 2, false));
+        let f = fold(api, &[], None, false);
+        assert_eq!((ids(&f), f.more, f.quiet), (vec![], 2, true), "one line");
+        // The open agent is always listed, so its space is never a quiet line.
+        let f = fold(api, &[], Some(5), false);
+        assert_eq!((ids(&f), f.more, f.quiet), (vec![5], 1, false));
+        // Open and waiting at once is listed once; a waiting one beyond the cap is folded.
+        let f = fold(web, &[2, 3, 1], Some(2), false);
+        assert_eq!(ids(&f), vec![2, 3, 1][..SIDE_SHOWN + 1].to_vec());
+        let f = fold(web, &[2, 3, 1], None, false);
+        assert_eq!((ids(&f), f.more), (vec![2, 3], 1));
+        let f = fold(web, &[2], None, true);
+        assert_eq!((ids(&f), f.more), (vec![2, 3, 1], 0), "expanded: all");
     }
 
     /// The state word table: never "blocked" anywhere a person reads.
@@ -2532,16 +1789,9 @@ pub(crate) mod tests {
         let mut kinds: Vec<Kind> = status::ALL.into_iter().map(Kind::Status).collect();
         kinds.push(Kind::Sleeping);
         let mut words: Vec<String> = kinds.iter().map(|k| k.word().to_string()).collect();
-        words.extend(
-            Chip::ALL
-                .iter()
-                .flat_map(|c| [c.label().to_string(), c.empty().to_string()]),
-        );
         let m = fixture();
-        words.push(m.status_line().unwrap_or_default());
         words.push(m.qass_line());
         for entry in m.agents() {
-            words.push(entry.sub());
             words.push(m.row_label(entry, 2000));
         }
         for word in words {
@@ -2578,116 +1828,6 @@ pub(crate) mod tests {
         assert_eq!(m.qass_line(), "not running");
     }
 
-    /// The fixture's remote agent (staging, its tab 1) asking, handed by `by` at `at`.
-    fn remote_asking(m: &mut Model, by: Option<&str>, at: i64) -> u32 {
-        let t = 0x8100_0001;
-        let r = m.rows.iter_mut().find(|r| r.terminal == t).expect("remote");
-        r.state = "blocked".into();
-        r.status = Some("blocked".into());
-        r.with_qass = by.is_some();
-        r.qass_away = by.map(|by| qoop_runtime::control::AwayHand { at, by: by.into() });
-        t
-    }
-
-    /// One rule offers "Let qass handle it" for every machine: This Mac's qass takes a remote
-    /// agent's question too, and a machine whose qoop refused such a hand as too old is not
-    /// offered it again.
-    #[test]
-    fn this_macs_qass_is_offered_for_remote_agents_too() {
-        let mut m = fixture();
-        let t = remote_asking(&mut m, None, 0);
-        let row = m.row(t).cloned().expect("row");
-        assert_eq!(m.qass_reason(&row), None);
-        assert_eq!(m.agent_key(&row), "staging/T1");
-        m.no_hands.insert(1);
-        assert_eq!(
-            m.qass_reason(&row).as_deref(),
-            Some("qoop on staging is too old to hand questions to qass")
-        );
-        m.no_hands.clear();
-        m.rows.retain(|r| r.workspace != 3);
-        assert_eq!(m.qass_reason(&row).as_deref(), Some("qass is not running"));
-    }
-
-    /// A remote hand from this Mac counts as with qass only while This Mac's qass has run and
-    /// watched since the window first saw it: one already there at launch, one made before a
-    /// qass restart, and one qass wrote a card for wait on the owner again. A hand by another
-    /// Mac is that Mac's qass's.
-    #[test]
-    fn a_remote_hand_is_with_qass_only_while_the_qass_told_of_it_runs() {
-        let mut m = fixture();
-        let t = remote_asking(&mut m, Some("testmac"), 100);
-        // Already there in the window's first list: nothing says this qass heard of it.
-        m.note_qass(10);
-        assert!(!m.with_qass(m.row(t).unwrap()));
-        assert!(m.asking().contains(&t));
-        // Handed again from here: a new hand, seen after qass came up.
-        remote_asking(&mut m, Some("testmac"), 200);
-        m.note_qass(20);
-        assert!(m.with_qass(m.row(t).unwrap()));
-        assert!(!m.asking().contains(&t));
-        assert_eq!(m.handed(), 1);
-        assert_eq!(
-            m.qass_words(m.row(t).unwrap()).as_deref(),
-            Some("With qass")
-        );
-        // qass's card for it: the card is what waits on the owner now.
-        m.carded = vec!["staging/T1".into()];
-        assert!(!m.with_qass(m.row(t).unwrap()));
-        m.carded.clear();
-        // qass restarted (a new generation): it never heard of the hand.
-        m.rows
-            .iter_mut()
-            .find(|r| r.terminal == 9)
-            .unwrap()
-            .generation = Some(2);
-        m.note_qass(30);
-        assert!(!m.with_qass(m.row(t).unwrap()));
-        assert!(m.asking().contains(&t));
-        // Stopped: the row says why nobody holds it.
-        m.qass_watch = Some(false);
-        m.note_qass(40);
-        assert_eq!(
-            m.qass_words(m.row(t).unwrap()).as_deref(),
-            Some("With qass, not watching")
-        );
-        // Another Mac's hand is that Mac's qass's.
-        m.qass_watch = Some(true);
-        remote_asking(&mut m, Some("othermac"), 300);
-        m.note_qass(50);
-        assert!(m.with_qass(m.row(t).unwrap()));
-    }
-
-    /// A remote's rows reach the window in a later list than This Mac's: a hand in that
-    /// machine's first list is still one the window knows nothing of.
-    #[test]
-    fn a_remote_hand_in_its_machines_first_list_is_unknown() {
-        let mut m = fixture();
-        let t = remote_asking(&mut m, Some("testmac"), 100);
-        let all = m.rows.clone();
-        m.rows.retain(|r| machine_of(r.workspace) == 0);
-        m.note_qass(10);
-        m.rows = all;
-        m.note_qass(20);
-        assert!(!m.with_qass(m.row(t).unwrap()));
-        assert!(m.asking().contains(&t));
-    }
-
-    /// A card finds its row by its key on another machine too.
-    #[test]
-    fn a_remote_card_finds_its_row() {
-        let m = fixture();
-        let card: AskInfo = serde_json::from_value(serde_json::json!({
-            "card": "E1", "agent": "staging/T1", "status": "open", "opened_at": 1,
-            "body": {
-                "handle": "soak", "urgency": "later", "doing": "a soak test",
-                "why": "it touches billing", "asks": "Run it?", "options": [],
-            },
-        }))
-        .expect("card");
-        assert_eq!(m.card_row(&card), Some(0x8100_0001));
-    }
-
     #[test]
     fn each_agent_kind_has_its_own_pet() {
         let pets: Vec<_> = KIND_SEEDS
@@ -2702,165 +1842,6 @@ pub(crate) mod tests {
         }
         assert_eq!(kind_pet(Some("vim")), None);
         assert_eq!(kind_pet(Some("claude")), kind_pet(Some("claude")), "fixed");
-    }
-
-    #[test]
-    fn branch_comes_from_the_first_words_turkish_included() {
-        assert_eq!(
-            branch_for("giriş sayfasını düzelt"),
-            "feat/giris-sayfasini-duzelt"
-        );
-        assert_eq!(branch_for("İstanbul ÇĞÖŞÜ ı"), "feat/istanbul-cgosu-i");
-        assert_eq!(
-            branch_for("Fix the login page, it 500s on Safari"),
-            "feat/fix-the-login-page-it"
-        );
-        assert_eq!(
-            branch_for("Don't break it's login"),
-            "feat/dont-break-its-login"
-        );
-        assert_eq!(branch_for("Don\u{2019}t stop"), "feat/dont-stop");
-        assert_eq!(branch_for("!!!"), "");
-        assert_eq!(
-            branch_for("\u{c9}lan \u{d1}and\u{fa} \u{c1}LTO"),
-            "feat/elan-nandu-alto"
-        );
-        let japanese = "\u{30ed}\u{30b0}\u{30a4}\u{30f3}\u{753b}\u{9762}\u{3092}\u{76f4}\u{3059}";
-        assert_eq!(branch_for(japanese), "", "no Latin word left");
-        assert_eq!(
-            branch_or_clock(japanese, 1_763_100_000),
-            "feat/work-1763100000"
-        );
-        assert_eq!(branch_or_clock("fix it", 1), "feat/fix-it");
-        assert!(
-            worktree_line(&branch_or_clock(japanese, 1), Some(1), "claude", japanese).is_ok(),
-            "a task with no Latin letter still starts"
-        );
-        assert_eq!(branch_problem("feat/x"), None);
-        assert_eq!(branch_problem("-b"), Some("A branch cannot start with -."));
-        assert_eq!(branch_problem("a@{1}"), Some("A branch cannot hold @{."));
-        assert_eq!(branch_problem("a b"), Some("A branch has no spaces."));
-        assert_eq!(branch_problem("feat/a\nb"), Some("A branch has no spaces."));
-        assert_eq!(branch_problem(""), Some("Name the branch."));
-    }
-
-    /// What a POSIX shell makes of a typed line: its words.
-    fn words(line: &str) -> Vec<String> {
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("printf '%s\\0' {line}"))
-            .output()
-            .expect("sh");
-        let text = String::from_utf8(out.stdout).expect("utf8");
-        let mut words: Vec<String> = text.split('\0').map(str::to_string).collect();
-        words.pop();
-        words
-    }
-
-    /// A backslash before a quote ended the quote early in fish and ran the rest; it is now
-    /// typed outside the quotes. Every shell's reading is checked in `qoop_domain::shell`.
-    #[test]
-    fn a_backslash_in_the_task_stays_one_word_in_every_shell() {
-        let task = r"a\'; touch /tmp/pwn; #";
-        let line = worktree_line("b", None, "claude", task).expect("line");
-        assert_eq!(
-            line,
-            r"qoop worktree new b -- claude 'a'\\\''; touch /tmp/pwn; #' && exit"
-        );
-        assert_eq!(
-            words(line.trim_end_matches(" && exit"))
-                .last()
-                .map(String::as_str),
-            Some(task)
-        );
-    }
-
-    /// A line the terminal would cut before the shell reads it is refused, not typed.
-    #[test]
-    fn a_line_too_long_to_type_is_refused() {
-        let most = LINE_MOST - "qoop worktree new b -- claude  && exit".len();
-        assert!(worktree_line("b", None, "claude", &"x".repeat(most - 1)).is_ok());
-        assert_eq!(
-            worktree_line("b", None, "claude", &"x".repeat(most)),
-            Err("The task is too long to type: shorten it.")
-        );
-    }
-
-    #[test]
-    fn the_prompt_loses_control_characters_and_is_cut() {
-        assert_eq!(
-            clean_prompt(" fix\nthe\r\nlogin\x1b[2J page\t"),
-            "fix the login [2J page"
-        );
-        assert_eq!(clean_prompt(&"é".repeat(5000)).chars().count(), PROMPT_MOST);
-    }
-
-    #[test]
-    fn the_typed_line_starts_the_agent_in_a_worktree() {
-        let prompt = "fix it's \"quoted\"\n$HOME `id` now";
-        let line = worktree_line("feat/fix", Some(3), "claude", prompt).expect("line");
-        assert_eq!(
-            line,
-            "qoop worktree new feat/fix --space 3 -- claude 'fix it'\\''s \"quoted\" $HOME `id` now' && exit"
-        );
-        assert_eq!(
-            words(line.trim_end_matches(" && exit")),
-            [
-                "qoop",
-                "worktree",
-                "new",
-                "feat/fix",
-                "--space",
-                "3",
-                "--",
-                "claude",
-                "fix it's \"quoted\" $HOME `id` now"
-            ]
-        );
-        assert_eq!(
-            worktree_line("b", None, "opencode", "go").as_deref(),
-            Ok("qoop worktree new b -- opencode --prompt go && exit")
-        );
-        assert_eq!(
-            worktree_line("-x", None, "claude", "go"),
-            Err("A branch cannot start with -.")
-        );
-        assert_eq!(
-            worktree_line("b", None, "claude", "--help"),
-            Err("The prompt cannot start with -.")
-        );
-        assert_eq!(
-            worktree_line("b", None, "claude", " \n "),
-            Err("Say what the agent should do.")
-        );
-        assert_eq!(
-            worktree_line("b", None, "claude; rm -rf ~", "go"),
-            Err("That agent cannot start this way.")
-        );
-        let offered = worktree_agents(&[
-            ("claude".into(), "claude".into()),
-            ("fast".into(), "claude --model opus".into()),
-            ("cx".into(), "/opt/homebrew/bin/codex".into()),
-            ("env".into(), "FOO=1 claude".into()),
-            ("piped".into(), "claude | tee log".into()),
-            ("aider".into(), "aider".into()),
-        ]);
-        let names: Vec<&str> = offered.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["claude", "fast", "cx", "env", "aider"]);
-        assert_eq!(
-            worktree_line("b", None, "aider --model x", "go").as_deref(),
-            Ok("qoop worktree new b -- aider --model x && exit")
-        );
-        assert_eq!(
-            worktree_line("b", None, "gemini", "go").as_deref(),
-            Ok("qoop worktree new b -- gemini -i go && exit")
-        );
-        assert!(takes_prompt("/opt/homebrew/bin/codex") && !takes_prompt("aider"));
-        assert!(
-            takes_prompt("CLAUDE_CONFIG_DIR=/tmp/c claude"),
-            "past an env assignment"
-        );
-        assert!(takes_prompt("env FOO=1 claude"), "past env");
     }
 
     fn schedule(name: &str, cron: Option<&str>, next_at: Option<i64>) -> ScheduleInfo {
@@ -2934,9 +1915,6 @@ pub(crate) mod tests {
         );
         assert_eq!(clock_at(now + 180, now, utc()), "16:05");
         assert_eq!(clock_at(now + 3 * 86_400, now, utc()), "Sun 16:02");
-        assert_eq!(until(now + 180, now), "in 3 m");
-        assert_eq!(until(now + 7080, now), "in 1 h 58 m");
-        assert_eq!(until(now + 124_200, now), "in 1 d 10 h");
     }
 
     pub fn split(first: u32, second: u32) -> Pane {
@@ -2958,27 +1936,6 @@ pub(crate) mod tests {
         assert_eq!(m.tree_of(2), Pane::Leaf { terminal: 2 });
         let tabs: Vec<u32> = m.tabs_of(1).iter().map(|r| r.terminal).collect();
         assert_eq!(tabs, [1, 2]);
-    }
-
-    /// The corner note is for another agent that turned Needs you, never the one on screen
-    /// nor one that already needed the owner.
-    #[test]
-    fn a_corner_note_is_for_another_agent_turning_needs_you() {
-        let before = fixture().rows;
-        let mut m = fixture();
-        assert_eq!(m.turned_needs(&before, &[1]), None, "nothing turned");
-        m.rows[2].status = Some("blocked".into());
-        assert_eq!(m.turned_needs(&before, &[1]), Some(3));
-        assert_eq!(m.turned_needs(&before, &[3]), None, "the one on screen");
-        assert_eq!(
-            m.turned_needs(&before, &[1, 3]),
-            None,
-            "the other pane on screen"
-        );
-        m.rows[6].status = Some("blocked".into());
-        m.rows[2].status = Some("done".into());
-        assert_eq!(m.turned_needs(&before, &[1]), None, "qass's own row");
-        assert_eq!(m.turned_needs(&[], &[1]), None, "a row not listed before");
     }
 
     fn event(at: i64, kind: &str, body: &str) -> TaskEventInfo {
@@ -3067,7 +2024,7 @@ pub(crate) mod tests {
     }
 
     /// Claude Code's edit question: Yes, an "always" option, No and tell it, and its field.
-    pub fn edit_menu(seal: u64) -> AgentMenu {
+    pub fn edit_menu(seal: u64) -> qoop_runtime::control::AgentMenu {
         serde_json::from_value(serde_json::json!({
             "question": "Do you want to make this edit to README.md?",
             "seal": seal,
@@ -3079,184 +2036,6 @@ pub(crate) mod tests {
             ],
         }))
         .expect("menu")
-    }
-
-    #[test]
-    fn the_explain_words_are_the_daemons() {
-        assert_eq!(EXPLAIN, qoop_runtime::menu::EXPLAIN);
-    }
-
-    /// Digits 1 to 5 in order, none on the "always" option, Explain and qass after the agent's
-    /// own; a multiple choice menu offers nothing to pick here.
-    #[test]
-    fn the_card_numbers_its_answers() {
-        let menu = edit_menu(7);
-        let all = offers(&menu);
-        let offered: Vec<(Option<u8>, &str)> = all
-            .iter()
-            .map(|o| (o.digit, o.label.split(',').next().unwrap_or("")))
-            .collect();
-        assert_eq!(
-            offered,
-            [
-                (Some(1), "Yes"),
-                (Some(2), "Yes"),
-                (None, "Yes"),
-                (Some(3), "No"),
-                (Some(4), "Explain this in more detail"),
-                (Some(5), "Let qass handle it"),
-            ]
-        );
-        assert_eq!(text_key(&menu).as_deref(), Some("4"));
-        let multi = AgentMenu {
-            multi: true,
-            ..menu
-        };
-        assert!(offers(&multi).is_empty());
-    }
-
-    fn held(terminal: u32, seal: u64, until: Instant) -> Hold {
-        Hold {
-            slot: Slot::Agent(terminal),
-            generation: Some(1),
-            seal,
-            pick: Pick::Key("1".into()),
-            label: "Yes".into(),
-            until,
-        }
-    }
-
-    /// With a fake clock: a menu arms after 500 ms, a pick goes after 3 s, Undo cancels it, a
-    /// new menu drops it, and closing the window sends what is on hold.
-    #[test]
-    fn a_pick_waits_three_seconds_and_can_be_undone() {
-        let t0 = Instant::now();
-        let mut rows = fixture().rows;
-        rows[1].menu = Some(edit_menu(7));
-        let mut holds = Holds::default();
-        assert!(holds.menus(&rows, t0).is_empty());
-        assert!(!holds.armed(2, 7, t0 + Duration::from_millis(499)));
-        assert!(holds.armed(2, 7, t0 + ARMING));
-
-        holds.start(held(2, 7, t0 + HOLD));
-        assert!(holds.due(t0 + Duration::from_millis(2999)).is_empty());
-        assert_eq!(holds.due(t0 + HOLD).len(), 1, "sent after 3 s");
-
-        holds.start(held(2, 7, t0 + HOLD));
-        assert!(holds.undo(Some(&Slot::Agent(2))));
-        assert!(holds.due(t0 + HOLD).is_empty(), "Undo cancels");
-
-        holds.start(held(2, 7, t0 + HOLD));
-        rows[1].menu = Some(edit_menu(8));
-        let dropped = holds.menus(&rows, t0 + Duration::from_secs(1));
-        assert_eq!(dropped.len(), 1, "another menu drops the pick");
-        assert!(
-            !holds.armed(2, 8, t0 + Duration::from_secs(1)),
-            "and arms anew"
-        );
-
-        holds.start(held(2, 8, t0 + HOLD));
-        holds.start(held(3, 9, t0 + HOLD));
-        assert_eq!(holds.flush().len(), 2, "closing sends both at once");
-        assert!(holds.held.is_empty());
-
-        // The hand-off's own Undo takes back the hand-off, not a single answer held later.
-        let hand = |terminal| Hold {
-            pick: Pick::Qass,
-            ..held(terminal, 0, t0 + HOLD)
-        };
-        holds.start(hand(4));
-        holds.start(hand(5));
-        holds.start(held(2, 8, t0 + HOLD + Duration::from_secs(1)));
-        assert!(holds.undo_hand_off());
-        let left: Vec<Option<u32>> = holds.held.iter().map(Hold::terminal).collect();
-        assert_eq!(left, [Some(2)]);
-    }
-
-    #[test]
-    fn refusals_read_as_words() {
-        let key = Pick::Key("1".into());
-        assert_eq!(
-            refusal_words("already_answered", "This Mac", &key),
-            "Someone already answered this question."
-        );
-        assert_eq!(
-            refusal_words("qass_not_running", "staging", &Pick::Qass),
-            "qass is not running on staging, so it cannot take this."
-        );
-        let old = "this daemon is older than the client that called it: it does not know the \
-                   method that was asked for (unknown variant `AnswerMenuText`)";
-        let words = Pick::Text {
-            key: "4".into(),
-            text: "x".into(),
-        };
-        assert_eq!(
-            refusal_words(old, "staging", &words),
-            "qoop on staging is too old for typed answers."
-        );
-        assert_eq!(
-            refusal_words(old, "staging", &Pick::Qass),
-            "qoop on staging is too old to hand questions to qass."
-        );
-        // Every code the daemon sends reads as a sentence, never as the code.
-        for code in [
-            "busy",
-            "no_such_answer",
-            "not_at_input",
-            "no_text_field",
-            "empty",
-            "too_long",
-            "not_a_person",
-            "not_watching",
-            "skipped",
-        ] {
-            let said = refusal_words(code, "This Mac", &key);
-            assert!(said.ends_with('.') && !said.contains('_'), "{code}: {said}");
-        }
-    }
-
-    /// Claude Code's Bash question: its "don't ask again" answer is a standing permission,
-    /// click only, as an "always" one is.
-    #[test]
-    fn a_standing_permission_has_no_digit() {
-        let menu: AgentMenu = serde_json::from_value(serde_json::json!({
-            "question": "Do you want to proceed?",
-            "seal": 3,
-            "options": [
-                {"key": "1", "label": "Yes"},
-                {"key": "2", "label": "Yes, and don't ask again for cargo test commands in /srv/repo"},
-                {"key": "3", "label": "No, and tell Claude what to do differently (esc)", "tell": true},
-            ],
-        }))
-        .expect("menu");
-        let digits: Vec<Option<u8>> = offers(&menu).iter().map(|o| o.digit).collect();
-        assert_eq!(digits, [Some(1), None, Some(2), Some(3), Some(4)]);
-        assert!(standing("Yes, and don\u{2019}t ask again for this command"));
-        assert!(!standing(
-            "Yes, allow all edits during this session (shift+tab)"
-        ));
-    }
-
-    /// The rules card counts a lessons file the way qass writes it.
-    #[test]
-    fn the_lessons_are_counted_by_their_action() {
-        let file = "# Lessons\n\
-                    \n\
-                    - a release or a tag -> escalate (owner 2026-10-02)\n\
-                    - an edit to README in acme-web -> do it (E7)\n\
-                    - a delete outside the repo -> ask first (owner 2026-10-03)\n\
-                    - a test run in the repo -> do it (owner 2026-10-04)\n\
-                    - a dependency bump -> wait (E9)\n\
-                    a note that is not a lesson -> do it\n";
-        assert_eq!(
-            lessons_of(file),
-            Lessons {
-                yours: 2,
-                alone: 2,
-                all: 5,
-            }
-        );
-        assert_eq!(lessons_of(""), Lessons::default());
     }
 
     /// Summer time from 2026-03-29 01:00 UTC: a Central European zone, one hour ahead, then two.
@@ -3362,21 +2141,6 @@ pub(crate) mod tests {
         );
         assert_eq!(took(&runs[0]).as_deref(), Some("41 min"));
         assert_eq!(took(&runs[3]), None);
-        let schedules = [
-            schedule_info(1, "nightly-tests", "0 2 * * *", today * day),
-            schedule_info(2, "soak", "0 */2 * * *", today * day),
-        ];
-        assert_eq!(
-            last_run_line(
-                &schedules,
-                &runs[..2],
-                (today - 1) * day + 7200,
-                zone,
-                |r| { run_words(r).1 }
-            )
-            .as_deref(),
-            Some("Last: nightly-tests, 02:00, Failed:, tab 11")
-        );
         assert_eq!(
             day_label(today),
             format!(
@@ -3611,6 +2375,17 @@ pub(crate) mod tests {
         assert!(new_menus(&before, &now).is_empty(), "the same menu");
         now[1].menu = Some(edit_menu(8));
         assert_eq!(new_menus(&before, &now), vec![now[1].terminal]);
+        // The same words asked again are a new menu: only its turn differs.
+        now[1].menu = before[1].menu.clone();
+        before[1].menu_seal = Some(1);
+        now[1].menu_seal = Some(1);
+        assert!(new_menus(&before, &now).is_empty(), "the same turn");
+        now[1].menu_seal = Some(2);
+        assert_eq!(
+            new_menus(&before, &now),
+            vec![now[1].terminal],
+            "another turn"
+        );
         now[1].menu = None;
         assert!(new_menus(&before, &now).is_empty(), "no menu now");
     }

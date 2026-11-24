@@ -174,27 +174,6 @@ impl Desk {
             .collect()
     }
 
-    /// This Mac's runs, for home's "Last:" line.
-    pub(crate) fn local_runs(&self) -> Vec<ScheduleRun> {
-        self.schedule_page
-            .runs
-            .iter()
-            .filter(|((m, _), _)| *m == 0)
-            .flat_map(|(_, runs)| runs.iter().cloned())
-            .collect()
-    }
-
-    /// Home's "Last:" line: this Mac's newest run, read as its report reads it.
-    pub(crate) fn last_line(&self) -> Option<String> {
-        state::last_run_line(
-            &self.model.schedules,
-            &self.local_runs(),
-            self.now,
-            self.zone,
-            |run| self.run_words(run).1,
-        )
-    }
-
     /// A request to the machine shown: through `Via` for another machine.
     fn sched_ask(&self, request: ControlRequest) {
         match self.schedule_page.via {

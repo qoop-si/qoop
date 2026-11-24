@@ -5,7 +5,7 @@
 use gpui::{AnyElement, Context, FontWeight, Role, Window, div, prelude::*, px};
 use qoop_runtime::control::{ControlRequest, WorkspaceRow};
 
-use crate::app::Desk;
+use crate::app::{Desk, Page};
 use crate::link::{self, Up};
 use crate::state::{self, Kind};
 use crate::theme::{MONO_FONT, Theme, c, ca};
@@ -35,8 +35,9 @@ impl Desk {
     }
 
     /// Watching: qass reads every question and answers what its rules allow, or none.
-    fn set_watch(&mut self, on: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_watch(&mut self, on: bool, cx: &mut Context<Self>) {
         self.model.qass_watch = Some(on);
+        self.note_hand();
         self.ask(ControlRequest::QassWatch {
             id: link::fresh_id("qass"),
             on: Some(on),
@@ -70,7 +71,7 @@ impl Desk {
             .is_some_and(|until| self.now < until)
     }
 
-    fn start_qass(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn start_qass(&mut self, cx: &mut Context<Self>) {
         if self.qass_starting() {
             return;
         }
@@ -118,7 +119,7 @@ impl Desk {
         .detach();
     }
 
-    fn wake_qass(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn wake_qass(&mut self, cx: &mut Context<Self>) {
         if let Some(space) = self.qass_space().map(|w| w.id) {
             self.ask(ControlRequest::WakeWorkspace {
                 id: link::fresh_id("wake"),
@@ -133,9 +134,9 @@ impl Desk {
     fn type_into_qass(&mut self, words: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.back_to_live();
         if let Some(term) = self.term.as_ref().filter(|_| self.connected) {
-            let _ = self
-                .up
-                .send(Up::Input(term.terminal, words.as_bytes().to_vec()));
+            let terminal = term.terminal;
+            let _ = self.up.send(Up::Input(terminal, words.as_bytes().to_vec()));
+            self.typed_at.insert(terminal, std::time::Instant::now());
             window.focus(&self.term_focus, cx);
         }
     }
@@ -147,6 +148,10 @@ impl Desk {
             .as_ref()
             .and_then(|term| self.model.row(term.terminal));
         let asleep = self.qass_space().is_some_and(|w| w.asleep);
+        let next = state::next_runs(&self.model.schedules, &self.model.rows, self.zone, 1)
+            .into_iter()
+            .find(|r| r.running.is_none())
+            .map(|r| format!("next {}", state::clock_at(r.at, self.now, self.zone)));
         let header = div()
             .flex_none()
             .flex()
@@ -192,6 +197,15 @@ impl Desk {
                             .text_size(px(12.5))
                             .text_color(c(t.t2))
                             .child("the assistant that watches your agents"),
+                    ),
+            )
+            .child(
+                ui::link_button("nav-schedules", "Schedules", t)
+                    .when_some(next, |d, next| {
+                        d.child(div().text_size(px(11.5)).text_color(c(t.t2)).child(next))
+                    })
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open(Page::Schedules, window, cx)),
                     ),
             )
             .child(div().text_size(px(12.5)).child("Watching"))
