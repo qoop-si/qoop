@@ -4,10 +4,9 @@
 
 qass comes with the skill install: an assistant that sits above every other agent. It is told
 when one stops, reads where that work stands (its task, its plan file, the repo's rules),
-answers what it can the way you would, and sends you only what needs your word. What it sends
-you is a card in the Inbox (`ctrl-a i`, with `f` to show only qass's cards); you answer there,
-the answer waits 3 seconds so `u` can take it back, and it passes your answer on. You can also
-talk to it in its own tab. Start it in its own space:
+answers what it can the way you would, and sends you only what needs your word. You answer it
+on its screen (`ctrl-a i`), or in the desktop app's or the phone's Inbox, and it passes your answer
+on. Start it in its own space:
 
 ```
 qoop qass
@@ -15,10 +14,9 @@ qoop qass
 
 It opens qass in its own space on the agent `qoop settings` names (`qass runs on`: claude by
 default, codex, gemini, opencode, or one of your own `[agents]` lines, such as
-`claudes = "claude --model sonnet"`), or shows or wakes the one you have. `ctrl-a Q` opens its ledger: how it stands (`p` pauses or resumes it, `s` starts it when it is
-stopped), what it holds, what it did today as the daemon recorded it, its schedules and rules, a
-line to ask it (`a`, then `enter`), `i` for the questions it asked you in the Inbox, and `t` for
-qass's own terminal. The desktop app has the same as its qass page, with a drawer for the chat. Close it as any tab: `ctrl-a x` in it, or `qoop close`.
+`claudes = "claude --model sonnet"`), or shows or wakes the one you have. `ctrl-a Q` goes there
+and back. The desktop app shows qass on its qass page, with a drawer for the chat. Close it as
+any tab: `ctrl-a x` in it, or `qoop close`.
 
 ## When it acts
 

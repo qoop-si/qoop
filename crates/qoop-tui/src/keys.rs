@@ -27,24 +27,14 @@ pub fn show_prefix(byte: u8) {
     SHOWN_PREFIX.store(byte, std::sync::atomic::Ordering::Relaxed);
 }
 
-#[cfg(test)]
-thread_local! {
-    /// A prefix a test names in its own thread, so a test of the words never touches the process's.
-    pub(crate) static TEST_PREFIX: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
-}
-
 /// The prefix byte the screen names.
 pub fn shown_prefix() -> u8 {
-    #[cfg(test)]
-    if let Some(byte) = TEST_PREFIX.with(|c| c.get()) {
-        return byte;
-    }
     SHOWN_PREFIX.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The prefix as a person writes it: `ctrl-a`.
 pub fn prefix_name() -> String {
-    name_of(shown_prefix())
+    name_of(SHOWN_PREFIX.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Text written with `ctrl-a` for the prefix, as the screen should say it.
@@ -158,15 +148,19 @@ pub enum Action {
     /// have been called after.
     Rename,
     SpaceSettings,
-    /// ctrl-a Q, qass's ledger over the pane, or put away: its state and Pause, what it holds and
-    /// did, its schedules and rules, and a line to ask it; `t` in it opens its own terminal.
+    /// ctrl-a Q, qass in its own space, or back from it.
     ///
     /// Uppercase, like the other pages and boxes on the capitals; the lowercase letter stays
     /// free.
     Qass,
-    /// ctrl-a i, the Inbox over the pane, from any tab: everything that needs the person, open
-    /// with the keyboard in it, or put away.
+    /// ctrl-a i, the question inbox beside qass's terminal: open and focus it, or put it away.
     Asks,
+    /// ctrl-a C, the schedules on qass's screen: open and focus the panel, or
+    /// put the keyboard back.
+    Clock,
+    /// ctrl-a T, on qass's tab with the board: fold the pane with the keyboard to its strip,
+    /// or open the one folded.
+    Fold,
     /// ctrl-a b, fold the left column away and back.
     Collapse,
     /// ctrl-a U, say whether a newer release is waiting and how it gets installed.
@@ -474,6 +468,8 @@ impl Keys {
                     b'R' => Action::SpaceSettings,
                     b'Q' => Action::Qass,
                     b'i' => Action::Asks,
+                    b'C' => Action::Clock,
+                    b'T' => Action::Fold,
                     b'1'..=b'9' => Action::Tab((byte - b'0') as usize),
                     // The space bar: the palette is the front door, so it gets the
                     // biggest key.
@@ -810,12 +806,7 @@ mod tests {
         assert_eq!(keys.feed(b"\x01R"), vec![Action::SpaceSettings]);
         assert_eq!(keys.feed(b"\x01Q"), vec![Action::Qass]);
         assert_eq!(keys.feed(b"\x01i"), vec![Action::Asks]);
-        // The schedules panel and the fold of qass's tab went with qass's old screen.
-        assert!(
-            keys.feed(b"\x01C")
-                .iter()
-                .all(|a| !matches!(a, Action::Qass | Action::Asks))
-        );
+        assert_eq!(keys.feed(b"\x01C"), vec![Action::Clock]);
     }
 
     #[test]

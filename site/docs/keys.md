@@ -17,8 +17,10 @@ program.
 | `ctrl-a w` | new space |
 | `ctrl-a s`, `ctrl-a S` | next, previous space |
 | `ctrl-a R` | the space's settings: its name and colour |
-| `ctrl-a Q` | qass's ledger over the pane, or put away: how qass stands with `p` to pause or resume it (`s` starts it when it is stopped, and opens its terminal), a link to the questions it asked you (`i` opens them in the Inbox), what it holds, what it did today as the daemon recorded it, its schedules (add or change them with `qoop schedule`), its rules as a count, and a line to ask it (`a`, then `enter`). `j` `k` scroll it, `t` opens qass's own terminal, `esc` goes back. A click on the pet in the column's foot does the same |
-| `ctrl-a i` | Inbox: from any tab, everything that needs you as one list, oldest first, one card each, with the count in its title. Below 100 columns it folds the agents column while it is open. In it `j` `k` move, `1` to `9` answer with the option of that number (the answer waits 3 seconds, `u` takes it back, `enter` sends the selected card's answer now; after the selected card leaves the list, press `j` or `k` before a digit answers), `h` (or `q`) hands the question to qass to decide, `r` types your own words, `g` goes to that agent's tab, `o` talks it through with the agent, `m` reads the whole card, `x` puts it away, `f` shows only what qass asked (again to clear), `tab` shows the Board in place of the list (read only: waiting on you, doing, todo and done; with other computers connected `c` turns to the next computer's board; `tab` again goes back), `n` starts a new agent in a new worktree (what to do, which space and agent, the branch; `tab` moves between them, `enter` starts it), `esc` closes it. A click on the `needs you` title of the agents column opens it too |
+| `ctrl-a Q` | qass in its own space, or back to where you were; a click on the pet in the column's foot does the same |
+| `ctrl-a i` | questions: on qass's screen, qass's questions beside its chat. A new question opens nothing by itself: it lights the questions tab on the rail and the lamp under the pet; `ctrl-a i` (or a click on that tab) brings it up, and the last answer puts it away. In it `j` `k` pick a question, `a` to `d` answer with an option (sent at once; once the picked question is answered elsewhere or ends, none is picked until `j` or `k` picks one), `t` types your own words, `x` puts it away, `enter` goes to that agent's tab, `tab` gives the chat the keyboard, `esc` closes it. A click on the `questions` count in qass's header does the same |
+| `ctrl-a T` | fold: on qass's screen, fold the pane the keyboard is in to its strip, or open the folded one. On an agent's pane, unfold its questions rail: the narrow column at the right of every agent's pane (two agents split in one tab each carry their own), with how many questions the agent waits on (`⠔2`), a mark for each card (`⠔Q3`), and at its foot the task's steps done of all (`2/4`) and its stage. A new question opens nothing by itself: it adds its mark to the rail, and the agent's row in the column shows the same count after its name. Unfolded, the rail is a pane of 52 columns beside the agent, or over the agent when that would leave it under 60 columns, with the keyboard in it; drag its left edge, or press `<` `>` in it for 4 columns less or more, to set its width from 40 columns up to the whole pane, kept for the session. Nothing on a card is cut: a card taller than the pane is read whole in it, `j` `k` scroll it. In it: `1` to `9` answer the open card (once the open card is answered elsewhere or ends, none is open until `j` or `k` picks one), `enter` opens or folds a card, `j` `k` move, `r` types your own words, `q` hands the card to qass to decide, `s` folds or opens the task under the cards, `g` gives the agent the keyboard, `esc` (or `ctrl-a T` again) folds it back |
+| `ctrl-a C` | schedules: on qass's screen, the schedules panel beside or under its terminal, with the keyboard in it (again gives the keyboard back). `j` `k` pick a schedule, `enter` goes to its last run, `space` pauses or resumes it, `r` runs it now, `x` then `Y` removes it, `+` opens the form for a new one (when, from presets or a time, which agent, the folder and the prompt, with its first run read back; `tab` moves between the fields, `enter` saves, `esc` leaves the form), `esc` or `tab` goes back to the chat |
 | `ctrl-a W` | close the space when it is empty |
 | `ctrl-a Z` | sleep, wake: put the tab the keyboard is in to sleep, or wake the sleeping tab it rests on |
 | `ctrl-a f` | fold: the focused space's agents fold under its rule, or open again |
@@ -41,9 +43,9 @@ program.
 |---|---|
 | `ctrl-a space` | find anything: a space, an agent, a tab, an action, an action of an installed [herdr plugin](#plugins) |
 | `ctrl-a [` | copy mode: move, select, search the whole history (see [Copy mode](#copy-mode)) |
-| `ctrl-a g` | priority or tree: the agents column opens on the priority list (Needs you, With qass, Finished, Working, and the idle and asleep folded to one row that `enter` or a click lists, with every computer on the last row above the foot), or shows the agents grouped by space |
+| `ctrl-a g` | tree or priority: agents grouped by space, or ranked by priority |
 | `ctrl-a a` | agents column: the keyboard on it, to move over its rows, open, sleep, search |
-| `ctrl-a tab` | needs you: the agent that needs you next (a question qass asked, or one about no agent, opens the Inbox instead) |
+| `ctrl-a tab` | needs you: the agent that needs you next |
 | `ctrl-a M` | last answer: the focused agent's last answer, read from its transcript, as a page |
 | `ctrl-a F` | an agent's focus view: your last prompt, its last turns, one row per tool call |
 | `ctrl-a t` | chat: show an agent's conversation instead of its terminal, and back. The terminal keeps running and typing still goes to it; the wheel scrolls the chat, and copy mode and the mouse copy the text you see. A prompt waiting for you shows the terminal until it is answered. Remembered per agent program (`claude`, `codex`), so the next tab of that program starts the same way |
@@ -90,10 +92,10 @@ up, with the keyboard in the terminal or not: otherwise it is a letter for the t
 | click | focus a tab, a pane, a space or an agent; in a chat, open or close the step you click (shift-click selects over it instead) |
 | drag | select, and copy when you let go; scroll while the button is down and the selection runs on, and every row it covers is copied, also rows scrolled out of view |
 | drag a divider | resize the panes on either side |
-| click a space's `+`, or the tab bar's | a new agent, terminal or agent in a worktree in that space, in its directory; an agent asks for its name (empty for the agent's own) |
-| click the pet at the foot of the column | qass's ledger: the same as `ctrl-a Q` |
-| click a computer on the computers line of the agents column | that computer's own screen: how it is reached and since when, and its agents as they were when it last answered; `r` tries a computer that is not reached again |
-| click the `needs you` title in the agents column | open the Inbox, the same as `ctrl-a i` |
+| click a space's `+`, or the tab bar's | a new agent or terminal in that space, in its directory; an agent asks for its name (empty for the agent's own) |
+| click the pet at the foot of the column | qass, or back to where you were: the same as `ctrl-a Q` |
+| click the `questions` count in qass's header | open or close the questions, the same as `ctrl-a i` |
+| click an agent pane's questions rail | unfold it, the same as `ctrl-a T`, the keyboard moving to that agent; in the pane, a click opens a card or picks an answer; drag its left edge to change its width |
 | click a space's `⋯` | the space's settings: its name and colour |
 | drag the column's edge | widen or narrow the left column, up to half the window |
 | shift-drag | select over a program that took the mouse |

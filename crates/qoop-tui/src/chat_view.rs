@@ -101,47 +101,25 @@ fn cell_width(cells: &[Cell]) -> usize {
     cells.iter().map(|(c, _)| width::columns(*c)).sum()
 }
 
-/// A one-line summary as rows: `mark`, then `label` wrapped whole under the mark (never cut,
-/// not even by an ellipsis), then `tail` and `end` after the last row when they fit there and on
-/// a row of their own when they do not, so the state words and the chevron always show.
-fn summary_rows(
-    mark: (&str, Style),
-    label: (&str, Style),
-    tail: (&str, Style),
-    end: &str,
-    cols: usize,
-) -> Vec<StyledRow> {
-    let indent = width::width(mark.0);
-    let text: String = label.0.chars().filter(|c| !joiner(*c)).collect();
-    let mut rows: Vec<Vec<Cell>> =
-        crate::asks::wrap_whole(&text, cols.saturating_sub(indent).max(1))
-            .iter()
-            .enumerate()
-            .map(|(at, piece)| {
-                let mut row = if at == 0 {
-                    cells(mark.0, mark.1)
-                } else {
-                    cells(&" ".repeat(indent), style(Role::Detail))
-                };
-                row.extend(cells(piece, label.1));
-                row
-            })
-            .collect();
-    if !tail.0.is_empty() || !end.is_empty() {
-        let fits = rows
-            .last()
-            .is_some_and(|row| cell_width(row) + width::width(tail.0) + width::width(end) <= cols);
-        if !fits {
-            rows.push(cells(&" ".repeat(indent), style(Role::Detail)));
-        }
-        if let Some(row) = rows.last_mut() {
-            // On a row of its own the tail's two leading blanks are not wanted: the indent is.
-            let words = if fits { tail.0 } else { tail.0.trim_start() };
-            row.extend(cells(words, tail.1));
-            row.extend(cells(end, style(Role::Detail)));
-        }
+/// `text` cut to `room` columns, with a closing ellipsis when it did not fit.
+fn cut(text: &str, room: usize) -> String {
+    if width::width(text) <= room {
+        return text.to_string();
     }
-    rows.iter().map(|row| row_of(row)).collect()
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = width::columns(c);
+        if used + w + 1 > room {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    if room > 0 {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 /// Greedy word wrap to `room` columns. A word longer than a row is broken on a character.
@@ -455,15 +433,14 @@ fn chevron(open: bool) -> &'static str {
 
 /// One step as a quiet row: a mark, what it did, the state in words when it did not go well
 /// (`running`, `failed`, `exit N`, never colour alone), and a chevron at the end when it opens.
-/// What it did wraps whole onto more rows rather than being cut; the words and the chevron
-/// always stay, after the last of them.
+/// What does not fit is cut from the label first; the words and the chevron always stay.
 fn tool_line(
     text: &str,
     status: Status,
     exit_code: Option<i32>,
     open: Option<bool>,
     cols: usize,
-) -> Vec<StyledRow> {
+) -> StyledRow {
     let (role, word) = state_of(status);
     let exit = exit_code
         .filter(|code| *code != 0)
@@ -478,13 +455,13 @@ fn tool_line(
     } else {
         format!("  {tail}")
     };
-    summary_rows(
-        ("\u{25cf} ", style(role)),
-        (&one_line(text), style(Role::Detail)),
-        (&tail, style(role)),
-        open.map_or("", chevron),
-        cols,
-    )
+    let end = open.map_or("", chevron);
+    let room = cols.saturating_sub(2 + width::width(&tail) + width::width(end));
+    let mut row = cells("\u{25cf} ", style(role));
+    row.extend(cells(&cut(&one_line(text), room), style(Role::Detail)));
+    row.extend(cells(&tail, style(role)));
+    row.extend(cells(end, style(Role::Detail)));
+    row_of(&row)
 }
 
 /// How a tool call or a subagent stands; nothing else has a status.
@@ -561,19 +538,17 @@ fn worked(run: &[&Item]) -> Option<u64> {
 
 /// A run of tool calls folded under one row: how long they took, else how many, and which
 /// did not go well.
-fn group_row(run: &[&Item], open: bool, cols: usize) -> Vec<StyledRow> {
+fn group_row(run: &[&Item], open: bool, cols: usize) -> StyledRow {
     let (role, trouble) = trouble(run);
     let head = match worked(run) {
         Some(ms) => format!("Worked for {}", took(ms)),
         None => format!("{} steps", run.len()),
     };
-    summary_rows(
-        ("", style(role)),
-        (&format!("{head}{trouble}"), style(role)),
-        ("", style(role)),
-        chevron(open),
-        cols,
-    )
+    let end = chevron(open);
+    let room = cols.saturating_sub(width::width(end));
+    let mut row = cells(&cut(&format!("{head}{trouble}"), room), style(role));
+    row.extend(cells(end, style(Role::Detail)));
+    row_of(&row)
 }
 
 /// The most rows of a tool's input and output an opened row shows.
@@ -613,13 +588,7 @@ fn detail_rows(got: Option<&Got>, off: bool, cols: usize) -> Vec<StyledRow> {
     let more = rows.len().saturating_sub(DETAIL_ROWS);
     rows.truncate(DETAIL_ROWS);
     if more > 0 {
-        // Said whole, wrapped: the rest of a long output is in the terminal's own scrollback.
-        for piece in crate::asks::wrap_whole(
-            &format!("\u{2026} {more} more rows in the terminal"),
-            cols.saturating_sub(2).max(1),
-        ) {
-            rows.push(cells(&piece, dim));
-        }
+        rows.push(cells(&format!("\u{2026} {more} more rows"), dim));
     }
     if truncated {
         rows.push(cells("\u{2026} cut by the daemon", dim));
@@ -683,17 +652,11 @@ fn compaction_label(text: Option<&str>) -> String {
     }
 }
 
-fn dim_row(text: &str, cols: usize) -> Vec<StyledRow> {
-    summary_rows(
-        ("", style(Role::Detail)),
-        (&one_line(text), style(Role::Detail)),
-        ("", style(Role::Detail)),
-        "",
-        cols,
-    )
+fn dim_row(text: &str, cols: usize) -> StyledRow {
+    row_of(&cells(&cut(&one_line(text), cols), style(Role::Detail)))
 }
 
-fn thought_row(ms: Option<u64>, cols: usize) -> Vec<StyledRow> {
+fn thought_row(ms: Option<u64>, cols: usize) -> StyledRow {
     tool_line(
         &match ms {
             Some(ms) => format!("Thought for {}", took(ms)),
@@ -807,10 +770,7 @@ type Line = (StyledRow, Option<String>);
 /// The rows of one step: a tool row opened shows what it did below it.
 fn step_lines(item: &Item, opened: &Opened, cols: usize) -> Vec<Line> {
     match item {
-        Item::Thinking { ms, .. } => thought_row(*ms, cols)
-            .into_iter()
-            .map(|row| (row, None))
-            .collect(),
+        Item::Thinking { ms, .. } => vec![(thought_row(*ms, cols), None)],
         Item::Tool {
             id,
             name,
@@ -829,10 +789,8 @@ fn step_lines(item: &Item, opened: &Opened, cols: usize) -> Vec<Line> {
                 (Some("question"), Some(answer)) => format!("{summary} {answer}"),
                 _ => summary.clone(),
             };
-            let rows = tool_line(&label(name, &summary), *status, *exit_code, open, cols);
-            // Every row of the summary answers a click as the first does.
-            let head = open.map(|_| key);
-            let mut lines: Vec<Line> = rows.into_iter().map(|row| (row, head.clone())).collect();
+            let row = tool_line(&label(name, &summary), *status, *exit_code, open, cols);
+            let mut lines = vec![(row, open.map(|_| key))];
             if open == Some(true) {
                 let body = detail_rows(opened.details.get(id), opened.off, cols);
                 lines.extend(body.into_iter().map(|row| (row, None)));
@@ -846,16 +804,16 @@ fn step_lines(item: &Item, opened: &Opened, cols: usize) -> Vec<Line> {
             name,
             run,
             ..
-        } => tool_line(
-            &subagent_label(act.as_deref(), name.as_deref(), summary, run.is_some()),
-            *status,
+        } => vec![(
+            tool_line(
+                &subagent_label(act.as_deref(), name.as_deref(), summary, run.is_some()),
+                *status,
+                None,
+                None,
+                cols,
+            ),
             None,
-            None,
-            cols,
-        )
-        .into_iter()
-        .map(|row| (row, None))
-        .collect(),
+        )],
         _ => vec![(StyledRow::default(), None)],
     }
 }
@@ -903,10 +861,7 @@ fn laid_out(
                     (opened.keys.contains(&key), key)
                 };
                 let head = Some(head);
-                let mut lines: Vec<Line> = group_row(&calls, open, cols)
-                    .into_iter()
-                    .map(|row| (row, head.clone()))
-                    .collect();
+                let mut lines = vec![(group_row(&calls, open, cols), head)];
                 if open {
                     for step in &items[at..end] {
                         lines.extend(step_lines(step, opened, cols));
@@ -931,20 +886,25 @@ fn laid_out(
                 ..
             } => (Kind::Message, user_rows(text, attachments, *queued, cols)),
             Item::Agent { text, .. } => (Kind::Message, agent_rows(text, cols)),
-            Item::Error { text, .. } => (Kind::Step, dim_row(&format!("error: {text}"), cols)),
+            Item::Error { text, .. } => {
+                (Kind::Step, vec![dim_row(&format!("error: {text}"), cols)])
+            }
             Item::Notice { kind, text, .. } if kind == "summary" => {
                 blocks.push((Kind::Message, recap_lines(item, text, opened, cols), index));
                 continue;
             }
             Item::Notice { kind, text, .. } => {
-                (Kind::Step, dim_row(&notice_label(kind, text), cols))
+                (Kind::Step, vec![dim_row(&notice_label(kind, text), cols)])
             }
             Item::Compaction { text, .. } => (
                 Kind::Step,
-                dim_row(&compaction_label(text.as_deref()), cols),
+                vec![dim_row(&compaction_label(text.as_deref()), cols)],
             ),
             // A kind of row a newer daemon sent: said, never dropped, so the page stays whole.
-            Item::Unknown => (Kind::Step, dim_row("item this build cannot show", cols)),
+            Item::Unknown => (
+                Kind::Step,
+                vec![dim_row("item this build cannot show", cols)],
+            ),
             _ => continue,
         };
         if !rows.is_empty() {
@@ -2584,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_command_wraps_whole_and_the_words_and_the_chevron_stay() {
+    fn a_long_command_is_cut_and_the_words_and_the_chevron_stay() {
         let item = Item::Tool {
             seq: 0,
             id: "t".into(),
@@ -2602,20 +2562,12 @@ mod tests {
             adds: None,
             dels: None,
         };
-        let item_again = item.clone();
         let got = lines(&[item], 36);
         assert_eq!(
             got,
-            [
-                "\u{25cf} Ran cargo test --workspace",
-                "  --all-targets  failed, exit 101 \u{25b8}"
-            ]
+            ["\u{25cf} Ran cargo tes\u{2026}  failed, exit 101 \u{25b8}"]
         );
-        assert!(got.iter().all(|row| width::width(row) <= 36));
-        // Both rows open and close the step, as the one row did.
-        let (_, _, heads) = laid_out(&[item_again], 36, &Opened::default());
-        assert_eq!(heads[0], Some("t:t".to_string()));
-        assert_eq!(heads[1], heads[0]);
+        assert_eq!(width::width(&got[0]), 36);
     }
 
     #[test]
@@ -3050,19 +3002,11 @@ mod tests {
             })),
         );
         let rows = laid_out(&items, 20, &opened).0;
-        // The note says where the rest is, and wraps whole in a narrow pane.
-        let tail: Vec<&str> = rows[1 + DETAIL_ROWS..]
-            .iter()
-            .map(|r| r.text.trim_end())
-            .collect();
+        assert_eq!(rows.len(), 1 + DETAIL_ROWS + 1);
         assert_eq!(
-            tail.join(" ")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" "),
-            "\u{2026} 10 more rows in the terminal"
+            rows.last().expect("a row").text.trim_end(),
+            " \u{2026} 10 more rows"
         );
-        assert!(rows.iter().all(|r| width::width(&r.text) <= 20));
         // Cut by the limit and by the daemon: both are said.
         let both = (0..40).map(|n| format!("l{n}\n")).collect::<String>();
         opened.details.insert(
@@ -3073,17 +3017,14 @@ mod tests {
                 truncated: true,
             })),
         );
-        let rows = laid_out(&items, 40, &opened).0;
+        let rows = laid_out(&items, 30, &opened).0;
         let tail: Vec<&str> = rows[rows.len() - 2..]
             .iter()
             .map(|r| r.text.trim_end())
             .collect();
         assert_eq!(
             tail,
-            [
-                " \u{2026} 10 more rows in the terminal",
-                " \u{2026} cut by the daemon"
-            ]
+            [" \u{2026} 10 more rows", " \u{2026} cut by the daemon"]
         );
         // A read that failed is waiting to be tried again; nothing recorded is said.
         opened.details.insert("a".into(), got(None));
@@ -3185,8 +3126,7 @@ mod tests {
                 "hello",
                 "",
                 "\u{25cf} Thought",
-                "context",
-                "compacted",
+                "context c\u{2026}",
                 "",
                 "bye"
             ]
@@ -3409,9 +3349,7 @@ mod tests {
                 "Sure. Running cargo",
                 "test first.",
                 "",
-                "\u{25cf} Ran cargo test",
-                "  --workspace",
-                "  failed, exit 2",
+                "\u{25cf} R\u{2026}  failed, exit 2",
                 "",
                 "Two tests failed."
             ]
@@ -5034,7 +4972,7 @@ mod tests {
     }
 
     #[test]
-    fn the_other_kinds_of_notice_wrap_whole_and_take_no_blank_row() {
+    fn the_other_kinds_of_notice_stay_one_dim_row_and_take_no_blank_row() {
         let long = "word ".repeat(30);
         let items = [
             Item::Notice {
@@ -5051,22 +4989,9 @@ mod tests {
             },
         ];
         let rows = layout(&items, 24);
-        let text: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
-        // Every word of the hook's text is there, none cut, and no blank row comes between
-        // the two notices: steps sit tight.
-        assert_eq!(text[0], "hook: word word word", "{text:?}");
-        assert_eq!(
-            text.iter()
-                .map(|r| r.matches("word").count())
-                .sum::<usize>(),
-            30
-        );
-        assert!(
-            text.iter()
-                .all(|r| !r.is_empty() && !r.contains('\u{2026}')),
-            "{text:?}"
-        );
-        assert_eq!(text.last().copied(), Some("interrupted: Interrupted"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "hook: word word word wo\u{2026}");
+        assert_eq!(rows[1].text, "interrupted: Interrupted");
     }
 
     #[test]

@@ -14,9 +14,10 @@ you are typing in, or the terminal window running qoop has lost focus. It waits 
 again first, so an agent that flickers through a state does not ping you, and several
 agents finishing together make one notification.
 
-A question you handed to qass waits on qass, not on you: it sends no note and rings no bell,
-and it sits under With qass in the Inbox. While qass is stopped or not watching it counts
-as waiting on you again.
+In the desktop app and on the phone, a question you handed to qass waits on qass, not on you:
+it sends no note and rings no bell, and it sits under With qass in the Inbox. While qass is
+stopped or not watching it counts as waiting on you again. The terminal interface notes a
+blocked agent whether or not its question went to qass.
 
 ## Long commands in a shell tab
 

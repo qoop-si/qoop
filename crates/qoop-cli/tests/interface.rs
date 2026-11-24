@@ -206,10 +206,11 @@ impl Drop for Interface {
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
-/// The screen row the column's title is drawn on: the first row of the column, nothing above
-/// it. Taken from the interface rather than written as a number, so this test cannot disagree
-/// with the layout the next time the layout changes. The tab bar is over the pane, not over
-/// this column, so the column starts at the very top.
+/// The screen row the column's title is drawn on: under the inbox's tab row and its list
+/// rows, which are there whether or not anybody waits. Taken from the interface rather than
+/// written as a number, so this test cannot disagree with the layout the next time the layout
+/// changes. The tab bar is over the pane, not over this column, so the column starts at the
+/// very top.
 const SPACES_TITLE_ROW: usize = qoop_tui::screen::SIDEBAR_TOP + qoop_tui::sidebar::TITLE_ROW;
 
 /// The screen row the tab names are on, one based: the bar's top row. The folders run on
@@ -358,33 +359,6 @@ impl Interface {
             painted: String::new(),
             screen: Screen::new(cols, rows),
         }
-    }
-
-    /// Put the left column in its tree. A fresh interface lists the priority list, the home;
-    /// the gates that read spaces and their rules ask for the tree the way a person does,
-    /// with `ctrl-a g`.
-    fn show_tree(&mut self) {
-        assert!(
-            self.wait_for_panel(
-                SPACES_TITLE_ROW,
-                |line| line.trim_end().ends_with("priority +"),
-                Duration::from_secs(20),
-            )
-            .is_some(),
-            "the column never opened on its priority list:\n{}",
-            self.painted
-        );
-        self.type_in(&[0x01, b'g']);
-        assert!(
-            self.wait_for_panel(
-                SPACES_TITLE_ROW,
-                |line| line.trim_end().ends_with("tree +"),
-                Duration::from_secs(10),
-            )
-            .is_some(),
-            "ctrl-a g did not show the tree:\n{}",
-            self.painted
-        );
     }
 
     /// Kill only the client, leaving the daemon and its terminals: the
@@ -1002,7 +976,6 @@ impl Interface {
 #[test]
 fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() {
     let mut ui = Interface::start();
-    ui.show_tree();
     assert!(
         ui.wait_for("detach", Duration::from_secs(20)).is_some(),
         "the key list never appeared:\n{}",
@@ -1279,7 +1252,6 @@ fn g12_6_detaching_restores_the_terminal_and_leaves_the_shell_running() {
 #[test]
 fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
     let mut ui = Interface::start();
-    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     let dir = ui.runtime_dir().join("bin");
@@ -1408,7 +1380,6 @@ fn g12_8_the_close_on_the_focused_tab_ends_that_terminal() {
 #[test]
 fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() {
     let mut ui = Interface::start();
-    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     ui.create_terminal("");
     assert!(
@@ -1511,7 +1482,6 @@ fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() 
 #[test]
 fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
     let mut ui = Interface::start();
-    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     ui.type_in(b"echo IN_THE_FIRST_SPACE\n");
     assert!(
@@ -1604,7 +1574,6 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
 #[test]
 fn g12_10_a_terminal_behind_a_namespace_is_on_the_panel_as_the_wrapper() {
     let mut ui = Interface::start();
-    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     let dir = ui.runtime_dir().join("bin");
@@ -1666,7 +1635,6 @@ fn g12_10_a_terminal_behind_a_namespace_is_on_the_panel_as_the_wrapper() {
 #[test]
 fn g12_11_an_empty_space_does_not_leave_the_keyboard_in_the_space_it_left() {
     let mut ui = Interface::start();
-    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     ui.type_in(b"echo BEFORE_THE_MOVE\n");
     assert!(
@@ -1767,7 +1735,6 @@ fn g12_11_an_empty_space_does_not_leave_the_keyboard_in_the_space_it_left() {
 #[test]
 fn g12_12_two_spaces_made_at_once_get_two_names_and_two_terminals() {
     let mut ui = Interface::start();
-    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     // Two, asked for back to back with no wait between them and both left unnamed, so both
@@ -1807,7 +1774,6 @@ fn g12_12_two_spaces_made_at_once_get_two_names_and_two_terminals() {
 #[test]
 fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
     let mut ui = Interface::start();
-    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     // A stand in agent in a second space, so there is a row in the panel to click. A shell
@@ -1904,7 +1870,6 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
 #[test]
 fn g12_14_a_digit_picks_the_tab_at_that_position_in_this_space() {
     let mut ui = Interface::start();
-    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     // A space of its own with three terminals in it, so that a client counting the daemon's
@@ -2186,7 +2151,6 @@ fn g12_16_ctrl_c_interrupts_a_foreground_process_for_a_backgrounded_daemon() {
 #[test]
 fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
     let mut ui = Interface::start();
-    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     let dir = ui.runtime_dir().join("bin");
@@ -2277,24 +2241,41 @@ fn g12_20_a_fresh_attach_sizes_the_adopted_terminal_to_its_pane() {
 }
 
 #[test]
-fn g12_21_clicking_the_order_word_flips_priority_and_tree() {
+fn g12_21_clicking_the_order_word_flips_tree_and_priority() {
     let mut ui = Interface::start();
-    // A fresh interface opens on the priority list, the home.
-    let title = SPACES_TITLE_ROW;
+    let title = ui
+        .wait_for_panel(
+            FIRST_SPACE_ROW,
+            |line| line.contains("default"),
+            Duration::from_secs(15),
+        )
+        .and_then(|_| {
+            agents_title_row(&ui.screen).and_then(|row| {
+                ui.wait_for_panel(
+                    row,
+                    |line| line.trim_end().ends_with("tree +"),
+                    Duration::from_secs(15),
+                )
+                .map(|_| row)
+            })
+        })
+        .unwrap_or_else(|| panic!("the title never said tree:\n{}", ui.painted));
+    // The order word flips the view, like `ctrl-a g`: the same agents, urgency first. The
+    // word ends two columns short of the edge, before the space and the `+`, and both
+    // words cover the column clicked here.
+    let word = index_width() as u16 - 3;
+    ui.click(word, title as u16);
     assert!(
         ui.wait_for_panel(
             title,
             |line| line.trim_end().ends_with("priority +"),
-            Duration::from_secs(20),
+            Duration::from_secs(10)
         )
         .is_some(),
-        "the title never said priority:\n{}",
+        "a click on tree did not flip to priority:\n{}",
         ui.painted
     );
-    // The order word flips the view, like `ctrl-a g`: the same agents, grouped by space. The
-    // word ends two columns short of the edge, before the space and the `+`, and both
-    // words cover the column clicked here.
-    let word = index_width() as u16 - 3;
+    // And back again with a second click.
     ui.click(word, title as u16);
     assert!(
         ui.wait_for_panel(
@@ -2303,91 +2284,17 @@ fn g12_21_clicking_the_order_word_flips_priority_and_tree() {
             Duration::from_secs(10)
         )
         .is_some(),
-        "a click on priority did not flip to the tree:\n{}",
+        "a click on priority did not flip back to tree:\n{}",
         ui.painted
     );
-    assert!(
-        ui.wait_for_panel(
-            FIRST_SPACE_ROW,
-            |line| line.contains("default"),
-            Duration::from_secs(15),
-        )
-        .is_some(),
-        "the tree never listed the daemon's own space:\n{}",
-        ui.painted
-    );
-    // And back again with a second click.
-    ui.click(word, title as u16);
-    assert!(
-        ui.wait_for_panel(
-            title,
-            |line| line.trim_end().ends_with("priority +"),
-            Duration::from_secs(10)
-        )
-        .is_some(),
-        "a click on tree did not flip back to priority:\n{}",
-        ui.painted
-    );
-    // The `agents` word itself is nothing: a click there leaves the view alone.
+    // The `spaces` word itself is nothing: a click there leaves the view alone.
     ui.click(5, title as u16);
     let _ = ui.wait_for("never appears", Duration::from_secs(2));
     assert!(
         ui.panel_line(title)
-            .is_some_and(|line| line.trim_end().ends_with("priority +")),
-        "a click on the agents word moved the view:\n{}",
+            .is_some_and(|line| line.trim_end().ends_with("tree +")),
+        "a click on the spaces word moved the view:\n{}",
         ui.painted
-    );
-}
-
-/// The left column has no inbox strip: the title is its first row, no row of it says
-/// "nothing needs you" or draws the seven tabs' counts, and a first run lists This Mac and
-/// nothing else on its computers line. Asked of the real interface on a real screen.
-#[test]
-fn the_column_opens_on_its_title_with_no_strip_and_lists_this_mac() {
-    // The constant the other gates read their rows from is the title's own row.
-    assert_eq!(qoop_tui::sidebar::TITLE_ROW, 0);
-    assert_eq!(SPACES_TITLE_ROW, qoop_tui::screen::SIDEBAR_TOP);
-    let mut ui = Interface::start();
-    assert!(
-        ui.wait_for_panel(
-            SPACES_TITLE_ROW,
-            |line| line.starts_with(" agents") && line.trim_end().ends_with("priority +"),
-            Duration::from_secs(20),
-        )
-        .is_some(),
-        "the title is not the column's first row:\n{}",
-        ui.painted
-    );
-    assert!(
-        ui.wait_for("This Mac", Duration::from_secs(10)).is_some(),
-        "the computers line never named This Mac:\n{}",
-        ui.painted
-    );
-    let column: Vec<String> = (SPACES_TITLE_ROW - 1..=ROWS as usize - qoop_tui::screen::STATUS)
-        .filter_map(|row| ui.panel_line(row))
-        .collect();
-    let all = column.join("\n");
-    for gone in ["nothing needs you", "inbox", "wants", "saved"] {
-        assert!(
-            !all.contains(gone),
-            "the strip's {gone:?} is still drawn:\n{all}"
-        );
-    }
-    // The strip's tab counts were braille marks with a number on the first column row.
-    assert!(
-        !column
-            .first()
-            .is_some_and(|row| row.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c))),
-        "the row over the title is the old strip:\n{all}"
-    );
-    let computers = column
-        .iter()
-        .find(|line| line.contains("computers"))
-        .unwrap_or_else(|| panic!("no computers line:\n{all}"));
-    assert_eq!(
-        computers.trim_end(),
-        " computers  This Mac \u{25cf}",
-        "a first run lists This Mac only"
     );
 }
 
@@ -2473,7 +2380,6 @@ fn g12_22_a_hidden_child_cursor_stays_hidden_between_repaints() {
 #[test]
 fn radar_tree_order_holds_creation_order() {
     let mut ui = Interface::start();
-    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     let dir = ui.runtime_dir().join("bin");
@@ -2836,8 +2742,7 @@ fn the_icon_font_a_start_writes_is_drawn_from_the_next_start() {
             .filter(|(_, g)| ui.painted.contains(*g))
             .count()
     };
-    // The cog on the foot: drawn whichever list the column shows.
-    let more = icons::SETTINGS.to_string();
+    let more = icons::MORE.to_string();
 
     let mut first = open();
     assert!(
@@ -2916,347 +2821,12 @@ fn under_the_floor_keys_act_on_nothing_unseen_and_a_detach_still_leaves() {
     );
 }
 
-// The Inbox (`ctrl-a i`) -------------------------------------------------------------------
+// qass's own screen, its board, rails and panels.
 
-impl Interface {
-    /// Read until a row of the screen as it is now holds `needle`.
-    fn wait_on_screen(&mut self, needle: &str, within: Duration) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < within {
-            if self.on_screen(needle) {
-                return true;
-            }
-            let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
-        }
-        self.on_screen(needle)
-    }
-
-    /// Whether a row of the screen as it is now holds `needle`.
-    fn on_screen(&self, needle: &str) -> bool {
-        (1..=self.rows as usize).any(|r| self.screen.text(r).is_some_and(|t| t.contains(needle)))
-    }
-
-    /// Read for `how_long`, so what happens in that time has happened.
-    fn wait_a_while(&mut self, how_long: Duration) {
-        let start = Instant::now();
-        while start.elapsed() < how_long {
-            let _ = self.wait_for("this needle never appears", Duration::from_millis(100));
-        }
-    }
-}
-
-/// A stand-in `claude` that draws Claude Code's permission menu, then keeps the first key it
-/// is given in `typed` (empty until it is given one). Returns where that file will be.
-fn menu_agent(ui: &mut Interface) -> std::path::PathBuf {
-    let dir = ui.runtime_dir().join("bin");
-    std::fs::create_dir_all(&dir).expect("dir");
-    let typed = ui.runtime_dir().join("typed");
-    let agent = dir.join("claude");
-    std::fs::write(
-        &agent,
-        format!(
-            "#!/bin/sh\nprintf '\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\\n'\n\
-             printf ' Do you want to proceed?\\n \u{276F} 1. Yes\\n   2. No\\n'\n\
-             stty raw -echo\ndd bs=1 count=1 2>/dev/null > '{}'\nsleep 30\n",
-            typed.display()
-        ),
-    )
-    .expect("write");
-    std::fs::set_permissions(
-        &agent,
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-    )
-    .expect("chmod");
-    ui.type_in(format!("{}\n", agent.display()).as_bytes());
-    typed
-}
-
-/// A blocked agent and the Inbox open over it: the interface, and the file the agent types to.
-fn inbox_over_a_blocked_agent() -> (Interface, std::path::PathBuf) {
-    inbox_over_a_blocked_agent_sized(COLS, ROWS)
-}
-
-fn inbox_over_a_blocked_agent_sized(cols: u16, rows: u16) -> (Interface, std::path::PathBuf) {
-    let mut ui = Interface::start_impl_sized(false, cols, rows);
-    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
-    let typed = menu_agent(&mut ui);
-    assert!(
-        ui.wait_for_agents(|line| line.contains("claude"), Duration::from_secs(15)),
-        "no agent on the panel: {:?}",
-        agents_panel(&ui.screen)
-    );
-    assert!(
-        ui.wait_for_agents_raw(
-            |line| line.contains("claude")
-                && [
-                    qoop_tui::theme::fg(qoop_tui::theme::Role::Blocked),
-                    qoop_tui::theme::selected_in(qoop_tui::theme::Role::Blocked),
-                ]
-                .iter()
-                .any(|ink| line.contains(ink.as_str())),
-            Duration::from_secs(15)
-        ),
-        "the agent is not blocked: {:?}",
-        agents_panel(&ui.screen)
-    );
-    // From the agent's own tab, the keyboard in its pane.
-    ui.type_in(b"\x01i");
-    // The Inbox's own key row: the column's "needs you 1" is there before it opens.
-    assert!(
-        ui.wait_on_screen("inbox:", Duration::from_secs(10)) && ui.on_screen("needs you 1"),
-        "ctrl-a i did not open the Inbox:\n{}",
-        ui.screen
-    );
-    (ui, typed)
-}
-
-/// `ctrl-a i` opens the Inbox from an agent's tab, over the pane: the count, the agent's
-/// question whole and its answers numbered; esc puts it away.
-#[test]
-fn ctrl_a_i_opens_the_inbox_from_an_agent_tab() {
-    let (mut ui, _) = inbox_over_a_blocked_agent();
-    assert!(
-        ui.wait_on_screen("Do you want to proceed?", Duration::from_secs(5)),
-        "the question is not in the Inbox:\n{}",
-        ui.screen
-    );
-    assert!(
-        ui.on_screen("1 Yes") && ui.on_screen("2 No"),
-        "{}",
-        ui.screen
-    );
-    assert!(
-        ui.on_screen("h hand to qass") || ui.on_screen("1-9 answer"),
-        "{}",
-        ui.screen
-    );
-    ui.type_in(b"\x1b");
-    ui.wait_a_while(Duration::from_millis(600));
-    assert!(
-        !ui.on_screen("from qass"),
-        "esc left the Inbox open:\n{}",
-        ui.screen
-    );
-    // The same key opens it again and puts it away again.
-    ui.type_in(b"\x01i");
-    assert!(
-        ui.wait_on_screen("from qass", Duration::from_secs(5)),
-        "{}",
-        ui.screen
-    );
-    ui.type_in(b"\x01i");
-    ui.wait_a_while(Duration::from_millis(600));
-    assert!(
-        !ui.on_screen("from qass"),
-        "ctrl-a i did not put the Inbox away:\n{}",
-        ui.screen
-    );
-}
-
-/// `f` filters the Inbox to what qass wrote, and `f` again clears it.
-#[test]
-fn f_filters_the_inbox_to_qass_and_clears_it() {
-    let (mut ui, _) = inbox_over_a_blocked_agent();
-    ui.type_in(b"f");
-    assert!(
-        ui.wait_on_screen("nothing from qass needs you", Duration::from_secs(5)),
-        "{}",
-        ui.screen
-    );
-    assert!(
-        !ui.on_screen("1 Yes"),
-        "the agent's own menu stayed under the filter"
-    );
-    ui.type_in(b"f");
-    assert!(
-        ui.wait_on_screen("1 Yes", Duration::from_secs(5)),
-        "the second f did not clear the filter:\n{}",
-        ui.screen
-    );
-}
-
-/// A digit starts a three second hold shown on the card, and the answer reaches the agent
-/// when it is up, not before.
-#[test]
-fn a_held_menu_answer_reaches_the_agent_after_three_seconds() {
-    let (mut ui, typed) = inbox_over_a_blocked_agent();
-    // The menu has been on the row for more than its arming by now.
-    ui.wait_a_while(Duration::from_millis(800));
-    ui.type_in(b"1");
-    assert!(
-        ui.wait_on_screen("sending in", Duration::from_secs(5)),
-        "no hold on the card:\n{}",
-        ui.screen
-    );
-    assert!(
-        ui.on_screen("u undo") && ui.on_screen("enter send now"),
-        "{}",
-        ui.screen
-    );
-    ui.wait_a_while(Duration::from_millis(1500));
-    assert_eq!(
-        std::fs::read_to_string(&typed).unwrap_or_default(),
-        "",
-        "the agent had its answer before the hold was up"
-    );
-    let start = Instant::now();
-    while std::fs::read_to_string(&typed)
-        .unwrap_or_default()
-        .is_empty()
-        && start.elapsed() < Duration::from_secs(8)
-    {
-        ui.wait_a_while(Duration::from_millis(100));
-    }
-    assert_eq!(std::fs::read_to_string(&typed).unwrap_or_default(), "1");
-}
-
-/// An undone answer never reaches the agent.
-#[test]
-fn an_undone_answer_never_reaches_the_agent() {
-    let (mut ui, typed) = inbox_over_a_blocked_agent();
-    ui.wait_a_while(Duration::from_millis(800));
-    ui.type_in(b"1");
-    assert!(
-        ui.wait_on_screen("sending in", Duration::from_secs(5)),
-        "{}",
-        ui.screen
-    );
-    ui.type_in(b"u");
-    assert!(
-        ui.wait_on_screen("undone", Duration::from_secs(5)),
-        "undo said nothing:\n{}",
-        ui.screen
-    );
-    ui.wait_a_while(Duration::from_secs(5));
-    assert_eq!(
-        std::fs::read_to_string(&typed).unwrap_or_default(),
-        "",
-        "an undone answer reached the agent"
-    );
-}
-
-/// Detaching sends what is held, so an answer the person gave is not lost to the three
-/// seconds.
-#[test]
-fn detaching_sends_an_answer_on_hold() {
-    let (mut ui, typed) = inbox_over_a_blocked_agent();
-    ui.wait_a_while(Duration::from_millis(800));
-    ui.type_in(b"1");
-    assert!(
-        ui.wait_on_screen("sending in", Duration::from_secs(5)),
-        "{}",
-        ui.screen
-    );
-    // `ctrl-q` leaves at once, inside the hold.
-    ui.type_in(b"\x11");
-    let start = Instant::now();
-    while std::fs::read_to_string(&typed)
-        .unwrap_or_default()
-        .is_empty()
-        && start.elapsed() < Duration::from_secs(6)
-    {
-        ui.wait_a_while(Duration::from_millis(100));
-    }
-    assert_eq!(
-        std::fs::read_to_string(&typed).unwrap_or_default(),
-        "1",
-        "a held answer was lost on detach"
-    );
-}
-
-/// A hangup (the terminal window closed) inside the hold sends the answer too.
-#[test]
-fn a_hangup_sends_an_answer_on_hold() {
-    let (mut ui, typed) = inbox_over_a_blocked_agent();
-    ui.wait_a_while(Duration::from_millis(800));
-    ui.type_in(b"1");
-    assert!(
-        ui.wait_on_screen("sending in", Duration::from_secs(5)),
-        "{}",
-        ui.screen
-    );
-    // SAFETY: a signal to the interface process this test spawned and still owns.
-    unsafe { libc::kill(ui.child.id() as i32, libc::SIGHUP) };
-    let start = Instant::now();
-    while std::fs::read_to_string(&typed)
-        .unwrap_or_default()
-        .is_empty()
-        && start.elapsed() < Duration::from_secs(6)
-    {
-        ui.wait_a_while(Duration::from_millis(100));
-    }
-    assert_eq!(
-        std::fs::read_to_string(&typed).unwrap_or_default(),
-        "1",
-        "a held answer was lost to a hangup"
-    );
-}
-
-/// Below 100 columns the agents column folds to its strip while the Inbox is open, and comes
-/// back when it is put away. The screen as a person sees it is kept when `QOOP_INBOX_SHOTS` is
-/// set.
-#[test]
-fn at_80_columns_the_inbox_folds_the_column_and_esc_brings_it_back() {
-    let (mut ui, _) = inbox_over_a_blocked_agent_sized(80, 24);
-    assert!(
-        ui.wait_on_screen("Do you want to proceed?", Duration::from_secs(5)),
-        "{}",
-        ui.screen
-    );
-    assert!(
-        !ui.on_screen("priority +"),
-        "the column stayed wide under the cards:\n{}",
-        ui.screen
-    );
-    if let Ok(dir) = std::env::var("QOOP_INBOX_SHOTS") {
-        let path = std::path::Path::new(&dir).join("inbox-real-80x24.txt");
-        std::fs::write(path, ui.screen.to_string()).expect("keep the screen");
-    }
-    ui.type_in(b"\x1b");
-    assert!(
-        ui.wait_on_screen("priority +", Duration::from_secs(5)),
-        "esc did not bring the column back:\n{}",
-        ui.screen
-    );
-}
-
-/// At 100 columns (the gates' own size) the column stays, and the screen is kept the same way.
-#[test]
-fn the_inbox_at_100_columns_keeps_the_column() {
-    let (mut ui, _) = inbox_over_a_blocked_agent();
-    assert!(
-        ui.wait_on_screen("Do you want to proceed?", Duration::from_secs(5)),
-        "{}",
-        ui.screen
-    );
-    assert!(
-        ui.on_screen("priority +"),
-        "the column folded at 100 columns:\n{}",
-        ui.screen
-    );
-    // The question is said once: what the agent drew above its options is not said again.
-    let said = (1..=ui.rows as usize)
-        .filter(|r| {
-            ui.screen
-                .text(*r)
-                .is_some_and(|t| t.contains("Do you want to proceed?"))
-        })
-        .count();
-    assert_eq!(said, 1, "{}", ui.screen);
-    if let Ok(dir) = std::env::var("QOOP_INBOX_SHOTS") {
-        let path = std::path::Path::new(&dir).join("inbox-real-100x30.txt");
-        std::fs::write(path, ui.screen.to_string()).expect("keep the screen");
-    }
-}
-
-// New agent (`n` in the Inbox) ------------------------------------------------------------
-
-/// `n` in the Inbox opens the new agent box; a task with a quote in it, enter, and the line
-/// typed into the new shell is the shared worktree line: a stand-in `qoop` first on the shell's
-/// PATH records the arguments it was given, so the quoting is checked by what the shell made of
-/// it, and nothing real is started.
-#[test]
-fn n_in_the_inbox_types_the_worktree_line_into_a_new_shell() {
+/// An interface on a daemon whose terminals find a stand-in `claude` first on their PATH (a
+/// shell loop that runs each line typed into it, so qass's pane takes `qoop ask add`) and
+/// qass's skill where `qoop qass` looks for it, with `qoop qass` already run.
+fn qass_ui() -> Interface {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(
         dir.path(),
@@ -3265,137 +2835,243 @@ fn n_in_the_inbox_types_the_worktree_line_into_a_new_shell() {
     .expect("chmod");
     let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin");
-    let args = dir.path().join("worktree-args");
-    let stub = bin.join("qoop");
+    let claude = bin.join("claude");
     std::fs::write(
-        &stub,
-        format!(
-            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n",
-            args.display()
-        ),
+        &claude,
+        "#!/bin/sh\nprintf '> '\nwhile IFS= read -r line; do eval \"$line\"; printf '> '; done\n",
     )
-    .expect("stub");
+    .expect("claude");
     std::fs::set_permissions(
-        &stub,
+        &claude,
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
     )
     .expect("chmod");
-    // The agents the person's config lists: one that starts in a worktree.
-    let config = dir.path().join("config").join("qoop");
-    std::fs::create_dir_all(&config).expect("config dir");
-    std::fs::write(
-        config.join("config.toml"),
-        "[agents]\nclaude = \"claude\"\n",
-    )
-    .expect("config");
+    let skill = dir.path().join("d/qoop/qass/.claude/skills/qass");
+    std::fs::create_dir_all(&skill).expect("skill");
+    std::fs::write(skill.join("SKILL.md"), "qass\n").expect("skill");
     let path = format!(
         "{}:{}",
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    let env: [(&str, std::ffi::OsString); 2] = [
+        ("PATH", path.into()),
+        ("XDG_DATA_HOME", dir.path().join("d").into()),
+    ];
     let runtime = dir.path().to_path_buf();
-    let (child, daemon, master) =
-        Interface::start_in(dir.path(), false, 220, 40, &[], &[("PATH", path.into())]);
+    let (child, daemon, master) = Interface::start_in(dir.path(), false, 200, 50, &env, &env);
     let mut ui = Interface {
         child,
         daemon,
         master,
         _dir: Some(dir),
         runtime,
-        cols: 220,
-        rows: 40,
+        cols: 200,
+        rows: 50,
         painted: String::new(),
-        screen: Screen::new(220, 40),
+        screen: Screen::new(200, 50),
     };
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
-    ui.type_in(b"\x01i");
-    assert!(
-        ui.wait_on_screen("inbox:", Duration::from_secs(10)),
-        "ctrl-a i did not open the Inbox:\n{}",
-        ui.screen
-    );
-    ui.type_in(b"n");
-    assert!(
-        ui.wait_on_screen("what should the agent do?", Duration::from_secs(5)),
-        "n did not open the new agent box:\n{}",
-        ui.screen
-    );
-    ui.type_in(b"it's done");
-    assert!(
-        ui.wait_on_screen("it's done", Duration::from_secs(5)),
-        "{}",
-        ui.screen
-    );
-    assert!(
-        ui.on_screen("new worktree feat/its-done"),
-        "no branch on the box:\n{}",
-        ui.screen
-    );
-    ui.type_in(b"\r");
-    let start = Instant::now();
-    while !args.exists() && start.elapsed() < Duration::from_secs(20) {
-        ui.wait_a_while(Duration::from_millis(100));
+    let (ok, out) = ui.qoop(&["qass"], &env);
+    assert!(ok, "qoop qass: {out}");
+    ui
+}
+
+impl Interface {
+    /// `qoop <args>` from outside every terminal, on this interface's daemon.
+    fn qoop(&self, args: &[&str], env: &[(&str, std::ffi::OsString)]) -> (bool, String) {
+        let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
+            .args(args)
+            .env("QOOP_RUNTIME_DIR", &self.runtime)
+            .env("XDG_CONFIG_HOME", self.runtime.join("config"))
+            .env_remove("QOOP_SESSION")
+            .env_remove("QORO_SESSION")
+            .envs(env.iter().map(|(k, v)| (*k, v)))
+            .output()
+            .expect("run qoop");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
     }
-    let got = std::fs::read_to_string(&args).unwrap_or_default();
-    assert_eq!(
-        got.lines().collect::<Vec<_>>(),
-        [
-            "worktree",
-            "new",
-            "feat/its-done",
-            "--space",
-            "1",
-            "--",
-            "claude",
-            "it's done"
-        ],
-        "the shell was typed the wrong line:\n{}",
+
+    /// `ctrl-a Q` until qass's framed screen shows: a press before the interface has read qass's
+    /// row finds no qass yet, so it is pressed again while the screen does not show it.
+    fn enter_qass(&mut self) -> bool {
+        for _ in 0..10 {
+            if self.screen_has("\u{2500} \u{25be} qass ", Duration::from_millis(300), false) {
+                return true;
+            }
+            self.type_in(b"\x01Q");
+            if self.screen_has("\u{2500} \u{25be} qass ", Duration::from_secs(3), false) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Read until the screen as it stands now holds `needle` (or no longer does, `gone`).
+    fn screen_has(&mut self, needle: &str, within: Duration, gone: bool) -> bool {
+        let start = Instant::now();
+        loop {
+            let _ = self.wait_for("\u{0}never", Duration::from_millis(100));
+            if self.screen.to_string().contains(needle) != gone {
+                return true;
+            }
+            if start.elapsed() > within {
+                return false;
+            }
+        }
+    }
+}
+
+/// `ctrl-a Q` goes to qass's own framed screen: its header over qass's terminal in a framed
+/// box, and the board `qoop qass` made, on the rail beside it while the tab is too small for
+/// both; pressed again it goes back.
+#[test]
+fn ctrl_a_capital_q_shows_qass_framed_screen_and_its_board() {
+    let mut ui = qass_ui();
+    assert!(
+        ui.enter_qass(),
+        "ctrl-a Q did not show qass's framed terminal:\n{}\n{}",
+        ui.screen,
+        ui.qoop(&["agents"], &[]).1
+    );
+    assert!(
+        ui.screen_has("\u{25b8} board", Duration::from_secs(10), false),
+        "no board beside qass:\n{}",
+        ui.screen
+    );
+    ui.type_in(b"\x01Q");
+    assert!(
+        ui.screen_has("\u{2500} \u{25be} qass ", Duration::from_secs(10), true),
+        "ctrl-a Q again did not go back:\n{}",
         ui.screen
     );
 }
 
-// qass's ledger (`ctrl-a Q`) --------------------------------------------------------------
-
-/// `ctrl-a Q` opens the ledger over the pane. With no qass on a fresh machine it says qass is
-/// not started and offers Start, not Pause; `esc` puts it away and the same key opens it again.
+/// `ctrl-a C` on qass's screen opens the schedules panel, and `+` in it the form, which reads
+/// the first run back.
 #[test]
-fn ctrl_a_capital_q_opens_the_ledger_and_a_stopped_qass_offers_start() {
-    let mut ui = Interface::start_impl_sized(false, 220, 40);
+fn ctrl_a_capital_c_opens_the_clock_panel_and_plus_opens_the_form() {
+    let mut ui = qass_ui();
+    assert!(ui.enter_qass(), "{}", ui.screen);
+    ui.type_in(b"\x01C");
+    assert!(
+        ui.screen_has("\u{2500} schedules ", Duration::from_secs(10), false)
+            && ui.screen_has("+ adds one", Duration::from_secs(5), false),
+        "ctrl-a C did not open the schedules:\n{}",
+        ui.screen
+    );
+    ui.type_in(b"+");
+    assert!(
+        ui.screen_has("\u{2500} new schedule ", Duration::from_secs(10), false)
+            && ui.screen_has("first run", Duration::from_secs(5), false),
+        "+ did not open the form:\n{}",
+        ui.screen
+    );
+}
+
+/// `ctrl-a T` opens the board folded on the rail beside qass, and pressed again folds the pane
+/// the keyboard is in (qass's) to the rail.
+#[test]
+fn ctrl_a_capital_t_folds_the_board_to_the_rail() {
+    let mut ui = qass_ui();
+    assert!(ui.enter_qass(), "{}", ui.screen);
+    assert!(ui.screen_has("\u{25b8} board", Duration::from_secs(10), false));
+    ui.type_in(b"\x01T");
+    assert!(
+        ui.screen_has("\u{2500} \u{25be} board ", Duration::from_secs(10), false),
+        "ctrl-a T did not open the board from the rail:\n{}",
+        ui.screen
+    );
+    ui.type_in(b"\x01T");
+    assert!(
+        ui.screen_has("\u{25b8} qass", Duration::from_secs(10), false),
+        "ctrl-a T did not fold qass's pane to the rail:\n{}",
+        ui.screen
+    );
+}
+
+/// A card qass writes lights its questions, `ctrl-a i` opens the column with the card and its
+/// numbered answers, and `a` sends the first at once (no hold): the card is no longer open,
+/// queued for qass or passed on.
+#[test]
+fn a_card_lights_the_questions_and_ctrl_a_i_opens_the_column() {
+    let mut ui = qass_ui();
+    assert!(ui.enter_qass(), "{}", ui.screen);
+    let card = ui.runtime_dir().join("card.txt");
+    std::fs::write(
+        &card,
+        "asked: ship the release\ndoing: the notes are written\nwhy: a release is yours\n\
+         asks: Ship 0.22 today?\nA: ship | the tests pass | Ship it.\n\
+         B: wait | you may read it first | Wait for me.\n",
+    )
+    .expect("card");
+    // Typed into qass's terminal, so the card is qass's.
+    ui.type_in(
+        format!(
+            "{} ask add E1 --agent T1 --handle check --urgency now < {}\r",
+            env!("CARGO_BIN_EXE_qoop"),
+            card.display()
+        )
+        .as_bytes(),
+    );
+    assert!(
+        ui.screen_has("\u{25b8} questions 1", Duration::from_secs(15), false),
+        "the card did not light the questions:\n{}",
+        ui.screen
+    );
+    ui.type_in(b"\x01i");
+    assert!(
+        ui.screen_has("Ship 0.22 today?", Duration::from_secs(10), false)
+            && ui.screen_has("[1] ship", Duration::from_secs(5), false)
+            && ui.screen_has("[2] wait", Duration::from_secs(5), false),
+        "ctrl-a i did not show the card and its answers:\n{}",
+        ui.screen
+    );
+    ui.type_in(b"a");
+    let start = Instant::now();
+    let listed = loop {
+        let (_, listed) = ui.qoop(&["ask", "ls"], &[]);
+        if !listed.contains("E1 open") || start.elapsed() > Duration::from_secs(10) {
+            break listed;
+        }
+        let _ = ui.wait_for("\u{0}never", Duration::from_millis(200));
+    };
+    assert!(
+        listed.contains("E1 queued") || listed.contains("E1 passed"),
+        "a did not answer the card at once: {listed}"
+    );
+}
+
+/// An agent's pane carries its questions rail at its right, `⠄0` while it waits on nothing.
+#[test]
+fn an_agent_pane_carries_its_questions_rail() {
+    let mut ui = Interface::start_impl_sized(false, 160, 40);
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
-    ui.type_in(b"\x01Q");
+    let dir = ui.runtime_dir().join("bin");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let agent = dir.join("claude");
+    std::fs::write(&agent, "#!/bin/sh\nprintf 'ready\\n'\nsleep 60\n").expect("write");
+    std::fs::set_permissions(
+        &agent,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .expect("chmod");
+    ui.type_in(format!("{}\n", agent.display()).as_bytes());
+    let start = Instant::now();
+    while !ui.qoop(&["agents"], &[]).1.contains("program=claude") {
+        assert!(start.elapsed() < Duration::from_secs(15), "no agent");
+        let _ = ui.wait_for("\u{0}never", Duration::from_millis(200));
+    }
     assert!(
-        ui.wait_on_screen("not started", Duration::from_secs(10)),
-        "ctrl-a Q did not open the ledger:\n{}",
-        ui.screen
-    );
-    assert!(
-        ui.on_screen("s start qass") && ui.on_screen("did today") && ui.on_screen("rules"),
-        "{}",
-        ui.screen
-    );
-    assert!(
-        !ui.on_screen("p pause") && !ui.on_screen("t its terminal"),
-        "a stopped qass offered Pause:\n{}",
-        ui.screen
-    );
-    ui.type_in(b"\x1b");
-    ui.wait_a_while(Duration::from_millis(600));
-    assert!(
-        !ui.on_screen("did today"),
-        "esc left the ledger open:\n{}",
-        ui.screen
-    );
-    ui.type_in(b"\x01Q");
-    assert!(
-        ui.wait_on_screen("did today", Duration::from_secs(5)),
-        "{}",
-        ui.screen
-    );
-    ui.type_in(b"\x01Q");
-    ui.wait_a_while(Duration::from_millis(600));
-    assert!(
-        !ui.on_screen("did today"),
-        "the same key did not put it away:\n{}",
+        ui.screen_has("\u{2804}0", Duration::from_secs(10), false),
+        "no questions rail on the agent's pane:\n{}",
         ui.screen
     );
 }

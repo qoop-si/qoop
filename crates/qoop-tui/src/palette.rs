@@ -24,12 +24,6 @@ pub enum Item {
     /// A new terminal running an agent the table does not know: the palette
     /// asks which command to type, so any agent works, not just the listed ones.
     NewAgentAsk,
-    /// The box that starts an agent in a new worktree (`n` in the Inbox).
-    NewWork,
-    /// qass's ledger, as `ctrl-a Q` opens it.
-    Ledger,
-    /// A computer's own screen, by its machine number.
-    Computer(usize),
     CopyMode,
     Resize,
     Equalize,
@@ -109,7 +103,7 @@ impl Filter {
     fn keeps(self, item: &Item) -> bool {
         let agent = matches!(
             item,
-            Item::NewAgent(_) | Item::NewAgentAsk | Item::NewWork | Item::Resume { .. }
+            Item::NewAgent(_) | Item::NewAgentAsk | Item::Resume { .. }
         );
         match self {
             Filter::All => true,
@@ -141,10 +135,6 @@ pub struct Palette {
     /// What the plugin host listed when the palette opened: its actions, still on its way,
     /// or that it is not running.
     pub plugins: crate::plugins::Listed,
-    /// The terminals of what the Inbox counts as needing the person, oldest first, taken when
-    /// the palette opened: the "needs you" section lists these and no others. A hand to qass
-    /// and finished work nobody read are not in it.
-    pub needs: Vec<u32>,
 }
 
 impl Palette {
@@ -219,23 +209,11 @@ impl Palette {
     ) -> Vec<Entry> {
         let mut out = Vec::new();
         let listed: Vec<&AgentRow> = rows.iter().collect();
-        for terminal in &self.needs {
-            if let Some(agent) = listed.iter().find(|a| a.terminal == *terminal) {
-                out.push(terminal_entry(agent, spaces, "needs you"));
-            }
-        }
-        // Blocked or failed and not counted: handed to qass, or qass's own tab. Still a tab
-        // somebody may want to go to, so it is found, under its own word.
-        for agent in listed.iter().filter(|a| {
-            matches!(crate::sidebar::shown_state(a), "blocked" | "failed")
-                && !self.needs.contains(&a.terminal)
-        }) {
-            let section = if agent.with_qass {
-                "with qass"
-            } else {
-                "waiting"
-            };
-            out.push(terminal_entry(agent, spaces, section));
+        for agent in listed
+            .iter()
+            .filter(|a| matches!(crate::sidebar::shown_state(a), "blocked" | "failed"))
+        {
+            out.push(terminal_entry(agent, spaces, "needs you"));
         }
         for agent in listed
             .iter()
@@ -301,30 +279,6 @@ impl Palette {
                 program: None,
             });
         }
-        // Each other computer, with how it is reached: its own screen.
-        let mut machines: Vec<usize> = Vec::new();
-        for space in spaces {
-            let machine = crate::mux::machine_of(space.id);
-            if machine == 0 || machines.contains(&machine) {
-                continue;
-            }
-            machines.push(machine);
-            let name = crate::places::machine_name(spaces, machine);
-            out.push(Entry {
-                item: Item::Computer(machine),
-                section: "computers",
-                sub: match space.link {
-                    Some(qoop_runtime::control::LinkState::Down) => "not reached".to_string(),
-                    Some(qoop_runtime::control::LinkState::Parked) => "not connected".to_string(),
-                    _ => "online".to_string(),
-                },
-                space_len: crate::width::width(&name),
-                text: name,
-                space: None,
-                state: None,
-                program: None,
-            });
-        }
         // The things the interface can do, each with the key that does it without the
         // palette, so the next time needs no palette. The agent row takes no key: it
         // asks which command to type, so an agent nobody listed still starts.
@@ -334,24 +288,12 @@ impl Palette {
             (Item::Equalize, "equalize panes", "="),
             (Item::NewTerminal, "new terminal here", "c"),
             (Item::NewAgentAsk, "new agent terminal...", ""),
-            (
-                Item::NewWork,
-                "new agent in a worktree...",
-                "n in the Inbox",
-            ),
-            (
-                Item::Ledger,
-                "qass: what it does, its schedules and rules",
-                "Q",
-            ),
             (Item::Sleep, "sleep this tab", "Z"),
             (Item::NewSpace, "new space", "w"),
         ] {
             // Under the agent filter the ask row leads the agents it offers, not a `do`
             // header of its own.
-            let section = if matches!(item, Item::NewAgentAsk | Item::NewWork)
-                && self.filter == Filter::Agents
-            {
+            let section = if item == Item::NewAgentAsk && self.filter == Filter::Agents {
                 "agents"
             } else {
                 "do"
@@ -362,8 +304,6 @@ impl Palette {
                 text: text.to_string(),
                 sub: if key.is_empty() {
                     "type any agent".to_string()
-                } else if key.contains(' ') {
-                    key.to_string()
                 } else {
                     crate::keys::named(&format!("ctrl-a {key}"))
                 },
@@ -769,22 +709,10 @@ mod tests {
         )
     }
 
-    /// A palette opened the way the client opens one: with the terminals the Inbox counts.
-    fn opened_for(rows: &[AgentRow]) -> Palette {
-        Palette {
-            needs: rows
-                .iter()
-                .filter(|r| matches!(crate::sidebar::shown_state(r), "blocked" | "failed"))
-                .map(|r| r.terminal)
-                .collect(),
-            ..Palette::open()
-        }
-    }
-
     #[test]
     fn an_empty_query_lists_what_needs_you_first() {
         let (rows, spaces) = sample();
-        let entries = opened_for(&rows).items(
+        let entries = Palette::open().items(
             &rows,
             &spaces,
             0,
@@ -892,7 +820,7 @@ mod tests {
     #[test]
     fn typing_filters_spaces_agents_and_actions_together() {
         let (rows, spaces) = sample();
-        let mut palette = opened_for(&rows);
+        let mut palette = Palette::open();
         for c in "webshop".chars() {
             palette.push(c);
         }
@@ -1020,7 +948,7 @@ mod tests {
     #[test]
     fn picked_follows_the_selection() {
         let (rows, spaces) = sample();
-        let mut palette = opened_for(&rows);
+        let mut palette = Palette::open();
         assert_eq!(
             palette.picked(
                 &rows,
@@ -1366,31 +1294,5 @@ mod tests {
         assert!(shown(&searching, 1).is_empty(), "never a search hit");
         palette.plugins = crate::plugins::Listed::Nothing;
         assert!(shown(&palette, 1).is_empty(), "no plugins, nothing extra");
-    }
-
-    /// The ledger's key is named with the command key the person chose, not written `ctrl-a`.
-    #[test]
-    fn the_ledgers_key_is_named_with_the_persons_command_key() {
-        crate::keys::TEST_PREFIX.with(|c| c.set(Some(0x02)));
-        let (rows, spaces) = sample();
-        let entries = opened_for(&rows).items(
-            &rows,
-            &spaces,
-            0,
-            &crate::sidebar::Seen::new(),
-            &crate::sidebar::Unseen::new(),
-        );
-        crate::keys::TEST_PREFIX.with(|c| c.set(None));
-        let ledger = entries
-            .iter()
-            .find(|e| e.item == Item::Ledger)
-            .expect("the ledger row");
-        assert_eq!(ledger.sub, "ctrl-b Q");
-        // A key that is not a command of the prefix keeps its own words.
-        let new = entries
-            .iter()
-            .find(|e| e.item == Item::NewWork)
-            .expect("the new agent row");
-        assert_eq!(new.sub, "n in the Inbox");
     }
 }

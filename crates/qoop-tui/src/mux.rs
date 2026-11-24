@@ -3084,93 +3084,21 @@ mod tests {
 
     /// Through the mux, a remote that predates typed answers refuses one as an unknown request
     /// with no id: the refusal comes back under the id of the answer it was for (the mux keeps
-    /// the variant), the card says that machine's qoop is too old, and nothing is typed into
-    /// any pane.
+    /// the variant), with the remote's terminal number mapped on the way there.
     #[tokio::test]
-    async fn a_remote_older_than_typed_answers_refuses_one_and_nothing_is_typed() {
-        use crate::answers::{HandInput, Hold, Pick, Slot};
-        use crate::inbox::Context;
-        use crate::inbox_pane::{Env, Pane};
-        use std::time::Instant;
+    async fn a_remote_older_than_typed_answers_refuses_one_under_its_id() {
         let (mut mux, _home_rx, mut remote_rx, _events) = two_links();
         let there = terminal_out(1, 21).expect("fits");
-        let space = workspace_out(1, 3).expect("fits");
-        let mut row: AgentRow = serde_json::from_value(serde_json::json!({
-            "terminal": there, "workspace": space, "program": "claude", "state": "blocked",
-            "agent": true, "generation": 1,
-        }))
-        .expect("row");
-        row.status = Some("blocked".into());
-        row.menu = serde_json::from_value(serde_json::json!({
-            "question": "Go on?", "seal": 4,
-            "options": [
-                {"key": "1", "label": "Yes"},
-                {"key": "9", "label": "Type something.", "input": true},
-            ],
-        }))
-        .ok();
-        let spaces = vec![WorkspaceRow {
-            dir: None,
-            keep_awake: false,
-            qass_skip: false,
-            id: space,
-            name: "devbox:work".into(),
-            terminals: 1,
-            asleep: false,
-            sleeping: Vec::new(),
-            closable: true,
-            ink: None,
-            link: None,
-            link_reason: None,
-            goal: None,
-        }];
-        let (hand, ctx, typed) = (HandInput::default(), Context::default(), BTreeMap::new());
-        let now = Instant::now();
-        let (board, reach) = (
-            crate::board::Board::default(),
-            crate::places::Reach::default(),
-        );
-        let beside = crate::places::Beside {
-            board: &board,
-            acts: None,
-            acts_failed: None,
-            schedules: None,
-            rules: None,
-            reach: &reach,
-            offers: &[],
-        };
-        let env = Env {
-            rows: std::slice::from_ref(&row),
-            spaces: &spaces,
-            cards: &[],
-            hand: &hand,
-            ctx: &ctx,
-            now,
-            now_unix: 0,
-            typed: &typed,
-            beside: &beside,
-        };
-        let mut pane = Pane::new();
-        pane.open();
-        pane.holds.start(Hold {
-            slot: Slot::Agent(there),
+        let asked = ControlRequest::AnswerMenuText {
+            id: "answer-7".into(),
+            terminal: there,
             generation: Some(1),
-            menu_seal: None,
             seal: 4,
-            pick: Pick::Text {
-                key: "9".into(),
-                text: "not now".into(),
-            },
-            label: "your words".into(),
-            until: now,
-        });
-        assert!(pane.tick(&env));
-        let sends = pane.take();
-        let [asked @ ControlRequest::AnswerMenuText { .. }] = &sends.requests[..] else {
-            panic!("{sends:?}");
+            key: "9".into(),
+            text: "not now".into(),
         };
         let id = asked.request_id().to_string();
-        mux.control(asked.clone()).await.expect("sent");
+        mux.control(asked).await.expect("sent");
         let at_remote: ControlRequest =
             body_of(&remote_rx.try_recv().expect("the remote was asked"));
         assert!(
@@ -3197,13 +3125,6 @@ mod tests {
         };
         assert_eq!(back, &id, "the refusal is not under the answer's id");
         assert!(refused_as_old(reason), "{reason}");
-        assert!(pane.answered(&said, &env));
-        assert!(pane.take().is_empty(), "something was sent or typed");
-        let card = pane.view(&env, 80, 40).plain.join("\n");
-        assert!(
-            card.contains("qoop on devbox is too old for typed answers"),
-            "{card}"
-        );
         // Another failure is not taken for it.
         assert!(!refused_as_old("busy") && !refused_as_old("already_answered"));
     }

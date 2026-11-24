@@ -38,7 +38,10 @@ use crate::qass_page::ago;
 
 /// The smallest window the page draws its three lanes in, a card each; under it one lane at a
 /// time ([`Page::narrow`]), and the mouse rests.
-const NEED: (usize, usize) = (60, 14);
+const NEED: (usize, usize) = (
+    qoop_tui::qass_screen::BOARD_MIN_COLS,
+    qoop_tui::qass_screen::BOARD_MIN_ROWS,
+);
 /// The smallest it draws in at all: one lane as a list of keys and titles. The board beside the
 /// open column of a 60 column window has about 22 of them.
 const FLOOR: (usize, usize) = (20, 8);

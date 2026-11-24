@@ -4,7 +4,7 @@
 //! on next.
 //!
 //! The bands and the words under each item are the shared ones (`qoop_tui::board`), so the
-//! TUI's Board and this one list the same items in the same order. A board is read through the
+//! phone's Board and this one list the same items in the same order. A board is read through the
 //! mux: another computer's by `Via`, its answer in the interface's numbers, and a computer
 //! whose qoop is from before the board says so in words.
 
