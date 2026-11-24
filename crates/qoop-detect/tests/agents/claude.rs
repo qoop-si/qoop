@@ -252,6 +252,35 @@ fn the_trust_dialog_is_a_setup_gate() {
     assert_no_blocker("claude", &quoted);
 }
 
+/// The real screen of a tab started during a DNS outage (2.1.331): read as idle before, which
+/// left it there for days.
+#[test]
+fn a_startup_that_could_not_connect_is_a_setup_gate() {
+    let screen = [
+        "",
+        RULE,
+        "  Claude Code can't start this session yet",
+        "",
+        "  Claude Code couldn't reach Anthropic to load your organization's settings (could not connect).",
+        "",
+        "  Automatic retries have stopped. Choose Retry now to check again.",
+        "",
+        "  ❯ 1. Retry now",
+        "    2. Quit",
+        "",
+        "  Enter to confirm · Esc to cancel",
+    ];
+    assert_rule("claude", &screen, "startup_unreachable", Blocked);
+    assert!(verdict("claude", &screen).is_some_and(|v| v.setup_gate));
+    let quoted = idle_under(&[
+        "● It said Claude Code can't start this session yet, so I picked:",
+        "  1. Retry now",
+        "",
+    ]);
+    assert_not_rule("claude", &quoted, "startup_unreachable");
+    assert_no_blocker("claude", &quoted);
+}
+
 #[test]
 fn the_first_run_dialogs_are_setup_gates() {
     let screens: [&[&str]; 4] = [

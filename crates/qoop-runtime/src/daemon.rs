@@ -13394,7 +13394,9 @@ async fn terminal_task(
                         // The owner's standing pick (2026-10-19): an agent's "do you trust this
                         // folder" question is answered yes for the person, in any folder,
                         // since picking it by hand (and on a phone) is all it ever was. Keys
-                        // only when the menu and its pointer are both read off this screen.
+                        // only when the menu and its pointer are both read off this screen. A
+                        // startup that could not reach the network is answered Retry now the
+                        // same way: nothing else would ever take that tab on.
                         let accept = verdict.as_ref().and_then(|v| manifest.accept_of(&v.rule));
                         match accept {
                             Some(accept) if trust_tries < TRUST_TRIES => {
@@ -13414,7 +13416,7 @@ async fn terminal_task(
                                     trust_tries += 1;
                                     if keys == b"\r" {
                                         crate::say!(
-                                            "qoopd: tab {stream}: {program} asked to trust its folder; answered yes"
+                                            "qoopd: tab {stream}: {program} asked at startup; answered {accept}"
                                         );
                                     }
                                     let _ = writes.push(keys.into(), WritePriority::UserInput);

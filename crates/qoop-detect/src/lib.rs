@@ -566,8 +566,8 @@ impl Manifest {
     /// `skip_state_update` rule won, and those mean opposite things to a caller that falls
     /// back to idle on silence: no match is an agent with nothing on screen, a skip is a
     /// pager over the past that says the last reading still stands.
-    /// The option that trusts the folder on the gate `rule` names, when it is a folder trust
-    /// dialog the runtime answers for the person.
+    /// The option the runtime picks for the person on the setup gate `rule` names: trusting
+    /// the folder on a folder trust dialog, Retry now on a startup that could not connect.
     pub fn accept_of(&self, rule: &str) -> Option<&str> {
         self.rules
             .iter()
@@ -2478,6 +2478,17 @@ mod against_a_real_screen {
         // Once the pointer stands on the option, enter.
         let moved = lines(&["   No, exit", " \u{276f} Yes, I trust this folder"]);
         assert_eq!(keys(&moved, yes, false).as_deref(), Some(&b"\r"[..]));
+        // Retry now: the option row, not the sentence above it that names it.
+        let retry = rules_for("claude")
+            .and_then(|m| m.accept_of("startup_unreachable").map(str::to_string))
+            .expect("claude retries a startup that could not connect");
+        let stuck = lines(&[
+            "  Automatic retries have stopped. Choose Retry now to check again.",
+            "",
+            "  \u{276f} 1. Retry now",
+            "    2. Quit",
+        ]);
+        assert_eq!(keys(&stuck, &retry, false).as_deref(), Some(&b"\r"[..]));
         // Only a setup gate answers: a rule without an accept has none.
         assert!(rules_for("claude").is_some_and(|m| m.accept_of("first_run_dialog").is_none()));
     }
