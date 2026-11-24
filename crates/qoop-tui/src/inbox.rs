@@ -88,6 +88,13 @@ pub struct Item {
 }
 
 impl Item {
+    /// Whether going to this item opens the Inbox rather than the agent's pane: a card qass wrote
+    /// (it is answered in the Inbox, where the agent's pane cannot) or one about no agent. The
+    /// one rule `ctrl-a tab` goes by, in the terminal interface and the desktop alike.
+    pub fn opens_inbox(&self) -> bool {
+        self.terminal.is_none() || self.kind == ItemKind::Qass
+    }
+
     /// `t:<terminal>` or `c:<card>`: the key the fixture orders by.
     pub fn key(&self) -> String {
         match &self.slot {
@@ -491,6 +498,36 @@ mod tests {
     /// The design's records in every state give the list, count and sections the design draws.
     /// A terminal's wait is the oldest of its items, whatever mix of menu and card it has, and
     /// none for one that waits on nothing.
+    /// `ctrl-a tab` opens the Inbox for a card qass wrote and for one about no agent, and the
+    /// agent's pane for everything else.
+    #[test]
+    fn a_qass_card_or_one_about_no_agent_opens_the_inbox() {
+        let item = |kind, terminal| Item {
+            slot: Slot::Agent(1),
+            kind,
+            terminal,
+            since: None,
+            hand_to_qass: false,
+            lost: false,
+        };
+        assert!(
+            item(ItemKind::Qass, Some(4)).opens_inbox(),
+            "answered in the Inbox"
+        );
+        assert!(item(ItemKind::Plan, None).opens_inbox(), "about no agent");
+        for kind in [
+            ItemKind::Menu,
+            ItemKind::Reply,
+            ItemKind::Dialog,
+            ItemKind::Open,
+            ItemKind::Agent,
+            ItemKind::Plan,
+            ItemKind::Failed,
+        ] {
+            assert!(!item(kind, Some(4)).opens_inbox(), "{kind:?}");
+        }
+    }
+
     #[test]
     fn since_of_is_the_oldest_item_of_the_terminal() {
         let items = vec![
@@ -590,7 +627,14 @@ mod tests {
         let names: Vec<&str> = fixture.states.keys().map(String::as_str).collect();
         assert_eq!(
             names,
-            ["computer_lost", "first_run", "normal", "qass_stopped"]
+            [
+                "computer_lost",
+                "first_run",
+                "normal",
+                "older_remote_no_status",
+                "paused",
+                "qass_stopped"
+            ]
         );
         for (name, state) in &fixture.states {
             let inbox = built(state);

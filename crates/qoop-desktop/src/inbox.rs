@@ -159,7 +159,8 @@ impl Desk {
             _ => 0,
         };
         match list.next_after(here) {
-            Some(item) => match item.terminal.filter(|_| item.kind != ItemKind::Qass) {
+            // The one rule the terminal interface goes by too (`Item::opens_inbox`).
+            Some(item) => match item.terminal.filter(|_| !item.opens_inbox()) {
                 Some(terminal) => self.open(Page::Session(terminal), window, cx),
                 None => {
                     let (slot, at) = (item.slot.clone(), 0);

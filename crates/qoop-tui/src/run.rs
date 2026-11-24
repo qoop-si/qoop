@@ -1629,6 +1629,7 @@ impl State {
         let day = crate::inbox_pane::day_start(&mut self.ibx_day, now);
         self.ibx_ctx =
             crate::inbox_pane::context(&self.spaces, day, crate::mux::machines_without_menus());
+        self.ibx.unlisted = crate::mux::machines_unlisted();
         let env = ibx_env!(self);
         let list = self.ibx.inbox(&env);
         self.ibx_held = self.ibx.held_line(&env);
@@ -1651,7 +1652,7 @@ impl State {
             .chain(self.asks.ended.iter())
             .cloned()
             .collect();
-        self.refresh_ibx();
+        self.rows_changed_ibx();
     }
 
     /// The Inbox's list as it stands now: what needs the person.
@@ -3038,7 +3039,7 @@ impl State {
     /// Whether `terminal`'s pane in `tile` of `tree` keeps the reserved line under it: on a
     /// local agent's pane. Never on a shell, another machine's terminal or qass's tab, nor in
     /// a tile too small to spare the row. The line does not wait on the daemon's question
-    /// cards: the Inbox lists what needs the person from the rows alone. Every
+    /// cards: the Inbox lists what needs the person from the rows and the cards. Every
     /// agent pane has it whether or not anything is said there, sized by its own tile and
     /// never by the focus, so a question arriving or answered, or the keyboard moving, resizes
     /// nothing.
@@ -3115,10 +3116,17 @@ impl State {
             .collect()
     }
 
-    /// The area `tree`'s tab takes: the pane.
+    /// The area `tree`'s tab takes: the pane. The column the Inbox folded (or the ledger's) does
+    /// not count: the Inbox covers the terminals and sizes none of them, so opening and closing
+    /// it reflows nothing (ADR-007).
     fn tab_area(&self, _tree: &Layout) -> layout::Rect {
-        let (cols, rows) =
-            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        let (cols, rows) = screen::pane_size_for(
+            self.cols,
+            self.lines,
+            self.collapsed && !self.ibx.folded,
+            0,
+            self.sidebar_width,
+        );
         layout::Rect {
             x: 0,
             y: 0,
@@ -3142,16 +3150,21 @@ impl State {
 
     /// Whether qass sits at its prompt with nothing of his on it, as far as this client can
     /// tell: idle or done, no trust or question up, and no key sent to it for the daemon's
-    /// typed quiet (`TYPED_QUIET_SECS` in qoop-runtime's asks). What another client typed
-    /// stays unseen; a paste is never sent, so he sees it and can clear it.
+    /// typed quiet (`TYPED_QUIET_SECS` in qoop-runtime's asks), by this client's own keys or by
+    /// the daemon's record of the last person to type there (`typed_by`), whichever client it was.
     fn qass_at_rest(&self, qass: u32) -> bool {
+        let quiet = qoop_runtime::asks::TYPED_QUIET_SECS;
+        let now = sidebar::now_unix();
         self.rows.iter().any(|r| {
             r.terminal == qass
                 && matches!(r.state.as_str(), "idle" | "done")
                 && r.readiness == "ready"
-        }) && self.typed_at.get(&qass).is_none_or(|at| {
-            at.elapsed().as_secs() >= qoop_runtime::asks::TYPED_QUIET_SECS.unsigned_abs()
-        })
+                // What another client typed there is on its line too (the daemon's record).
+                && !r.typed_by.as_ref().is_some_and(|typed| now - typed.at < quiet)
+        }) && self
+            .typed_at
+            .get(&qass)
+            .is_none_or(|at| at.elapsed().as_secs() >= quiet.unsigned_abs())
     }
 
     /// The tab after the focused one, wrapping, within the space on screen.
@@ -3937,6 +3950,13 @@ fn follow_elsewhere(state: &mut State, space: i64, ask: ControlRequest) -> Contr
 /// ponytail: this machine's PATH even for a remote space; a missing agent there fails in
 /// its own shell, where a person sees why. Ask the remote when that proves annoying.
 fn installed_agents() -> Vec<crate::config::Launcher> {
+    // Never the owner's config or PATH under test: one agent, fixed.
+    if cfg!(test) {
+        return vec![crate::config::Launcher {
+            name: "claude".into(),
+            command: "claude".into(),
+        }];
+    }
     agents_on(
         crate::config::agents(),
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -7620,7 +7640,10 @@ where
 
         answer: None,
         ibx: crate::inbox_pane::Pane::new(),
-        hand: crate::answers::HandInput::default(),
+        hand: crate::answers::HandInput {
+            dir: crate::inbox_pane::hand_dir(),
+            ..Default::default()
+        },
         ibx_cards: Vec::new(),
         ibx_ctx: crate::inbox::Context::default(),
         ibx_held: None,
@@ -9974,21 +9997,23 @@ where
                             }
                             // The first of the next row's queue, the way a click on that row
                             // goes there. Standing on a finished agent reads it, so the next
-                            // press finds the one after: wants, then failed, then done.
+                            // press finds the one after: what the Inbox counts, oldest first.
+                            // A card qass wrote, or one about no agent, is answered in the Inbox.
                             Action::UpNext => {
                                 match state.up_next() {
-                                    Some(item) => match item.terminal {
-                                        Some(picked) => {
-                                            if let Some(bytes) = focus(
+                                    Some(item) if item.opens_inbox() => {
+                                        open_inbox(&mut state);
+                                        state.ibx.select(item.slot);
+                                    }
+                                    Some(item) => {
+                                        if let Some(picked) = item.terminal
+                                            && let Some(bytes) = focus(
                                                 &mut state, picked, &mut control_seq, &mut seqs,
-                                            )? {
-                                                wr.write_all(&bytes).await?;
-                                            }
+                                            )?
+                                        {
+                                            wr.write_all(&bytes).await?;
                                         }
-                                        // Something qass says that is about no agent: it is in
-                                        // the Inbox.
-                                        None => open_inbox(&mut state),
-                                    },
+                                    }
                                     None => {
                                         state.message = Some("nothing needs you".to_string());
                                     }
@@ -10964,6 +10989,16 @@ where
     if state.ibx.owes() {
         let _ = drain_inbox(&mut state, &mut seqs, &mut control_seq, &mut wr).await;
         let _ = wr.flush().await;
+        // The mux runs in this process and carries a remote's answer: it has left only once the
+        // far daemon answered, so that is waited for (bounded), not guessed.
+        settle_answers(
+            &mut state,
+            &mut rd,
+            &mut connection,
+            &mut inbuf,
+            EXIT_SETTLE,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
@@ -13153,6 +13188,20 @@ struct InboxKeys {
     requests: Vec<ControlRequest>,
 }
 
+impl InboxKeys {
+    /// Take in what a later part of the same read asked as well.
+    fn absorb(&mut self, more: InboxKeys) {
+        self.resize |= more.resize;
+        self.jump = self.jump.or(more.jump);
+        self.paste = self.paste.take().or(more.paste);
+        self.send_line |= more.send_line;
+        self.requests.extend(more.requests);
+        if let Some(feed) = more.feed {
+            self.feed.get_or_insert_with(Vec::new).extend(feed);
+        }
+    }
+}
+
 /// Show a place beside the Inbox over the pane and give it the keyboard, as the Inbox is
 /// opened: one thing has the keyboard at a time, and below 100 columns the agents column folds.
 /// `from_inbox`: putting the place away goes back to the Inbox.
@@ -13308,7 +13357,7 @@ fn place_out(state: &mut State, out: crate::places::PlaceOut, taken: &mut InboxK
 }
 
 /// The ask a retry of `machine` sends: a read of the schedules, carried to that machine through
-/// one of its spaces. The machine's number is in the id, so a refusal can say whose it was.
+/// one of its spaces. The machine's number is in the id; the answer to it is taken in silence.
 fn retry_request(space: i64, machine: usize, n: u64) -> ControlRequest {
     ControlRequest::Via {
         id: format!("{RETRY_ID}{machine}-{n}"),
@@ -13352,7 +13401,23 @@ fn inbox_out(state: &mut State, out: crate::inbox_pane::Out) -> InboxKeys {
 fn inbox_keys(state: &mut State, bytes: &[u8], prefix: u8) -> InboxKeys {
     let env = ibx_env!(state);
     let out = state.ibx.key(bytes, prefix, &env);
-    inbox_out(state, out)
+    let mut taken = inbox_out(state, out);
+    // What follows a command in the same read is not lost: the Inbox takes it up again while it
+    // still has the keyboard (a box that just opened reads the paste after the key that opened
+    // it), and what is left goes to the ordinary path once it does not (after a jump, the
+    // prefix or a detach), the brackets of a paste put back.
+    while state.ibx.has_rest() {
+        if !state.ibx.open || taken.jump.is_some() || taken.feed.is_some() {
+            let rest = state.ibx.take_rest();
+            taken.feed.get_or_insert_with(Vec::new).extend(rest);
+            break;
+        }
+        let env = ibx_env!(state);
+        let out = state.ibx.resume(prefix, &env);
+        let more = inbox_out(state, out);
+        taken.absorb(more);
+    }
+    taken
 }
 
 /// A press, a drag, a release or the wheel over the Inbox: its own, never the terminal's
@@ -13468,11 +13533,11 @@ async fn drain_beside(
         )?)
         .await?;
     }
-    // The board page `qoop qass` used to open above qass: the Inbox shows the board now, so one
-    // that is found is closed, once per terminal this interface has seen. Whenever an interface
+    // The board page `qoop qass` used to open above qass: the Inbox shows the board now, so the
+    // split it made is closed, once per terminal this interface has seen. Whenever an interface
     // finds one, not only on the first start: a sleeping old pane gets its page typed back on
-    // wake and is caught then.
-    for terminal in old_board_panes(&state.rows, &state.spaces) {
+    // wake and is caught then. Only that exact split: a board page the person opened is theirs.
+    for terminal in old_board_panes(&state.rows, &state.spaces, &state.split_seen) {
         if state.beside.closed_boards.insert(terminal) {
             // Unique per attempt: the daemon replays a repeated id without closing anything.
             state.beside.asked += 1;
@@ -13494,27 +13559,91 @@ async fn drain_beside(
     Ok(())
 }
 
+/// The most the interface waits, on its way out, for the answers it sent last.
+const EXIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// After the answers still on hold were sent on the way out: read until the daemon (or the mux,
+/// for another computer's) has answered each, at most `within`. An answer for a remote machine
+/// has not left this process before that.
+async fn settle_answers(
+    state: &mut State,
+    rd: &mut (impl AsyncReadExt + Unpin),
+    connection: &mut Connection,
+    inbuf: &mut BytesMut,
+    within: std::time::Duration,
+) {
+    let end = std::time::Instant::now() + within;
+    let mut read = vec![0u8; 64 * 1024];
+    while state.ibx.awaiting() {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(left, rd.read(&mut read)).await {
+            Ok(Ok(n)) if n > 0 => {
+                inbuf.extend_from_slice(&read[..n]);
+                let Ok(messages) = connection.drain(inbuf) else {
+                    return;
+                };
+                for message in messages {
+                    if let Incoming::Control(response) = message {
+                        let env = ibx_env!(state);
+                        state.ibx.answered(&response, &env);
+                    }
+                }
+            }
+            _ => return,
+        }
+    }
+}
+
 /// The prefix of the id an old board pane is closed under.
 const BOARD_CLOSE_ID: &str = "board-close-";
 
-/// The board page `qoop qass` opened above qass before the Board moved into the Inbox: a pane
-/// named `board` that runs no agent but qoop's own page (`program` is `qoop`), in the real qass
-/// space on this computer (the first so named, as the daemon finds it). A person's own pane that
-/// happens to be called `board`, a shell for one, or a space renamed `qass` is never taken for it.
-fn old_board_panes(rows: &[AgentRow], spaces: &[qoop_runtime::control::WorkspaceRow]) -> Vec<u32> {
+/// The board page `qoop qass` opened above qass before the Board moved into the Inbox: the
+/// exact split it made, qoop's own page (`program` is `qoop`) in a pane named `board`, on the
+/// left of a tab at 700 thousandths with qass's agent in the rest of it, in the real qass space
+/// on this computer (the first so named, as the daemon finds it). A pane the person opened
+/// themselves (`qoop task board --page` in a split or a tab of their own, even one called
+/// `board`), a shell, a space renamed `qass` or another computer's pane is never taken for it.
+fn old_board_panes(
+    rows: &[AgentRow],
+    spaces: &[qoop_runtime::control::WorkspaceRow],
+    splits: &[qoop_runtime::control::Pane],
+) -> Vec<u32> {
+    use qoop_runtime::control::{Pane, SplitDir};
     let Some(qass) = sidebar::qass_space(spaces).filter(|id| crate::mux::machine_of(*id) == 0)
     else {
         return Vec::new();
     };
-    rows.iter()
-        .filter(|r| {
-            !r.agent
-                && r.name.as_deref() == Some(qoop_runtime::idle::BOARD_PANE)
-                && r.program.as_deref() == Some("qoop")
-                && r.workspace == qass
-                && !crate::mux::is_remote_terminal(r.terminal)
+    let row = |t: u32| rows.iter().find(|r| r.terminal == t);
+    splits
+        .iter()
+        .filter_map(|tree| match tree {
+            Pane::Split {
+                dir: SplitDir::V,
+                permille: 700,
+                first,
+                second,
+                ..
+            } => match **first {
+                Pane::Leaf { terminal } => Some((terminal, second.leaves())),
+                _ => None,
+            },
+            _ => None,
         })
-        .map(|r| r.terminal)
+        .filter(|(board, rest)| {
+            row(*board).is_some_and(|r| {
+                !r.agent
+                    && r.name.as_deref() == Some(qoop_runtime::idle::BOARD_PANE)
+                    && r.program.as_deref() == Some("qoop")
+                    && r.workspace == qass
+                    && !crate::mux::is_remote_terminal(r.terminal)
+            }) && rest
+                .iter()
+                .any(|t| row(*t).is_some_and(|r| r.agent && r.workspace == qass))
+        })
+        .map(|(board, _)| board)
         .collect()
 }
 
@@ -22374,6 +22503,35 @@ mod tests {
         );
     }
 
+    /// Opening the Inbox or the ledger below 100 columns folds the agents column, and the
+    /// terminals under it are not sized for that: a card read or a schedule read (which size
+    /// the terminals) sends nothing while it is folded open, and nothing once it is put away.
+    #[test]
+    fn the_inbox_folding_the_column_sizes_no_terminal() {
+        let mut state = tiled_state();
+        state.cols = 90;
+        state.lines = 30;
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let before = (state.sized.clone(), sent(&seqs));
+        for ledger in [false, true] {
+            if ledger {
+                assert!(!ledger_toggle(&mut state));
+            } else {
+                open_inbox(&mut state);
+            }
+            assert!(state.ibx.folded && state.collapsed, "the column folded");
+            assert!(
+                size_terminals(&mut state, &mut seqs).unwrap().is_none(),
+                "a read sized the terminals under the Inbox"
+            );
+            assert_eq!((state.sized.clone(), sent(&seqs)), before);
+            assert!(close_inbox(&mut state), "the column unfolded");
+            assert!(size_terminals(&mut state, &mut seqs).unwrap().is_none());
+            assert_eq!((state.sized.clone(), sent(&seqs)), before);
+        }
+    }
+
     /// A tab not on screen, parked or in another space, is sized to the whole pane, the
     /// way it will be drawn when it comes back; a sleeping row has no process to size.
     #[test]
@@ -22384,7 +22542,7 @@ mod tests {
         state.rows.push(agent(5, 2, "claude", "sleeping"));
         let mut seqs = std::collections::BTreeMap::new();
         size_terminals(&mut state, &mut seqs).unwrap();
-        // Each an agent: the pane in its frame, less the rail it carries there.
+        // Each an agent: the pane in its frame, less the reserved line under it.
         let area = state.lone_rect(3);
         let whole = (area.cols as u16, area.rows as u16);
         assert_eq!(state.sized.get(&3), Some(&whole));
@@ -23764,6 +23922,18 @@ mod tests {
         state.space = Some(1);
         state.focused = 1;
         state
+    }
+
+    /// The daemon's tree of the split `qoop qass` made: the board on the left, qass's agent (5)
+    /// in the rest, at 700 thousandths.
+    fn qass_board_split(board: u32) -> qoop_runtime::control::Pane {
+        qoop_runtime::control::Pane::Split {
+            dir: qoop_runtime::control::SplitDir::V,
+            permille: 700,
+            questions: 0,
+            first: Box::new(qoop_runtime::control::Pane::Leaf { terminal: board }),
+            second: Box::new(qoop_runtime::control::Pane::Leaf { terminal: 5 }),
+        }
     }
 
     /// A second space a rename called `qass` is kept off the lists with its tabs, and qass
@@ -26851,27 +27021,28 @@ mod tests {
     #[test]
     fn only_qoops_own_board_page_in_the_real_qass_space_is_an_old_board_pane() {
         let mut s = qass_state();
-        assert_eq!(old_board_panes(&s.rows, &s.spaces), vec![4]);
+        s.split_seen.push(qass_board_split(4));
+        assert_eq!(old_board_panes(&s.rows, &s.spaces, &s.split_seen), vec![4]);
         // The same name on a person's shell (program zsh), in another space or on an agent.
         for r in s.rows.iter_mut().filter(|r| r.terminal != 4) {
             r.name = Some(qoop_runtime::idle::BOARD_PANE.into());
         }
         let elsewhere = s.rows.iter_mut().find(|r| r.terminal == 1).expect("a row");
         elsewhere.agent = false;
-        assert_eq!(old_board_panes(&s.rows, &s.spaces), vec![4]);
+        assert_eq!(old_board_panes(&s.rows, &s.spaces, &s.split_seen), vec![4]);
         // A person's own `board` shell in qass's space is never closed.
         let mut shell = agent(8, 9, "zsh", "idle");
         shell.agent = false;
         shell.name = Some(qoop_runtime::idle::BOARD_PANE.into());
         s.rows.push(shell);
-        assert_eq!(old_board_panes(&s.rows, &s.spaces), vec![4]);
+        assert_eq!(old_board_panes(&s.rows, &s.spaces, &s.split_seen), vec![4]);
         // A space renamed to qass is never touched: only the first so named is qass's.
         let mut renamed = agent(9, 11, "qoop", "idle");
         renamed.agent = false;
         renamed.name = Some(qoop_runtime::idle::BOARD_PANE.into());
         s.rows.push(renamed);
         s.spaces.push(space(11, "qass"));
-        assert_eq!(old_board_panes(&s.rows, &s.spaces), vec![4]);
+        assert_eq!(old_board_panes(&s.rows, &s.spaces, &s.split_seen), vec![4]);
         // On another computer it is none of ours.
         let board = s
             .rows
@@ -26879,7 +27050,131 @@ mod tests {
             .find(|r| r.terminal == 4)
             .expect("the board");
         board.workspace = (1 << 40) | 9;
-        assert!(old_board_panes(&s.rows, &s.spaces).is_empty());
+        assert!(old_board_panes(&s.rows, &s.spaces, &s.split_seen).is_empty());
+    }
+
+    /// On the way out the interface waits, at most a bound, for the daemon (or the mux, for
+    /// another computer's) to answer the answers it sent last, so one for a remote machine has
+    /// left the process: it returns once each is answered, and gives up at the bound.
+    #[tokio::test]
+    async fn leaving_waits_for_the_answers_sent_last() {
+        use tokio::io::AsyncWriteExt;
+        let mut s = inbox_state();
+        let hold = crate::answers::Hold {
+            slot: crate::answers::Slot::Card("Q9".into()),
+            generation: None,
+            menu_seal: None,
+            seal: 0,
+            pick: crate::answers::Pick::PutAway { card: "Q9".into() },
+            label: "Put away".into(),
+            until: std::time::Instant::now() + std::time::Duration::from_secs(3),
+        };
+        s.ibx.holds.start(hold);
+        let env = ibx_env!(s);
+        s.ibx.flush(&env);
+        assert!(s.ibx.awaiting(), "asked, not yet answered");
+        let id = match s.ibx.take().requests.as_slice() {
+            [ControlRequest::AskWrite { id, .. }] => id.clone(),
+            other => panic!("{other:?}"),
+        };
+        let (mut near, mut far) = tokio::io::duplex(4096);
+        let (mut connection, mut inbuf) = (Connection::new(), BytesMut::new());
+        // Nothing comes: it gives up at the bound, still waiting.
+        let began = std::time::Instant::now();
+        settle_answers(
+            &mut s,
+            &mut near,
+            &mut connection,
+            &mut inbuf,
+            std::time::Duration::from_millis(150),
+        )
+        .await;
+        assert!(began.elapsed() >= std::time::Duration::from_millis(140));
+        assert!(s.ibx.awaiting());
+        // The answer comes: it returns at once, well before the bound.
+        let body = serde_json::to_vec(&ControlResponse::Failed {
+            id,
+            reason: "no_such_card".into(),
+        })
+        .unwrap();
+        for frame in qoop_proto::chunk(
+            qoop_proto::Channel::Control,
+            0,
+            0,
+            None,
+            bytes::Bytes::from(body),
+        ) {
+            let mut buf = BytesMut::new();
+            frame.encode(&mut buf).unwrap();
+            far.write_all(&buf).await.unwrap();
+        }
+        let began = std::time::Instant::now();
+        settle_answers(
+            &mut s,
+            &mut near,
+            &mut connection,
+            &mut inbuf,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(began.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!s.ibx.awaiting(), "answered");
+    }
+
+    /// What follows a command in the same read reaches the right place: after a jump or the
+    /// prefix it is for the ordinary path with the paste's brackets put back, and after the key
+    /// that opens the new agent box the box reads the paste, never a terminal.
+    #[test]
+    fn what_follows_a_command_in_one_read_is_fed_on_or_read_by_the_box() {
+        let pasted = b"\x1b[200~fix it\x1b[201~".to_vec();
+        let mut s = inbox_state();
+        open_inbox(&mut s);
+        let taken = inbox_keys(&mut s, &[b"g".as_slice(), &pasted].concat(), 1);
+        assert!(taken.jump.is_some(), "g went to the agent");
+        assert_eq!(taken.feed, Some(pasted.clone()), "the paste follows it");
+        assert!(!s.ibx.has_rest());
+        let mut s = inbox_state();
+        open_inbox(&mut s);
+        let taken = inbox_keys(&mut s, &[&[1u8][..], &pasted].concat(), 1);
+        assert_eq!(
+            taken.feed,
+            Some([&[1u8][..], &pasted].concat()),
+            "prefix and paste, in order"
+        );
+        // `n` opens the box and the paste after it is its text: nothing is fed to a terminal.
+        let mut s = inbox_state();
+        open_inbox(&mut s);
+        let taken = inbox_keys(&mut s, &[b"n".as_slice(), &pasted].concat(), 1);
+        assert!(taken.feed.is_none() && taken.jump.is_none(), "{taken:?}");
+        assert!(matches!(s.ibx.place, Some(crate::places::Place::New(_))));
+        assert!(!s.ibx.has_rest());
+    }
+
+    /// A board page the person opened themselves stays: in qass's space, named `board`, running
+    /// `qoop`, alone in its tab or in a split of their own (any ratio but the one qass made, or
+    /// beside something other than qass's agent), and not closed by any interface.
+    #[tokio::test]
+    async fn a_board_page_the_person_opened_is_never_closed() {
+        let mut s = qass_state();
+        let (mut control, mut wire) = (0, Vec::new());
+        // Alone in its tab: no tree at all.
+        drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
+        assert!(wire.is_empty(), "{:?}", String::from_utf8_lossy(&wire));
+        // In a split of their own: another ratio, or stacked, or beside a shell.
+        let split = |dir, permille, rest: u32| qoop_runtime::control::Pane::Split {
+            dir,
+            permille,
+            questions: 0,
+            first: Box::new(qoop_runtime::control::Pane::Leaf { terminal: 4 }),
+            second: Box::new(qoop_runtime::control::Pane::Leaf { terminal: rest }),
+        };
+        let mut shell = agent(7, 9, "zsh", "idle");
+        shell.agent = false;
+        s.rows.push(shell);
+        use qoop_runtime::control::SplitDir::{H, V};
+        s.split_seen = vec![split(V, 500, 5), split(H, 700, 5), split(V, 700, 7)];
+        drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
+        assert!(wire.is_empty(), "{:?}", String::from_utf8_lossy(&wire));
     }
 
     /// The migration: an interface that finds the old board page closes it, once per terminal,
@@ -26887,6 +27182,7 @@ mod tests {
     #[tokio::test]
     async fn the_first_list_closes_an_old_board_pane_once() {
         let mut s = qass_state();
+        s.split_seen.push(qass_board_split(4));
         let (mut control, mut wire) = (0, Vec::new());
         drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
         let said = String::from_utf8_lossy(&wire).to_string();
@@ -26907,6 +27203,7 @@ mod tests {
         again.agent = false;
         again.name = Some(qoop_runtime::idle::BOARD_PANE.into());
         s.rows.push(again);
+        s.split_seen.push(qass_board_split(6));
         drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
         let said = String::from_utf8_lossy(&wire).to_string();
         assert!(said.contains("board-close-6-2"), "{said}");

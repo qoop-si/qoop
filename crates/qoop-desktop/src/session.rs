@@ -659,7 +659,7 @@ impl Desk {
         });
         div()
             .flex_none()
-            .h(px(36.))
+            .min_h(px(36.))
             .flex()
             .items_center()
             .gap(px(4.))
@@ -681,6 +681,7 @@ impl Desk {
                     .aria_label("Tabs")
                     .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(4.))
                     .children(tabs.into_iter().map(|tab| {
@@ -689,10 +690,11 @@ impl Desk {
                         let title = state::title_of(tab);
                         ui::control(("tab", terminal as u64), Role::Tab, title.clone(), t)
                             .aria_selected(on)
+                            .debug_selector(move || format!("tab-title-{terminal}"))
                             .flex()
                             .items_center()
                             .gap(px(7.))
-                            .h(px(30.))
+                            .min_h(px(30.))
                             .max_w(px(220.))
                             .px(px(10.))
                             .rounded(px(9.))
@@ -702,12 +704,8 @@ impl Desk {
                             .hover(|s| ui::paint(s, t.hover()))
                             .child(ui::mark(self.shown_kind(state::Entry::Live(tab)), t, 10.))
                             .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(title),
+                                // Whole: a long title wraps, never cut.
+                                div().min_w_0().child(title),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open(Page::Session(terminal), window, cx)
@@ -1330,9 +1328,6 @@ impl Desk {
                                         div()
                                             .flex_1()
                                             .min_w_0()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
                                             .font_family(MONO_FONT)
                                             .text_size(px(12.))
                                             .child(file.path.clone()),

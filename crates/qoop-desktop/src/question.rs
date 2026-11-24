@@ -71,7 +71,7 @@ impl Desk {
         }
     }
 
-    /// Why "Let qass handle it" cannot be pressed for `row`, or `None` when it can: the one rule
+    /// Why "Hand to qass" cannot be pressed for `row`, or `None` when it can: the one rule
     /// (`Model::qass_reason`), This Mac's qass taking remote agents' questions too.
     pub fn qass_reason(&self, row: &AgentRow) -> Option<String> {
         self.model.qass_reason(row)
@@ -81,7 +81,12 @@ impl Desk {
     /// the first time a remote row or a hand needs it.
     fn hand_id(&mut self) -> Option<String> {
         if self.model.hand.hand_id.is_none() {
-            self.model.hand.hand_id = qoop_runtime::paths::hand_id().ok();
+            self.model.hand.hand_id = self
+                .model
+                .hand
+                .dir
+                .as_deref()
+                .and_then(|dir| qoop_runtime::paths::hand_id_in(dir).ok());
         }
         self.model.hand.hand_id.clone()
     }
@@ -259,19 +264,32 @@ impl Desk {
     }
 
     /// Send the picks whose hold is up.
+    ///
+    /// Looked at again first, and held while the rows are from before the connection dropped: a
+    /// terminal number may be another agent's after a restart or a reconnect, and a pick is
+    /// sent only against a list that has come since and been checked.
     pub(crate) fn fire(&mut self) {
+        self.drop_stale_holds();
+        if !self.fresh {
+            return;
+        }
         let due = self.holds.due(Instant::now());
         self.send(due);
     }
 
     /// Send what is on hold now, Undo or not: the window is closing.
     pub fn flush_holds(&mut self) {
+        self.drop_stale_holds();
         let all = self.holds.flush();
         self.send(all);
     }
 
     /// Send now: `slot`'s pick (or the newest one, with every pick held with it) goes at once.
     pub(crate) fn send_now(&mut self, slot: Option<&Slot>, cx: &mut Context<Self>) {
+        self.drop_stale_holds();
+        if !self.fresh {
+            return;
+        }
         let taken = self.holds.send_now(slot);
         if !taken.is_empty() {
             self.send(taken);
@@ -345,8 +363,12 @@ impl Desk {
         let typed = self
             .typed_at
             .get(&terminal)
-            .is_some_and(|at| began.is_none_or(|b| *at > b));
+            .is_some_and(|at| began.is_none_or(|b| *at > b))
+            // Or by any other client: the daemon records the last person to type there.
+            || hold.typed_since(self.model.row(terminal), Instant::now(), crate::app::unix_now());
+        // Rows from before the connection dropped may name another agent by this number.
         let away = !self.connected
+            || !self.fresh
             || self
                 .model
                 .row(terminal)
@@ -454,6 +476,20 @@ impl Desk {
         self.ask(request);
         let slot = hold.slot.clone();
         self.said.insert(slot, Said::Sending { id, hold, retried });
+    }
+
+    /// The link dropped: an answer asked and not yet answered will not be, by this connection.
+    /// Its card says so instead of "Sending" for good.
+    pub(crate) fn sending_dropped(&mut self) {
+        for said in self.said.values_mut() {
+            if matches!(said, Said::Sending { .. }) {
+                *said = Said::Refused(
+                    "The connection dropped before this was confirmed. Look at the agent to \
+                     see whether it arrived."
+                        .into(),
+                );
+            }
+        }
     }
 
     /// The picks a sending answer was asked under `id`, with their holds.
@@ -576,10 +612,13 @@ impl Desk {
         true
     }
 
-    /// After a new agent list: a pick whose menu changed or went is dropped, and the card says
-    /// who answered; the digits of a new menu wait out their arming.
-    pub(crate) fn menus_changed(&mut self, cx: &Context<Self>) {
-        let dropped = self.holds.menus(&self.model.rows, Instant::now());
+    /// Drop the picks that no longer stand: a menu that changed or went, a card that is no
+    /// longer open, a computer that is not reached. The card says why. Run on every list and
+    /// card read, and again right before anything is sent.
+    pub(crate) fn drop_stale_holds(&mut self) {
+        let mut dropped = self.holds.menus(&self.model.rows, Instant::now());
+        let lost = qoop_tui::inbox_pane::lost_machines(&self.model.spaces);
+        dropped.extend(self.holds.stale(&self.cards(), &lost));
         for hold in dropped {
             // The person's own words are never lost to an agent that moved on: they wait as the
             // card's draft, and the card says so.
@@ -589,16 +628,28 @@ impl Desk {
                     .insert(hold.slot.clone(), Said::Refused(MOVED_ON.into()));
                 continue;
             }
-            let by = hold
-                .terminal()
-                .and_then(|t| self.model.row(t))
-                .and_then(|r| r.answered.as_ref())
-                .map(|a| format!("Answered on the {}: {}.", by_word(&a.by), a.label));
-            let said = by.unwrap_or_else(|| {
-                state::refusal_words("already_answered", "This Mac", &hold.pick)
-            });
+            let said = match &hold.slot {
+                Slot::Card(_) => "This card is no longer open, so nothing was sent.".to_string(),
+                Slot::Agent(t) if lost.contains(&qoop_tui::mux::machine_of_terminal(*t)) => {
+                    "That computer is not reached, so nothing was sent.".to_string()
+                }
+                Slot::Agent(t) => self
+                    .model
+                    .row(*t)
+                    .and_then(|r| r.answered.as_ref())
+                    .map(|a| format!("Answered on the {}: {}.", by_word(&a.by), a.label))
+                    .unwrap_or_else(|| {
+                        state::refusal_words("already_answered", "This Mac", &hold.pick)
+                    }),
+            };
             self.said.insert(hold.slot.clone(), Said::Refused(said));
         }
+    }
+
+    /// After a new agent list: a pick whose menu changed or went is dropped, and the card says
+    /// who answered; the digits of a new menu wait out their arming.
+    pub(crate) fn menus_changed(&mut self, cx: &Context<Self>) {
+        self.drop_stale_holds();
         // An answer field for an agent that no longer asks closes; for a card, once the card
         // is no longer open.
         let gone = self.own.as_ref().is_some_and(|own| match &own.card {

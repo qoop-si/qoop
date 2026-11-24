@@ -275,7 +275,8 @@ pub fn hand_id() -> std::io::Result<String> {
     hand_id_in(&dir)
 }
 
-fn hand_id_in(dir: &Path) -> std::io::Result<String> {
+/// [`hand_id`] in the folder `dir`.
+pub fn hand_id_in(dir: &Path) -> std::io::Result<String> {
     let file = dir.join(HAND_ID_FILE);
     if let Ok(id) = std::fs::read_to_string(&file)
         && !id.trim().is_empty()

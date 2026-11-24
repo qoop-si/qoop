@@ -224,6 +224,10 @@ pub struct Desk {
     pub(crate) qoop_missing: bool,
     /// The agent list came at least once: before it, the Inbox and the sidebar draw skeletons.
     pub(crate) listed: bool,
+    /// The rows are this connection's: a fresh list has come since it began and was checked
+    /// against what is held. False from a drop on, so a pick is never sent by a number that
+    /// may be another agent's after a restart or a reconnect.
+    pub(crate) fresh: bool,
     /// The schedules page: machine, runs, day, the report open, the sheet.
     pub schedule_page: crate::schedules::SchedulePage,
     /// The person's `config.toml`: the prefix byte and the theme (auto follows the system).
@@ -295,19 +299,38 @@ impl Desk {
             }
         }
         let theme_pref = config.config.theme;
-        // This Mac's hand id, read here and not made: another Mac's hand is told apart from this
-        // Mac's own from the first list on. The shared hand rules make the file once a remote
-        // row or a hand needs it, as the terminal interface does.
-        let hand_id = qoop_runtime::paths::qass_data_dir()
+        // The owner's own files, read from a run and never from a test (a test points the window
+        // at its own): This Mac's hand id is read here and not made, so another Mac's hand is
+        // told apart from this Mac's own from the first list on; the shared hand rules make the
+        // file once a remote row or a hand needs it, as the terminal interface does.
+        let owner = !cfg!(test);
+        let hand_dir = owner.then(qoop_runtime::paths::qass_data_dir).flatten();
+        let hand_id = hand_dir
+            .as_ref()
             .and_then(|dir| {
                 std::fs::read_to_string(dir.join(qoop_runtime::paths::HAND_ID_FILE)).ok()
             })
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty());
+        let nowhere = std::path::PathBuf::from("/nonexistent/qoop");
+        let (lessons_path, config_path, pet_path) = if owner {
+            (
+                qoop_runtime::paths::qass_config_dir().join("lessons.md"),
+                qoop_tui::config::path(),
+                qoop_runtime::avatar::avatar_path(),
+            )
+        } else {
+            (
+                nowhere.join("lessons.md"),
+                nowhere.join("config.toml"),
+                nowhere.join("avatar.json"),
+            )
+        };
         Desk {
             model: Model {
                 hand: qoop_tui::answers::HandInput {
                     hand_id,
+                    dir: hand_dir,
                     ..Default::default()
                 },
                 ..Model::default()
@@ -367,9 +390,9 @@ impl Desk {
             watch_open: false,
             ticking: false,
             schedule_page: Default::default(),
-            lessons_path: qoop_runtime::paths::qass_config_dir().join("lessons.md"),
-            config_path: qoop_tui::config::path(),
-            pet_path: qoop_runtime::avatar::avatar_path(),
+            lessons_path,
+            config_path,
+            pet_path,
             settings: Default::default(),
             qass_starting_until: None,
             reach: state::Reach::default(),
@@ -383,6 +406,7 @@ impl Desk {
             pinged: HashMap::new(),
             drawn_states: Vec::new(),
             listed: false,
+            fresh: false,
             qoop_missing: state::qoop_bin().is_none(),
             prefix: config.config.prefix,
             theme_pref,
@@ -401,7 +425,7 @@ impl Desk {
             look: None,
             now: unix_now(),
             zone: qoop_runtime::schedule::system_zone(),
-            my_pet: qoop_runtime::avatar::load(),
+            my_pet: owner.then(qoop_runtime::avatar::load).flatten(),
             cells: cells(cx, 12.),
             offers: state::worktree_agents(&offered),
             agent_names: qoop_tui::schedules::agents(&config.agents, &config.qass_agent),
@@ -440,6 +464,7 @@ impl Desk {
         match down {
             Down::Connected => {
                 self.connected = true;
+                self.fresh = false;
                 self.lost_at = None;
                 self.qoop_said = None;
                 self.reach.forget_links();
@@ -461,6 +486,8 @@ impl Desk {
                     self.lost_at = Some(self.now);
                 }
                 self.connected = false;
+                self.fresh = false;
+                self.sending_dropped();
             }
             Down::Screens => {
                 let mut screens =
@@ -550,6 +577,7 @@ impl Desk {
                 self.answered_elsewhere(&before);
                 self.rows_changed();
                 self.menus_changed(cx);
+                self.fresh = true;
                 // qass started or woke while its page is open: its terminal comes on.
                 if self.qass_terminal().is_some() {
                     self.qass_starting_until = None;
@@ -993,10 +1021,13 @@ impl Desk {
         }
         // The Board has no cards to answer: its digits are the person's own.
         let on_inbox = self.page == Page::Inbox && !self.board.open;
-        // `u` belongs to Undo while anything is on hold, wherever its line shows (card, Inbox):
-        // the focused card's pick, else the newest. It never reaches the terminal then.
-        if keys::typed(k) == "u" && !self.holds.held.is_empty() {
-            let focused = if on_inbox {
+        // `u` is Undo on the Inbox while anything is on hold (the focused card's pick, else the
+        // newest), and on an agent's page, the terminal focused or not, only while a pick for that
+        // agent is held and the menu it was made on is still up (a card's: while the card is
+        // open). Once the menu is gone it is a letter for the terminal again, and anywhere else it
+        // is one too: `ls -lu` never undoes anything.
+        if keys::typed(k) == "u" {
+            let slot = if self.page == Page::Inbox {
                 let list = self.inbox();
                 let items: Vec<_> = list
                     .items
@@ -1004,13 +1035,37 @@ impl Desk {
                     .filter(|i| self.inbox_filter_holds(i))
                     .collect();
                 self.cursor_slot(&items)
+                    .filter(|slot| self.holds.of(slot).is_some())
+                    .map(Some)
+                    .or_else(|| (!self.holds.held.is_empty()).then_some(None))
+            } else if let Page::Session(terminal) = self.page {
+                let asks = &self.asks;
+                let menu_seal = self
+                    .model
+                    .row(terminal)
+                    .and_then(|r| r.menu.as_ref())
+                    .map(|m| m.seal);
+                self.holds
+                    .held
+                    .iter()
+                    .rev()
+                    .find(|h| match &h.slot {
+                        state::Slot::Agent(t) => {
+                            *t == terminal && h.seal != 0 && menu_seal == Some(h.seal)
+                        }
+                        state::Slot::Card(id) => asks.iter().any(|a| {
+                            a.card == *id && a.terminal == Some(terminal) && a.status == "open"
+                        }),
+                    })
+                    .map(|h| Some(h.slot.clone()))
             } else {
-                self.card_offers().map(|(t, ..)| state::Slot::Agent(t))
+                None
             };
-            let slot = focused.filter(|slot| self.holds.of(slot).is_some());
-            self.undo(slot.as_ref(), cx);
-            cx.stop_propagation();
-            return;
+            if let Some(slot) = slot {
+                self.undo(slot.as_ref(), cx);
+                cx.stop_propagation();
+                return;
+            }
         }
         let digit = match keys::typed(k) {
             d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {

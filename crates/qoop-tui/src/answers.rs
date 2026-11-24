@@ -29,13 +29,18 @@ impl Kind {
         if row.state == status::SLEEPING || row.slept_at_unix.is_some() {
             return Kind::Sleeping;
         }
-        // An older daemon sends no status: shown as unsure rather than worked out here.
-        Kind::Status(
-            row.status
-                .as_deref()
-                .and_then(Status::from_token)
-                .unwrap_or(Status::Unknown),
-        )
+        Kind::Status(match row.status.as_deref() {
+            Some(token) => Status::from_token(token).unwrap_or(Status::Unknown),
+            // A daemon before 0.15.0 sends no status. Only what needs a person is read from its
+            // raw state (as the field's doc says, and the notch does); the rest is unsure.
+            // Only an agent's: a shell that fails is no agent that needs you.
+            None if row.agent => match row.state.as_str() {
+                "blocked" => Status::Blocked,
+                "failed" => Status::Failed,
+                _ => Status::Unknown,
+            },
+            None => Status::Unknown,
+        })
     }
 
     pub fn needs_you(self) -> bool {
@@ -181,6 +186,18 @@ pub struct Hold {
 }
 
 impl Hold {
+    /// Whether anybody typed into `row`'s terminal since this hold began, by the daemon's record
+    /// of the last person to type there (`typed_by`), whichever client it was: what a reply or a
+    /// line is typed into is theirs then. `now` and `now_unix` are the same moment.
+    pub fn typed_since(&self, row: Option<&AgentRow>, now: Instant, now_unix: i64) -> bool {
+        let held = (now + HOLD).saturating_duration_since(self.until);
+        // Rounded down a second: the daemon's stamp is a whole second, and one typed in the
+        // second the hold began may have come after it.
+        let began = now_unix - held.as_secs() as i64 - 1;
+        row.and_then(|r| r.typed_by.as_ref())
+            .is_some_and(|typed| typed.at >= began)
+    }
+
     /// The agent's terminal, for a pick on its menu.
     pub fn terminal(&self) -> Option<u32> {
         match self.slot {
@@ -255,6 +272,25 @@ impl Holds {
         dropped
     }
 
+    /// The picks that no longer stand, dropped and returned: a card's pick once its card is no
+    /// longer `open` (another client answered it, or the phone's answer is queued: putting it
+    /// away then would close a card whose answer is on its way), and an agent's pick on a
+    /// machine that is not reached (what the link last said of its rows is old). A card the
+    /// read does not list is kept: nothing says it left.
+    pub fn stale(&mut self, cards: &[AskInfo], lost: &BTreeSet<usize>) -> Vec<Hold> {
+        let (kept, dropped): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|h| match &h.slot {
+                Slot::Card(id) => cards
+                    .iter()
+                    .find(|c| c.card == *id)
+                    .is_none_or(|c| c.status == "open"),
+                Slot::Agent(t) => !lost.contains(&crate::mux::machine_of_terminal(*t)),
+            });
+        self.held = kept;
+        dropped
+    }
+
     /// Whether the menu of `terminal` with text seal `seal` and turn seal `menu_seal` takes a
     /// digit yet.
     pub fn armed(&self, terminal: u32, seal: u64, menu_seal: Option<u64>, now: Instant) -> bool {
@@ -290,18 +326,16 @@ impl Holds {
         !self.send_now(slot).is_empty()
     }
 
-    /// Undo the hand-off to qass: every agent held to be handed over, nothing else.
-    pub fn undo_hand_off(&mut self) -> bool {
-        let before = self.held.len();
-        self.held.retain(|h| h.pick != Pick::Qass);
-        self.held.len() != before
-    }
-
     /// The picks whose hold is up, taken out to be sent.
     pub fn due(&mut self, now: Instant) -> Vec<Hold> {
+        self.due_where(now, |_| true)
+    }
+
+    /// The picks whose hold is up and that `ready` lets go: the others stay held.
+    pub fn due_where(&mut self, now: Instant, ready: impl Fn(&Hold) -> bool) -> Vec<Hold> {
         let (due, kept): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.held)
             .into_iter()
-            .partition(|h| h.until <= now);
+            .partition(|h| h.until <= now && ready(h));
         self.held = kept;
         due
     }
@@ -342,6 +376,10 @@ pub struct HandInput {
     pub carded: Vec<String>,
     /// This Mac's hand id (`paths::hand_id`), once known.
     pub hand_id: Option<String>,
+    /// The folder the hand id is read from and made in (qass's data folder): none under test, so
+    /// a test never makes the owner's file.
+    #[serde(skip)]
+    pub dir: Option<std::path::PathBuf>,
     /// Each other machine's name as a person gives it, by its number: what keys a remote
     /// agent (`staging/T2`).
     pub machines: BTreeMap<usize, String>,
@@ -971,18 +1009,96 @@ mod tests {
         holds.start(held(3, 9, t0 + HOLD));
         assert_eq!(holds.flush().len(), 2, "closing sends both at once");
         assert!(holds.held.is_empty());
+    }
 
-        // The hand-off's own Undo takes back the hand-off, not a single answer held later.
-        let hand = |terminal| Hold {
-            pick: Pick::Qass,
-            ..held(terminal, 0, t0 + HOLD)
+    /// A row with no status is read from its raw state only for an agent: a shell that failed or
+    /// blocks is no agent that needs the person.
+    #[test]
+    fn the_raw_state_fallback_is_for_agents_only() {
+        let mut r = row(4, 1, "blocked");
+        r.status = None;
+        assert_eq!(Kind::of(&r), Kind::Status(Status::Blocked));
+        r.state = "failed".into();
+        assert_eq!(Kind::of(&r), Kind::Status(Status::Failed));
+        r.agent = false;
+        assert_eq!(Kind::of(&r), Kind::Status(Status::Unknown));
+    }
+
+    /// A card's pick is dropped once its card is no longer `open` (the phone answered it, so it
+    /// is queued), and an agent's pick once its machine is not reached. A card the read does not
+    /// list is kept.
+    #[test]
+    fn a_pick_on_a_card_that_left_open_or_a_lost_machine_is_dropped() {
+        let t0 = Instant::now();
+        let card = |id: &str, status: &str| -> AskInfo {
+            serde_json::from_value(serde_json::json!({
+                "card": id, "status": status, "opened_at": 1,
+                "body": {"handle": "h", "urgency": "later", "doing": "d", "why": "w",
+                         "asks": "a", "options": []},
+            }))
+            .expect("card")
         };
-        holds.start(hand(4));
-        holds.start(hand(5));
-        holds.start(held(2, 8, t0 + HOLD + Duration::from_secs(1)));
-        assert!(holds.undo_hand_off());
-        let left: Vec<Option<u32>> = holds.held.iter().map(Hold::terminal).collect();
-        assert_eq!(left, [Some(2)]);
+        let slot = |id: &str| Slot::Card(id.into());
+        let put_away = |id: &str| Hold {
+            slot: slot(id),
+            pick: Pick::PutAway { card: id.into() },
+            ..held(0, 0, t0 + HOLD)
+        };
+        let remote = 0x8100_0002u32;
+        let mut holds = Holds::default();
+        for id in ["Q1", "Q2", "Q3"] {
+            holds.start(put_away(id));
+        }
+        holds.start(held(remote, 7, t0 + HOLD));
+        holds.start(held(2, 7, t0 + HOLD));
+        let cards = [card("Q1", "open"), card("Q2", "queued")];
+        let lost = BTreeSet::from([crate::mux::machine_of_terminal(remote)]);
+        let dropped = holds.stale(&cards, &lost);
+        let gone: Vec<Slot> = dropped.into_iter().map(|h| h.slot).collect();
+        assert_eq!(gone, [slot("Q2"), Slot::Agent(remote)]);
+        let left: Vec<Slot> = holds.held.iter().map(|h| h.slot.clone()).collect();
+        assert_eq!(left, [slot("Q1"), slot("Q3"), Slot::Agent(2)]);
+        for status in ["passed", "answered", "closed"] {
+            let mut holds = Holds::default();
+            holds.start(put_away("Q1"));
+            assert_eq!(
+                holds.stale(&[card("Q1", status)], &BTreeSet::new()).len(),
+                1
+            );
+        }
+    }
+
+    /// A reply is not typed into a terminal somebody typed in since the hold began, whichever
+    /// client it was: the daemon's `typed_by` says.
+    #[test]
+    fn typing_after_the_hold_began_is_seen_in_the_rows_record() {
+        let t0 = Instant::now();
+        let mut r = row(4, 1, "blocked");
+        let hold = held(4, 0, t0 + HOLD);
+        // The hold began at unix 1000 (3 s before t0 + HOLD is due, seen from t0 at 1000).
+        assert!(!hold.typed_since(Some(&r), t0, 1000), "nobody typed");
+        r.typed_by = Some(qoop_runtime::control::TypedBy {
+            kind: "phone".into(),
+            at: 990,
+        });
+        assert!(!hold.typed_since(Some(&r), t0, 1000), "before the hold");
+        // The daemon's stamp is a whole second: one a second before the hold may be after it.
+        for (at, after) in [(998, false), (999, true)] {
+            r.typed_by = Some(qoop_runtime::control::TypedBy {
+                kind: "phone".into(),
+                at,
+            });
+            assert_eq!(hold.typed_since(Some(&r), t0, 1000), after, "at {at}");
+        }
+        r.typed_by = Some(qoop_runtime::control::TypedBy {
+            kind: "phone".into(),
+            at: 1002,
+        });
+        assert!(
+            hold.typed_since(Some(&r), t0 + Duration::from_secs(2), 1002),
+            "after it"
+        );
+        assert!(!hold.typed_since(None, t0, 1000), "no row, nobody");
     }
 
     /// The same question asked again has the same text seal and a new turn: the answer held
