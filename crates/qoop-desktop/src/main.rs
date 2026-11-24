@@ -8,8 +8,6 @@ mod bench;
 #[cfg(target_os = "macos")]
 mod board;
 #[cfg(target_os = "macos")]
-mod chat;
-#[cfg(target_os = "macos")]
 mod element;
 #[cfg(target_os = "macos")]
 mod field;

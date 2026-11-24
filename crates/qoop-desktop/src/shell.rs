@@ -271,6 +271,15 @@ impl Desk {
             })
     }
 
+    /// Whether the sidebar's link to `page` is the page on screen: qass's is on its agent page too.
+    pub(crate) fn nav_on(&self, page: Page) -> bool {
+        self.page == page
+            || (page == Page::Qass
+                && self
+                    .qass_terminal()
+                    .is_some_and(|q| self.page == Page::Session(q)))
+    }
+
     /// The sidebar: where qoop opens (Inbox, qass, settings, a new agent), the spaces folded to
     /// what waits and the agent on screen, and the computers pinned under the list.
     pub(crate) fn sidebar(
@@ -287,7 +296,7 @@ impl Desk {
                    badge: usize,
                    note: Option<String>,
                    cx: &mut Context<Self>| {
-            let on = self.page == page;
+            let on = self.nav_on(page);
             let said = match badge {
                 0 => label.to_string(),
                 n => format!("{label}, {n} waiting"),

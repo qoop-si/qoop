@@ -1,7 +1,8 @@
 //! d-settings, This Mac: every key of `config.toml` as a switch, a choice or a value, each
 //! written at once with `qoop_tui::config::set` (comments and keys it does not know are kept,
 //! a value it refuses never reaches the file) and confirmed in place; the file itself, read
-//! only, beside them; the pet, and six new ones to pick from.
+//! only, beside them; what qass watches, with its switches; the pet, and six new ones to pick
+//! from; and a link to Schedules.
 
 use std::path::PathBuf;
 
@@ -10,7 +11,7 @@ use qoop_runtime::avatar::{self, Avatar};
 use qoop_runtime::control::{ControlRequest, ControlResponse};
 use qoop_tui::config::Read;
 
-use crate::app::Desk;
+use crate::app::{Desk, Page};
 use crate::field::Field;
 use crate::link;
 use crate::state::{self, SETTINGS, Setting, SettingKind};
@@ -253,6 +254,13 @@ impl Desk {
                             .child("a change is written as you make it"),
                     )
                     .child(div().flex_1())
+                    .child(
+                        ui::link_button("nav-schedules", "Schedules", t)
+                            .debug_selector(|| "nav-schedules".to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open(Page::Schedules, window, cx)
+                            })),
+                    )
                     .child(ui::kbd("/", t))
                     .child(
                         ui::pill("open-config", "Open in your editor", t)
@@ -361,6 +369,7 @@ impl Desk {
                                         })),
                                 )
                             })
+                            .child(self.watch_card(self.model.qass_watch != Some(false), t, cx))
                             .child(self.pet_panel(t, cx)),
                     ))
                     .child(self.file_view(read)),

@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use qoop_domain::status::{self, Status};
 use qoop_runtime::control::{
-    AgentRow, AskInfo, ItemCardInfo, LinkState, Pane, QassAct, ScheduleInfo, ScheduleRun,
+    AgentMenu, AgentRow, AskInfo, ItemCardInfo, LinkState, Pane, ScheduleInfo, ScheduleRun,
     SleepingTab, StepInfo, TaskEventInfo, TaskInfo, TerminalStream, WorkspaceRow,
 };
 use qoop_runtime::schedule::{Cron, Naive, Zone, next_slot};
@@ -257,15 +257,6 @@ impl Model {
         format!("{}/{}", self.space_name(row.workspace), title_of(row))
     }
 
-    /// What qass did, in the names the window shows: "wrote to api/claude", not the daemon's
-    /// tab number.
-    pub fn act_text(&self, act: &QassAct) -> String {
-        match act.terminal.and_then(|t| self.row(t)) {
-            Some(row) if act.kind == "wrote" => format!("wrote to {}", self.agent_name(row)),
-            _ => act.text.clone(),
-        }
-    }
-
     /// What a screen reader says for a row: "README Coupons section, claude, acme-web,
     /// Needs you, 4m".
     pub fn row_label(&self, entry: Entry<'_>, now: i64) -> String {
@@ -292,14 +283,27 @@ impl Model {
     /// This Mac's qass: the first agent in this machine's space named qass. The one that takes
     /// every hand, remote agents' too.
     pub fn qass_row(&self) -> Option<&AgentRow> {
-        let spaces: Vec<i64> = self
-            .qass_spaces()
-            .into_iter()
-            .filter(|id| machine_of(*id) == 0)
-            .collect();
         self.rows
             .iter()
-            .find(|r| spaces.contains(&r.workspace) && r.agent)
+            .find(|r| r.agent && self.in_qass_space(r.terminal))
+    }
+
+    /// Whether `terminal`'s row is in This Mac's qass space: qass's place, whether qass runs in
+    /// it or not.
+    pub fn in_qass_space(&self, terminal: TerminalStream) -> bool {
+        self.row(terminal).is_some_and(|r| {
+            machine_of(r.workspace) == 0 && self.qass_spaces().contains(&r.workspace)
+        })
+    }
+
+    /// The card's answers for `row`'s `menu`: Hand to qass is never offered on a qass's own
+    /// card, which would hand qass its own question.
+    pub fn offers(&self, row: &AgentRow, menu: &AgentMenu) -> Vec<Offer> {
+        let own = self.qass_spaces().contains(&row.workspace);
+        offers(menu)
+            .into_iter()
+            .filter(|o| !(own && o.pick == Pick::Qass))
+            .collect()
     }
 
     /// Whether machine `m` runs a qass of its own: an agent in its space named qass.
@@ -584,8 +588,8 @@ pub fn selected_text(lines: &[String], a: (usize, usize), b: (usize, usize)) -> 
 }
 
 pub use qoop_tui::answers::{
-    HOLD, Hold, Holds, Lessons, Offer, Pick, Slot, branch_or_clock, clean_prompt, daemon_space,
-    offers, refusal_words, takes_prompt, text_key, worktree_agents, worktree_line,
+    HOLD, Hold, Holds, Offer, Pick, Slot, branch_or_clock, clean_prompt, daemon_space, offers,
+    refusal_words, takes_prompt, text_key, worktree_agents, worktree_line,
 };
 
 const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -1246,18 +1250,6 @@ pub fn reach_words(state: MachineState, zone: Zone) -> String {
     }
 }
 
-/// Whether an agent that waited in `before` (idle, done or blocked) works in `now`: what a
-/// write of qass's looks like from the rows, a prompt or a menu answered alike.
-pub fn woke(before: &[AgentRow], now: &[AgentRow]) -> bool {
-    before
-        .iter()
-        .filter(|b| matches!(b.state.as_str(), "idle" | "done" | "blocked"))
-        .any(|b| {
-            now.iter()
-                .any(|r| r.terminal == b.terminal && r.state == "working")
-        })
-}
-
 /// Whether a machine in `state` is not reached: its rows are shown as of a time.
 pub fn unreached(state: MachineState) -> bool {
     matches!(
@@ -1338,134 +1330,6 @@ pub fn work_space(
             (instead.map(|w| w.id), said)
         }
         None => (first_reached().map(|w| w.id), None),
-    }
-}
-
-/// How qass stands on This Mac (`qoop_tui::ledger::Stand`): it
-/// runs (paused when its watching switch is off, else watching the agents of the computers
-/// reached, `lost` being the ones not), its agent sleeps, it does not run, or it was never set
-/// up here.
-pub fn qass_stand(model: &Model, lost: &BTreeSet<usize>) -> qoop_tui::ledger::Stand {
-    use qoop_tui::ledger::Stand;
-    if model.qass_row().is_some() {
-        if model.qass_watch == Some(false) {
-            return Stand::Paused;
-        }
-        let mut machines: Vec<usize> = model
-            .spaces
-            .iter()
-            .map(|w| machine_of(w.id))
-            .chain(std::iter::once(0))
-            .collect();
-        machines.sort_unstable();
-        machines.dedup();
-        let on = machines.iter().filter(|m| !lost.contains(m)).count();
-        let agents = model
-            .live()
-            .filter(|r| r.agent && !lost.contains(&machine_of(r.workspace)))
-            .count();
-        return Stand::Watching {
-            agents,
-            on,
-            of: machines.len(),
-        };
-    }
-    match model
-        .spaces
-        .iter()
-        .find(|w| w.name == QASS_SPACE && machine_of(w.id) == 0)
-    {
-        None => Stand::None,
-        Some(w) if w.asleep || w.sleeping.iter().any(|t| t.agent.is_some()) => Stand::Asleep,
-        Some(_) => Stand::Stopped,
-    }
-}
-
-/// The line under qass's name: what it watches and where it does not, or why it does not run.
-/// `seen` is when this window last saw it running, "17:02"; `lost` names the computers not
-/// reached.
-pub fn qass_said(stand: &qoop_tui::ledger::Stand, seen: Option<&str>, lost: &[String]) -> String {
-    use qoop_tui::ledger::Stand;
-    let plural = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
-    match stand {
-        Stand::None => "not started".to_string(),
-        Stand::Asleep => "asleep: it sleeps when idle. Wake it to ask it.".to_string(),
-        Stand::Paused => "paused: it wakes only when you write to it".to_string(),
-        Stand::Stopped => format!(
-            "stopped, {}. What it held is back in your Inbox, and new questions come straight to you.",
-            qoop_tui::places::seen_running(seen)
-        ),
-        Stand::Watching { agents, on, of } => {
-            let mut said = format!("watching {}", plural(*agents, "agent"));
-            if *of > 1 {
-                if on < of {
-                    said.push_str(&format!(" on {on} of {of} computers"));
-                } else {
-                    said.push_str(&format!(" on {of} computers"));
-                }
-            }
-            if on < of {
-                said.push_str(&format!("; {} not reached", lost.join(" and ")));
-            }
-            said
-        }
-    }
-}
-
-/// A schedule as the qass page says it under its name: when it runs, and when it runs next in
-/// the words the schedules panel uses (`qoop_tui::schedules::moment`: the time today, tomorrow,
-/// the weekday, or the date), `paused`, or `done`.
-pub fn schedule_line(s: &ScheduleInfo, now: i64, zone: Zone) -> String {
-    let next = match (s.paused, s.next_at) {
-        (true, _) => "paused".to_string(),
-        (false, Some(at)) => format!("next {}", qoop_tui::schedules::moment(at, now, zone)),
-        (false, None) => "done".to_string(),
-    };
-    format!("{}, {next}", s.when)
-}
-
-/// One thing qass did today, as the page lists it: when, and what, as recorded. The daemon
-/// records no reason, so none is drawn (plan D1).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Did {
-    pub at: String,
-    pub words: String,
-}
-
-/// What qass did, newest first as the daemon sends it, in the names the window shows ("Wrote to
-/// api/claude").
-pub fn did_today(model: &Model, acts: &[QassAct], zone: Zone) -> Vec<Did> {
-    acts.iter()
-        .map(|a| Did {
-            at: clock(a.at, zone),
-            words: qoop_tui::ledger::act_words(&model.act_text(a)),
-        })
-        .collect()
-}
-
-/// qass's rules as lessons.md counts them: how many there are, and a heading with its words
-/// for each kind. No file read here says how to learn them.
-pub fn rules_lines(rules: Option<Lessons>) -> (usize, Vec<(String, String)>) {
-    let plural = |n: usize| format!("{n} rule{}", if n == 1 { "" } else { "s" });
-    match rules {
-        None => (
-            0,
-            vec![("lessons.md could not be read".to_string(), String::new())],
-        ),
-        Some(l) if l.all == 0 => (0, vec![("None written yet".to_string(), String::new())]),
-        Some(l) => (
-            l.all,
-            vec![
-                (
-                    "Answers alone".to_string(),
-                    format!("{} say do it", plural(l.alone)),
-                ),
-                (
-                    "Always asks you".to_string(),
-                    format!("{} leave it to you", plural(l.yours)),
-                ),
-            ],
-        ),
     }
 }
 
@@ -2592,46 +2456,6 @@ pub(crate) mod tests {
                 "Answered on your iPhone: Yes, {}",
                 clock(1_000, zone)
             ))
-        );
-    }
-
-    /// A schedule's next run reads in the shared words: today's time, tomorrow, a weekday inside
-    /// the week, else the date; paused and finished ones say so.
-    #[test]
-    fn a_schedule_says_its_next_run_in_the_shared_words() {
-        let zone = utc();
-        let now: i64 = 1_763_000_000;
-        let sch = |paused: bool, next_at: Option<i64>| -> ScheduleInfo {
-            serde_json::from_value(serde_json::json!({
-                "id": 1, "name": "nightly", "cron": "0 5 * * *", "agent": "claude", "cwd": "/tmp",
-                "prompt": "go", "paused": paused, "created_at": 0, "when": "every day 05:00",
-                "next_at": next_at,
-            }))
-            .expect("schedule")
-        };
-        let day: i64 = 86_400;
-        let at = |days: i64| now - now.rem_euclid(day) + days * day + 5 * 3600;
-        assert_eq!(
-            schedule_line(&sch(false, Some(at(0))), now, zone),
-            "every day 05:00, next 05:00"
-        );
-        assert_eq!(
-            schedule_line(&sch(false, Some(at(1))), now, zone),
-            "every day 05:00, next tomorrow 05:00"
-        );
-        assert!(schedule_line(&sch(false, Some(at(3))), now, zone).contains("next "));
-        let far = schedule_line(&sch(false, Some(at(21))), now, zone);
-        assert!(
-            far.starts_with("every day 05:00, next ") && far.matches(' ').count() >= 6,
-            "{far}"
-        );
-        assert_eq!(
-            schedule_line(&sch(true, Some(at(1))), now, zone),
-            "every day 05:00, paused"
-        );
-        assert_eq!(
-            schedule_line(&sch(false, None), now, zone),
-            "every day 05:00, done"
         );
     }
 }

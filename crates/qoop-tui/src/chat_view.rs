@@ -2120,60 +2120,6 @@ fn programs_in(file: &std::path::Path) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Who said a line of a plain chat.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Who {
-    /// The person (what was typed to the agent, from any client).
-    You,
-    /// The agent.
-    Agent,
-}
-
-/// One line of a chat drawn as messages: what was said, a note that is not a message, or what
-/// went wrong. A window with room for words and not for a terminal's rows draws these.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Bubble {
-    Said { by: Who, text: String },
-    Note(String),
-    Failed(String),
-}
-
-/// A page of a session as messages, oldest first: the person's words and the agent's, what an
-/// agent sent another (`from`), a compaction and an error as notes. Tool calls, reasoning and
-/// the rows of a kind this build does not know are left to the terminal; a message with no
-/// words (only attachments) says how many it carries.
-pub fn bubbles(items: &[Item]) -> Vec<Bubble> {
-    let mut out = Vec::new();
-    for item in items {
-        match item {
-            Item::User {
-                text, attachments, ..
-            } => {
-                let text = match (text.trim(), attachments.len()) {
-                    ("", 0) => continue,
-                    ("", n) => format!("{n} attached"),
-                    (text, 0) => text.to_string(),
-                    (text, n) => format!("{text} ({n} attached)"),
-                };
-                out.push(Bubble::Said { by: Who::You, text });
-            }
-            Item::Agent { text, .. } if !text.trim().is_empty() => out.push(Bubble::Said {
-                by: Who::Agent,
-                text: text.trim().to_string(),
-            }),
-            Item::Notice { text, .. } if !text.trim().is_empty() => {
-                out.push(Bubble::Note(text.trim().to_string()));
-            }
-            Item::Compaction { .. } => {
-                out.push(Bubble::Note("The conversation was compacted.".into()))
-            }
-            Item::Error { text, .. } => out.push(Bubble::Failed(text.trim().to_string())),
-            _ => {}
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5022,36 +4968,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// The messages of a chat page: the person's and the agent's words, in order; tool calls
-    /// and reasoning are left out; an attachment-only message and an error say what they are.
-    #[test]
-    fn a_page_reads_as_messages() {
-        let items = vec![
-            user("Do not answer anything on xheron for the next hour."),
-            thinking(Some(900)),
-            tool("Bash", "qoop rules add", Status::Ok, Some(0)),
-            agent("Done. Until 18:10 every question from xheron comes to you."),
-            user("  "),
-            Item::Error {
-                seq: 0,
-                text: "rate limited".into(),
-            },
-        ];
-        assert_eq!(
-            bubbles(&items),
-            vec![
-                Bubble::Said {
-                    by: Who::You,
-                    text: "Do not answer anything on xheron for the next hour.".into()
-                },
-                Bubble::Said {
-                    by: Who::Agent,
-                    text: "Done. Until 18:10 every question from xheron comes to you.".into()
-                },
-                Bubble::Failed("rate limited".into()),
-            ]
-        );
     }
 }
