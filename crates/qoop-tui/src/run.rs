@@ -1174,6 +1174,18 @@ struct State {
     prefix_pending: bool,
     /// An agent's last answer, open as a page over the pane.
     answer: Option<crate::answer::Answer>,
+    /// The Inbox pane: what needs the person, over the pane (`ctrl-a i`).
+    ibx: crate::inbox_pane::Pane,
+    /// What this client knows about qass and the hands to it, for the Inbox.
+    hand: crate::answers::HandInput,
+    /// Every card read (open, answered and ended), as the Inbox lists them.
+    ibx_cards: Vec<qoop_runtime::control::AskInfo>,
+    /// What the Inbox needs around the rows: today's start, the computers not reached.
+    ibx_ctx: crate::inbox::Context,
+    /// The status row's word about an answer on hold while the Inbox is put away.
+    ibx_held: Option<String>,
+    /// When the person's day began, as last looked up ([`crate::inbox_pane::day_start`]).
+    ibx_day: i64,
     /// What each local agent costs, as last sampled. Empty unless `QOOP_USAGE=1`.
     usage: sidebar::Usage,
     /// Each sampled terminal's group, when it was read, and each member's CPU nanoseconds
@@ -1572,6 +1584,101 @@ impl Modes {
     }
 }
 
+/// The Inbox's view of the client: the rows, the cards, what is known about qass and the
+/// clocks, borrowed field by field so the pane itself can be borrowed mutably beside them.
+macro_rules! ibx_env {
+    ($s:expr) => {
+        crate::inbox_pane::Env {
+            rows: &$s.rows,
+            spaces: &$s.spaces,
+            cards: &$s.ibx_cards,
+            hand: &$s.hand,
+            ctx: &$s.ibx_ctx,
+            now: std::time::Instant::now(),
+            now_unix: sidebar::now_unix(),
+            typed: &$s.typed_at,
+        }
+    };
+}
+
+impl State {
+    /// Read what the Inbox needs around the rows: qass and the hands to it, the computers not
+    /// reached, when the person's day began. Called when the rows or the cards moved, and
+    /// before every frame.
+    fn refresh_ibx(&mut self) {
+        let now = sidebar::now_unix();
+        crate::inbox_pane::update_hand(
+            &mut self.hand,
+            &self.spaces,
+            &self.rows,
+            &self.ibx_cards,
+            &self.ibx.no_hands,
+            sidebar::watching(),
+            now,
+        );
+        let day = crate::inbox_pane::day_start(&mut self.ibx_day, now);
+        self.ibx_ctx =
+            crate::inbox_pane::context(&self.spaces, day, crate::mux::machines_without_menus());
+        let env = ibx_env!(self);
+        self.ibx_held = self.ibx.held_line(&env);
+    }
+
+    /// A new agent list: the hands are noted, the held answers whose menu changed are dropped.
+    fn rows_changed_ibx(&mut self) {
+        self.refresh_ibx();
+        let env = ibx_env!(self);
+        self.ibx.rows_changed(&env);
+    }
+
+    /// The cards were read again: the Inbox lists open, answered and ended ones alike.
+    fn cards_changed_ibx(&mut self) {
+        self.ibx_cards = self
+            .asks
+            .live
+            .iter()
+            .chain(self.asks.ended.iter())
+            .cloned()
+            .collect();
+        self.refresh_ibx();
+    }
+
+    /// The Inbox's list as it stands now: what needs the person.
+    fn inbox_now(&self) -> crate::inbox::Inbox {
+        let env = ibx_env!(self);
+        self.ibx.inbox(&env)
+    }
+
+    /// Where the Inbox is painted: from the first screen row, over the tab bar and the pane,
+    /// as wide as the pane. In pane columns and rows.
+    fn ibx_size(&self) -> (usize, usize) {
+        let (cols, rows) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        (cols as usize, rows as usize + screen::TABS)
+    }
+
+    /// The Inbox painted, when it is open and nothing else owns the screen.
+    fn ibx_view(&self) -> Option<crate::inbox_pane::View> {
+        // A box, a mode or a close asking its question has the screen: the Inbox steps aside
+        // and comes back when it is answered.
+        if !self.ibx.open
+            || self.palette.is_some()
+            || self.prompt.is_some()
+            || self.menu.is_some()
+            || self.reading.is_some()
+            || self.modes.open()
+            || self.armed.is_some()
+        {
+            return None;
+        }
+        let (cols, rows) = self.ibx_size();
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        let env = ibx_env!(self);
+        Some(self.ibx.view(&env, cols, rows))
+    }
+}
+
 impl State {
     fn frame(&self) -> Frame<'_> {
         let mut tiles = Vec::new();
@@ -1619,7 +1726,10 @@ impl State {
             cols: self.cols,
             lines: self.lines,
             // A mode speaks for itself on the notice row: its keys, or its question.
-            message: self.mode_line().or(self.message.as_deref()),
+            message: self
+                .mode_line()
+                .or(self.ibx_held.as_deref().filter(|_| !self.ibx.open))
+                .or(self.message.as_deref()),
             hint: self.hint.as_deref().or_else(|| self.chat_hint()),
             view: self.view,
             seen: &self.seen_done,
@@ -1663,6 +1773,10 @@ impl State {
                 agent_order: self.agent_view.as_ref(),
                 tab_rails: self.tab_rails(),
                 cards: &self.asks.live,
+                next: self.next_waiting(),
+                hand: self.hand.qass_off().is_none(),
+                holding: !self.ibx.holds.held.is_empty(),
+                words: self.ibx.can_type(&ibx_env!(self)),
                 chat_refused: self.chat.is_refused(self.focused),
                 shut: &self.shut,
                 doze_open: &self.doze_open,
@@ -1720,6 +1834,8 @@ impl State {
                     && screen::left_for(self.cols, self.collapsed, self.sidebar_width) > 0
                 {
                     screen::KeyContext::Sidebar
+                } else if self.ibx.open {
+                    screen::KeyContext::Inbox
                 } else if self.tabq_focused() {
                     screen::KeyContext::Questions
                 } else if self.qass_split() && fold_leaves(self).is_some() {
@@ -2953,16 +3069,30 @@ impl State {
         sidebar::shown(&self.spaces, &self.rows)
     }
 
-    /// `ctrl-a tab`'s next: the first of the queue the next row reads, qass never in it.
-    fn up_next(&self) -> Option<u32> {
-        sidebar::queue(
-            self.shown().1,
-            self.focused,
-            &self.seen_done,
-            &self.unseen_finished,
-        )
-        .first()
-        .map(|row| row.terminal)
+    /// `ctrl-a tab`'s next: the first of what the Inbox counts after the agent the keyboard is on,
+    /// qass's own tab never in it and finished work nobody read left out.
+    fn up_next(&self) -> Option<crate::inbox::Item> {
+        self.inbox_now().next_after(self.focused).cloned()
+    }
+
+    /// The palette as it opens: its "needs you" section lists what the Inbox counts, and only that.
+    fn new_palette(&self, agents: Vec<crate::config::Launcher>) -> Palette {
+        Palette {
+            needs: self.inbox_now().terminals(),
+            ..Palette::with_agents(agents)
+        }
+    }
+
+    /// The status line's next: [`State::up_next`], named.
+    fn next_waiting(&self) -> Option<screen::Next> {
+        let item = self.up_next()?;
+        let env = ibx_env!(self);
+        let (who, word) = crate::inbox_pane::next_words(&item, &env);
+        Some(screen::Next {
+            who,
+            word,
+            failed: item.kind == crate::inbox::ItemKind::Failed,
+        })
     }
 
     /// Whether the space on screen is qass's.
@@ -8934,6 +9064,12 @@ where
         prefix_pending: false,
 
         answer: None,
+        ibx: crate::inbox_pane::Pane::new(),
+        hand: crate::answers::HandInput::default(),
+        ibx_cards: Vec::new(),
+        ibx_ctx: crate::inbox::Context::default(),
+        ibx_held: None,
+        ibx_day: 0,
 
         usage: sidebar::Usage::new(),
 
@@ -9337,6 +9473,8 @@ where
                 // and the hit testing below, and its time remembered for the
                 // clicks that land between paints.
                 state.refresh_chat();
+                state.refresh_ibx();
+                let inbox_view = state.ibx_view();
                 let mut frame = state.frame();
                 // The carried row on the rows of this very frame, its clock and all.
                 let drag = state.drag_paint(frame.now_unix);
@@ -9386,6 +9524,10 @@ where
                 {
                     screen::paint_answer(&frame, answer, &mut painted);
                 }
+                // The Inbox covers the pane the same way, last: it owns the pane while open.
+                if let Some(view) = inbox_view.as_ref() {
+                    screen::paint_inbox(&frame, view, &mut painted);
+                }
                 // The borrow ends here: the clock is copied out before the
                 // state is touched again below.
                 let paint_now = frame.now_unix;
@@ -9417,6 +9559,7 @@ where
                     || state.menu.is_some()
                     || state.reading.is_some()
                     || state.answer.is_some()
+                    || state.ibx.open
                     || state.focus;
                 let resized = state.img_size != (state.cols, state.lines);
                 let anchored = state.anchor.is_some() || suppressed;
@@ -9543,7 +9686,11 @@ where
                 drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
             }
             // A write to send, and the moment a notice is let go. `None` with nothing to do.
-            let asks_at = [state.asks.wake_at(), state.clock.wake_at()]
+            let asks_at = [
+                state.asks.wake_at(),
+                state.clock.wake_at(),
+                state.ibx.wake_at(std::time::Instant::now()),
+            ]
                 .into_iter()
                 .flatten()
                 .min()
@@ -9991,6 +10138,18 @@ where
                         if let ModeOutcome::Passthrough(rest) = outcome {
                             feed = Some(rest);
                         }
+                    } else if state.ibx.open
+                        && !keys.prefix_pending()
+                        && !keys.mouse_pending()
+                        && !is_report_head(&bytes)
+                    {
+                        // The Inbox owns the keyboard while it is open, and hands back the
+                        // prefix, the mouse and a detach.
+                        dirty = true;
+                        feed = run_inbox_keys(
+                            &mut state, &bytes, keys.prefix(), &mut control_seq, &mut seqs, &mut wr,
+                        )
+                        .await?;
                     } else if state.answer.is_some() {
                         // An open answer owns the keyboard: it scrolls and closes, and a stray
                         // key does nothing rather than type into the agent behind it.
@@ -10125,7 +10284,26 @@ where
                         if action.moves_on() && state.message.take().is_some() {
                             dirty = true;
                         }
+                        // Over the Inbox the mouse is its own, never the terminal's under it.
+                        if state.ibx.open
+                            && let Some(taken) = inbox_mouse(&mut state, &action)
+                        {
+                            dirty = true;
+                            finish_inbox(&mut state, taken, &mut control_seq, &mut seqs, &mut wr)
+                                .await?;
+                            continue;
+                        }
                         match action {
+                            Action::Input(bytes) if state.ibx_view().is_some() => {
+                                // Typed in the same read as the key that opened the Inbox: its.
+                                dirty = true;
+                                // The decoder already took the prefix and the mouse out of these
+                                // bytes, so there is nothing to hand back.
+                                let _ = run_inbox_keys(
+                                    &mut state, &bytes, keys.prefix(), &mut control_seq, &mut seqs, &mut wr,
+                                )
+                                .await?;
+                            }
                             Action::Input(bytes) => {
                                 // Typed in the same read as the key that opened a mode,
                                 // as in `ctrl-a [ k`: the mode's, like everything after it.
@@ -11445,6 +11623,8 @@ where
                                 dirty = true;
                             }
                             Action::Collapse => {
+                                // The person's own fold: the Inbox no longer unfolds it.
+                                state.ibx.folded = false;
                                 state.collapsed = !state.collapsed;
                                 // The pane's width changed with the column, and a child
                                 // that is not told reflows its output against a width it no
@@ -11480,12 +11660,11 @@ where
                             // qass in its own space, or back from it. Its page stays
                             // `qoop qass page`.
                             Action::Asks => {
-                                if asks_toggle(&mut state)
+                                if inbox_toggle(&mut state)
                                     && let Some(resize) = size_terminals(&mut state, &mut seqs)?
                                 {
                                     wr.write_all(&resize).await?;
                                 }
-                                drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                                 dirty = true;
                             }
                             Action::Clock => {
@@ -11570,7 +11749,7 @@ where
                                 dirty |= chat_row_key(&mut state);
                             }
                             Action::Palette => {
-                                state.palette = Some(Palette::with_agents(crate::config::agents()));
+                                state.palette = Some(state.new_palette(crate::config::agents()));
                                 // The plugin host is asked off the render path; its rows land when it answers.
                                 let tx = blocking_tx.clone();
                                 tokio::task::spawn_blocking(move || {
@@ -11582,15 +11761,19 @@ where
                             // goes there. Standing on a finished agent reads it, so the next
                             // press finds the one after: wants, then failed, then done.
                             Action::UpNext => {
-                                let next = state.up_next();
-                                match next {
-                                    Some(picked) => {
-                                        if let Some(bytes) = focus(
-                                            &mut state, picked, &mut control_seq, &mut seqs,
-                                        )? {
-                                            wr.write_all(&bytes).await?;
+                                match state.up_next() {
+                                    Some(item) => match item.terminal {
+                                        Some(picked) => {
+                                            if let Some(bytes) = focus(
+                                                &mut state, picked, &mut control_seq, &mut seqs,
+                                            )? {
+                                                wr.write_all(&bytes).await?;
+                                            }
                                         }
-                                    }
+                                        // Something qass says that is about no agent: it is in
+                                        // the Inbox.
+                                        None => open_inbox(&mut state),
+                                    },
                                     None => {
                                         state.message = Some("nothing needs you".to_string());
                                     }
@@ -12072,8 +12255,19 @@ where
                                 if state.tabq_answered(&response) {
                                     dirty = true;
                                 }
+                                // What the Inbox asked: its answers, and the cards read again
+                                // once one was written.
+                                {
+                                    let env = ibx_env!(state);
+                                    if state.ibx.answered(&response, &env) {
+                                        state.asks.stale = true;
+                                        dirty = true;
+                                    }
+                                }
+                                drain_inbox(&mut state, &mut seqs, &mut control_seq, &mut wr).await?;
                                 if state.asks.answered(&response) {
                                     dirty = true;
+                                    state.cards_changed_ibx();
                                     // The last card going takes questions he brought up out
                                     // beside the board: the board is sized again, qass not.
                                     if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
@@ -12296,6 +12490,13 @@ where
                     let (clock_sends, clock_moved) = state.clock.tick(std::time::Instant::now());
                     sends.extend(clock_sends);
                     moved |= clock_moved;
+                    // The answers on hold: counted down, and sent once their time is up.
+                    state.refresh_ibx();
+                    let env = ibx_env!(state);
+                    if state.ibx.tick(&env) {
+                        dirty = true;
+                    }
+                    drain_inbox(&mut state, &mut seqs, &mut control_seq, &mut wr).await?;
                     for request in sends {
                         wr.write_all(&client::encode_control_seq(&request, &mut control_seq)?).await?;
                     }
@@ -12542,6 +12743,19 @@ where
         }
     }
     .await;
+
+    // What is still on hold is sent now, whichever way the interface left (a detach, a hangup,
+    // a kill): an answer the person gave is not lost to the three seconds. Best effort.
+    state.refresh_ibx();
+    {
+        let env = ibx_env!(state);
+        state.ibx.flush(&env);
+    }
+    if state.ibx.owes() {
+        let _ = drain_inbox(&mut state, &mut seqs, &mut control_seq, &mut wr).await;
+        let _ = wr.flush().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     // Off in the reverse order, and before leaving the alternate screen: a terminal left
     // in mouse reporting mode sends escape sequences into whatever the person runs next.
@@ -14590,8 +14804,16 @@ fn focus(
     control_seq: &mut u32,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
+    // Going to an agent puts the Inbox away, and unfolds the column it folded.
+    let unfolded = close_inbox(state);
     forget_return(state);
-    move_focus(state, to, control_seq, seqs)
+    let moved = move_focus(state, to, control_seq, seqs)?;
+    if unfolded && let Some(resize) = size_terminals(state, seqs)? {
+        let mut all = moved.unwrap_or_default();
+        all.extend_from_slice(&resize);
+        return Ok(Some(all));
+    }
+    Ok(moved)
 }
 
 /// The person put the keyboard somewhere themselves: a focused tab that went away is no
@@ -14613,6 +14835,9 @@ fn move_focus(
     if to == 0 || to == state.focused {
         return Ok(None);
     }
+    // A new place for the keyboard puts the Inbox away (the column it folded is unfolded
+    // before the terminals are sized, at the end).
+    close_inbox(state);
     // The keyboard going into a pane folded to its strip opens it (sized at the end).
     let folded = state
         .space
@@ -15156,6 +15381,203 @@ fn clock_toggle(state: &mut State) -> bool {
     state.asks.release();
     state.clock.focus = true;
     !was
+}
+
+/// `ctrl-a i`: open the Inbox over the pane from any tab and give it the keyboard, or put it
+/// away. True when the agents column was unfolded again, so the terminals must be sized.
+fn inbox_toggle(state: &mut State) -> bool {
+    if state.ibx.open {
+        return close_inbox(state);
+    }
+    open_inbox(state);
+    false
+}
+
+/// Open the Inbox. Below [`crate::inbox_pane::INBOX_FOLDS_BELOW`] columns the agents column folds to its strip
+/// while it is open: the cards take the room, and what they say is never cut. The terminals
+/// are not sized for it (the Inbox covers them), so opening and closing reflows nothing.
+fn open_inbox(state: &mut State) {
+    // One thing has the keyboard at a time.
+    state.asks.release();
+    state.clock.release();
+    state.tabq_focus = None;
+    state.answer = None;
+    if state.focus {
+        close_focus(state);
+    }
+    state.refresh_ibx();
+    state.ibx.open();
+    if state.cols < crate::inbox_pane::INBOX_FOLDS_BELOW
+        && !state.collapsed
+        && screen::left_for(state.cols, true, state.sidebar_width) > 0
+    {
+        state.collapsed = true;
+        state.ibx.folded = true;
+    }
+}
+
+/// Put the Inbox away, and unfold the column it folded. True when it did, so the terminals
+/// must be sized again (a size is sent only to a terminal whose size changed).
+fn close_inbox(state: &mut State) -> bool {
+    if !state.ibx.open {
+        return false;
+    }
+    state.ibx.close();
+    std::mem::take(&mut state.ibx.folded) && std::mem::replace(&mut state.collapsed, false)
+}
+
+/// What the Inbox did with some keys or a click, for the loop that owns the keyboard.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct InboxKeys {
+    /// What is not the Inbox's, for the ordinary path.
+    feed: Option<Vec<u8>>,
+    /// Go to this terminal's tab.
+    jump: Option<u32>,
+    /// The agents column came back: the terminals must be sized again.
+    resize: bool,
+    /// A line to talk a card through, pasted into qass's input once its tab is shown.
+    paste: Option<(u32, String)>,
+}
+
+/// What an [`crate::inbox_pane::Out`] asks of the client.
+fn inbox_out(state: &mut State, out: crate::inbox_pane::Out) -> InboxKeys {
+    use crate::inbox_pane::Out;
+    let mut taken = InboxKeys::default();
+    match out {
+        Out::Stay => {}
+        Out::Closed => taken.resize = close_inbox(state),
+        Out::Jump(terminal) => taken.jump = Some(terminal),
+        Out::Talk(card) => match crate::asks::talk_target(&card, &state.rows, &state.spaces) {
+            Some(tab) => taken.jump = Some(tab),
+            None => match state.qass_chat() {
+                Some(qass) if state.qass_at_rest(qass) => {
+                    taken.jump = Some(qass);
+                    taken.paste = Some((qass, crate::asks::talk_line(&card)));
+                }
+                Some(_) => say(state, crate::asks::talk_line(&card)),
+                None => say(state, "qass is not running".to_string()),
+            },
+        },
+        Out::Pass(rest) => taken.feed = Some(rest),
+    }
+    taken
+}
+
+/// Keys typed while the Inbox has the keyboard.
+fn inbox_keys(state: &mut State, bytes: &[u8], prefix: u8) -> InboxKeys {
+    let env = ibx_env!(state);
+    let out = state.ibx.key(bytes, prefix, &env);
+    inbox_out(state, out)
+}
+
+/// A press, a drag, a release or the wheel over the Inbox: its own, never the terminal's
+/// under it. `None` for a place outside it (the agents column, which answers its own).
+fn inbox_mouse(state: &mut State, action: &Action) -> Option<InboxKeys> {
+    let (row, col) = match *action {
+        Action::Click { row, col, .. } | Action::Wheel { row, col, .. } => (row, col),
+        // A drag or a release belongs to a gesture begun elsewhere while one is on (a row
+        // carried, a divider pulled); otherwise it is the Inbox's and goes nowhere.
+        Action::Drag { row, col, .. } | Action::Release { row, col, .. } => {
+            if state.row_press.is_some()
+                || state.sidebar_drag.is_some()
+                || state.inbox_drag.is_some()
+                || state.modes.split_drag.is_some()
+            {
+                return None;
+            }
+            (row, col)
+        }
+        _ => return None,
+    };
+    // Stepped aside for a box or a question: the clicks are theirs.
+    state.ibx_view()?;
+    let (cols, rows) = state.ibx_size();
+    let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+    let (r, c) = (
+        (row as usize).checked_sub(1)?,
+        (col as usize).checked_sub(left + 1)?,
+    );
+    if r >= rows || c >= cols {
+        return None;
+    }
+    let mut taken = InboxKeys::default();
+    match *action {
+        Action::Click { .. } => {
+            let hit = state
+                .ibx_view()
+                .and_then(|view| crate::inbox_pane::hit_at(&view, r, c));
+            if let Some(hit) = hit {
+                let env = ibx_env!(state);
+                let out = state.ibx.click(hit, &env);
+                taken = inbox_out(state, out);
+            }
+        }
+        Action::Wheel { up, .. } => state.ibx.scroll(!up),
+        _ => {}
+    }
+    Some(taken)
+}
+
+/// Send what the Inbox owes: requests for the daemon, a reply or a key typed into an agent.
+async fn drain_inbox(
+    state: &mut State,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    control_seq: &mut u32,
+    wr: &mut (impl AsyncWriteExt + Unpin),
+) -> io::Result<()> {
+    let sends = state.ibx.take();
+    for request in &sends.requests {
+        wr.write_all(&client::encode_control_seq(request, control_seq)?)
+            .await?;
+    }
+    for typed in sends.typed {
+        if typed.paste {
+            let text = String::from_utf8_lossy(&typed.bytes).to_string();
+            paste_into(typed.terminal, &text, seqs, wr, &mut state.typed_at).await?;
+        } else {
+            send_to_terminal(typed.terminal, seqs, wr, typed.bytes).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Keys for the Inbox, and what they ask: the column sized again, an agent shown, a line pasted,
+/// what is owed sent. What is not the Inbox's is returned for the ordinary path.
+async fn run_inbox_keys(
+    state: &mut State,
+    bytes: &[u8],
+    prefix: u8,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl AsyncWriteExt + Unpin),
+) -> io::Result<Option<Vec<u8>>> {
+    let taken = inbox_keys(state, bytes, prefix);
+    finish_inbox(state, taken, control_seq, seqs, wr).await
+}
+
+/// What the Inbox asked of the client, done: see [`run_inbox_keys`].
+async fn finish_inbox(
+    state: &mut State,
+    taken: InboxKeys,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl AsyncWriteExt + Unpin),
+) -> io::Result<Option<Vec<u8>>> {
+    if taken.resize
+        && let Some(resize) = size_terminals(state, seqs)?
+    {
+        wr.write_all(&resize).await?;
+    }
+    if let Some(terminal) = taken.jump
+        && let Some(bytes) = focus(state, terminal, control_seq, seqs)?
+    {
+        wr.write_all(&bytes).await?;
+    }
+    if let Some((terminal, line)) = &taken.paste {
+        paste_talk(state, *terminal, line, seqs, wr).await?;
+    }
+    drain_inbox(state, seqs, control_seq, wr).await?;
+    Ok(taken.feed)
 }
 
 /// `ctrl-a i`, or a click on the chip: open the inbox and give it the keyboard; with it open
@@ -16045,7 +16467,9 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         // became of it, where the next answer replaces it. Not on the status row as well, where
         // an old refusal would outlive the answer that went.
         ControlResponse::Failed { id, .. }
-            if id.starts_with(crate::asks::WRITE_ID) || id.starts_with(TABQ_READ) => {}
+            if id.starts_with(crate::asks::WRITE_ID)
+                || id.starts_with(crate::inbox_pane::ID)
+                || id.starts_with(TABQ_READ) => {}
         ControlResponse::Failed { id, reason }
             if id.starts_with("sleep-") || id.starts_with("wake-") =>
         {
@@ -16287,6 +16711,17 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // daemon of somebody else's, and no network.
             // qass finishes a turn on every event it handles: only its asking is news.
             let qass = sidebar::qass_space(&state.spaces);
+            // What the loop below asks of a hand to qass is asked of the list that just came,
+            // not of the one before it.
+            crate::inbox_pane::update_hand(
+                &mut state.hand,
+                &state.spaces,
+                &agents,
+                &state.ibx_cards,
+                &state.ibx.no_hands,
+                sidebar::watching(),
+                sidebar::now_unix(),
+            );
             for row in &agents {
                 let before = state.was.get(&row.terminal).cloned();
                 let is_qass = Some(row.workspace) == qass;
@@ -16305,8 +16740,11 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 let rung_before = row.status.is_some()
                     && row.stop.is_some()
                     && state.rung.get(&row.terminal) == row.stop.as_ref();
+                // A question handed to qass waits on qass, not on the person: the Inbox does
+                // not count it, so nothing is said for it either.
                 let wants_someone = match shown {
-                    "blocked" | "failed" => true,
+                    "blocked" => !crate::answers::handed(row, &state.hand),
+                    "failed" => true,
                     "done" => !is_qass && !(row.status.is_some() && (looking || rung_before)),
                     _ => false,
                 };
@@ -16403,6 +16841,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 .collect();
             state.rows = agents;
             sidebar::qass_last(&mut state.spaces, &mut state.rows);
+            state.rows_changed_ibx();
             follow_adopted(state);
             name_sessions(state, request);
             // A space being closed waits for this: the daemon counts store rows and the
@@ -18776,6 +19215,12 @@ mod tests {
             prefix_pending: false,
 
             answer: None,
+            ibx: crate::inbox_pane::Pane::new(),
+            hand: crate::answers::HandInput::default(),
+            ibx_cards: Vec::new(),
+            ibx_ctx: crate::inbox::Context::default(),
+            ibx_held: None,
+            ibx_day: 0,
 
             usage: sidebar::Usage::new(),
 
@@ -20355,6 +20800,12 @@ mod tests {
             prefix_pending: false,
 
             answer: None,
+            ibx: crate::inbox_pane::Pane::new(),
+            hand: crate::answers::HandInput::default(),
+            ibx_cards: Vec::new(),
+            ibx_ctx: crate::inbox::Context::default(),
+            ibx_held: None,
+            ibx_day: 0,
 
             usage: sidebar::Usage::new(),
 
@@ -20537,6 +20988,12 @@ mod tests {
             prefix_pending: false,
 
             answer: None,
+            ibx: crate::inbox_pane::Pane::new(),
+            hand: crate::answers::HandInput::default(),
+            ibx_cards: Vec::new(),
+            ibx_ctx: crate::inbox::Context::default(),
+            ibx_held: None,
+            ibx_day: 0,
 
             usage: sidebar::Usage::new(),
 
@@ -32328,5 +32785,309 @@ mod tests {
             };
             assert_eq!(bytes(&with), bytes(&without), "at {cols}x{lines}");
         }
+    }
+    // The Inbox (round 2) -------------------------------------------------------------------
+
+    /// A row as the daemon sends it now: with the status it decided, and since when it waits.
+    fn waiting_row(terminal: u32, workspace: i64, status: &str, since: i64) -> AgentRow {
+        let mut row = agent(terminal, workspace, "claude", status);
+        row.status = Some(status.to_string());
+        row.last_active_at_unix = Some(since);
+        row
+    }
+
+    /// An Inbox state: a failed agent (3) and a blocked one (1), the oldest first, an unread
+    /// finish (2) between them in the daemon's list, and the keyboard on a working agent (6).
+    fn inbox_state() -> State {
+        let mut s = state();
+        s.spaces = vec![space(1, "app"), space(2, "webshop")];
+        s.rows = vec![
+            waiting_row(1, 1, "blocked", 100),
+            waiting_row(2, 2, "done", 150),
+            waiting_row(3, 2, "failed", 200),
+            waiting_row(6, 2, "working", 50),
+        ];
+        s.focused = 6;
+        s.space = Some(2);
+        s.palette = None;
+        s.refresh_ibx();
+        s
+    }
+
+    #[test]
+    fn ctrl_a_tab_visits_only_what_is_counted_and_skips_unread_done() {
+        let mut s = inbox_state();
+        let next = |s: &State| s.up_next().and_then(|i| i.terminal);
+        // Oldest first, and the unread finish (2) is never the next.
+        assert_eq!(next(&s), Some(1));
+        s.focused = 1;
+        assert_eq!(
+            next(&s),
+            Some(3),
+            "after the blocked one comes the failed one"
+        );
+        s.focused = 3;
+        assert_eq!(
+            next(&s),
+            Some(1),
+            "and round again, never the unread finish"
+        );
+        s.focused = 2;
+        assert_eq!(next(&s), Some(1));
+        // Nothing counted: nothing is next.
+        s.rows.retain(|r| r.terminal == 2 || r.terminal == 6);
+        s.focused = 6;
+        assert_eq!(next(&s), None);
+        // The status line names the same one, in the failed ink for a failure.
+        let mut s = inbox_state();
+        s.focused = 1;
+        let next = s.next_waiting().expect("one waits");
+        assert_eq!(next.who, "webshop / claude");
+        assert!(next.failed && next.word == "failed");
+    }
+
+    #[test]
+    fn the_palettes_needs_you_section_counts_by_the_one_rule() {
+        let mut s = inbox_state();
+        // qass runs, and one blocked agent is handed to it.
+        s.spaces.push(space(3, "qass"));
+        s.rows.push(waiting_row(9, 3, "idle", 10));
+        let mut handed = waiting_row(5, 1, "blocked", 120);
+        handed.with_qass = true;
+        s.rows.push(handed);
+        s.refresh_ibx();
+        let palette = s.new_palette(Vec::new());
+        let entries = palette.items(
+            &s.rows,
+            &s.spaces,
+            s.focused,
+            &s.seen_done,
+            &s.unseen_finished,
+        );
+        let section = |name: &str| -> Vec<palette::Item> {
+            entries
+                .iter()
+                .filter(|e| e.section == name)
+                .map(|e| e.item.clone())
+                .collect()
+        };
+        // The blocked and the failed agent, oldest first: not the handed one, not the finish.
+        assert_eq!(
+            section("needs you"),
+            vec![palette::Item::Terminal(1), palette::Item::Terminal(3)]
+        );
+        assert_eq!(section("with qass"), vec![palette::Item::Terminal(5)]);
+        assert_eq!(section("new"), vec![palette::Item::Terminal(2)]);
+    }
+
+    #[test]
+    fn ctrl_a_i_opens_the_inbox_over_any_tab_and_a_jump_puts_it_away() {
+        // From an agent's tab in a window of 104 columns: the column stays.
+        let mut s = inbox_state();
+        s.cols = 104;
+        s.lines = 30;
+        assert!(!s.ibx.open && s.ibx_view().is_none());
+        assert!(!inbox_toggle(&mut s));
+        assert!(s.ibx.open && !s.collapsed);
+        let view = s.ibx_view().expect("painted");
+        assert!(view.plain[0].contains("needs you 2"), "{:?}", view.plain[0]);
+        // Over everything: the first row is the Inbox's, not the tab bar's.
+        assert_eq!(view.plain.len(), s.ibx_size().1);
+        // Away again by the same key.
+        assert!(!inbox_toggle(&mut s));
+        assert!(!s.ibx.open);
+        // Going to an agent puts it away too.
+        inbox_toggle(&mut s);
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        focus(&mut s, 1, &mut seq, &mut seqs).expect("focus");
+        assert!(!s.ibx.open);
+        assert_eq!(s.focused, 1);
+    }
+
+    #[test]
+    fn below_100_columns_the_inbox_folds_the_column_to_its_strip_and_unfolds_it_after() {
+        let mut s = inbox_state();
+        assert_eq!((s.cols, s.collapsed), (80, false));
+        inbox_toggle(&mut s);
+        assert!(s.collapsed, "the column stays wide under the cards");
+        let view = s.ibx_view().expect("painted");
+        assert_eq!(view.plain[0].chars().count(), 80 - 5);
+        assert!(
+            inbox_toggle(&mut s),
+            "unfolding means the terminals are sized again"
+        );
+        assert!(!s.collapsed && !s.ibx.open);
+        // A fold the person made themselves is theirs: the Inbox leaves it.
+        s.collapsed = true;
+        inbox_toggle(&mut s);
+        inbox_toggle(&mut s);
+        assert!(s.collapsed);
+    }
+
+    #[test]
+    fn an_open_palette_is_over_the_inbox() {
+        let mut s = inbox_state();
+        inbox_toggle(&mut s);
+        assert!(s.ibx_view().is_some());
+        s.palette = Some(Palette::open());
+        assert!(s.ibx_view().is_none(), "the palette owns the screen");
+        s.palette = None;
+        assert!(s.ibx_view().is_some());
+    }
+
+    #[test]
+    fn the_status_row_keeps_an_answer_on_hold_while_the_inbox_is_put_away() {
+        use crate::answers::{Hold, Pick, Slot};
+        let mut s = inbox_state();
+        s.ibx.holds.start(Hold {
+            slot: Slot::Agent(1),
+            generation: None,
+            seal: 4,
+            pick: Pick::Key("1".into()),
+            label: "Yes".into(),
+            until: std::time::Instant::now() + std::time::Duration::from_secs(3),
+        });
+        s.refresh_ibx();
+        let line = s.ibx_held.clone().expect("a hold has a word");
+        assert!(
+            line.contains("sending in 3 s: Yes") && line.contains("undoes"),
+            "{line}"
+        );
+        assert_eq!(s.frame().message, Some(line.as_str()));
+        // A hold outranks a passing word, so its count and its way out stay readable.
+        s.message = Some("a passing word".to_string());
+        assert_eq!(s.frame().message, Some(line.as_str()));
+        s.message = None;
+        // Open, the Inbox's own bar says it, and the row is left to its other words.
+        inbox_toggle(&mut s);
+        assert_eq!(s.frame().message, None);
+    }
+
+    /// A question handed to qass waits on qass, not on the person: no bell, no line on the
+    /// notice row, as the Inbox does not count it.
+    #[test]
+    fn a_hand_to_qass_is_not_news_for_the_person() {
+        let (mut request, mut dirty) = (0u64, false);
+        let mut rows_after = |with_qass: bool| {
+            let mut s = inbox_state();
+            // qass shows up in the very list that carries the handed agent: the hand is read
+            // off that list, not off the one before it.
+            s.spaces.push(space(3, "qass"));
+            s.was.insert(5, "working".to_string());
+            s.ring = false;
+            s.message = None;
+            let mut row = waiting_row(5, 1, "blocked", 120);
+            row.with_qass = with_qass;
+            let mut agents = s.rows.clone();
+            agents.push(waiting_row(9, 3, "idle", 10));
+            agents.push(row);
+            apply(
+                &mut s,
+                ControlResponse::Agents {
+                    id: "index".into(),
+                    agents,
+                    splits: Vec::new(),
+                    qass_checks: None,
+                },
+                &mut request,
+                &mut dirty,
+            );
+            s
+        };
+        let handed = rows_after(true);
+        assert!(
+            handed.message.is_none() && !handed.ring,
+            "{:?}",
+            handed.message
+        );
+        let own = rows_after(false);
+        assert!(
+            own.message.is_some(),
+            "a blocked agent of the person's is news"
+        );
+    }
+
+    #[test]
+    fn a_drag_or_release_over_the_inbox_is_its_own_unless_another_gesture_is_on() {
+        let mut s = inbox_state();
+        s.cols = 104;
+        s.lines = 30;
+        inbox_toggle(&mut s);
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width) as u16;
+        let (row, col) = (5u16, left + 8);
+        let drag = Action::Drag {
+            row,
+            col,
+            shift: false,
+        };
+        let release = Action::Release {
+            row,
+            col,
+            shift: false,
+        };
+        let click = Action::Click {
+            row,
+            col,
+            shift: false,
+            ctrl: false,
+        };
+        // Nothing carried: taken, so no release reaches the terminal under the Inbox.
+        assert!(inbox_mouse(&mut s, &drag).is_some());
+        assert!(inbox_mouse(&mut s, &release).is_some());
+        assert!(inbox_mouse(&mut s, &click).is_some());
+        // A press that began in the column and is carried: the drag and the release go on.
+        s.sidebar_drag = Some(0);
+        assert!(inbox_mouse(&mut s, &drag).is_none());
+        assert!(inbox_mouse(&mut s, &release).is_none());
+        s.sidebar_drag = None;
+    }
+
+    #[test]
+    fn the_inbox_steps_aside_for_a_mode_or_a_close_asking_its_question() {
+        let mut s = inbox_state();
+        inbox_toggle(&mut s);
+        assert!(s.ibx_view().is_some());
+        s.armed = Some(7);
+        assert!(s.ibx_view().is_none(), "over an armed close");
+        let click = Action::Click {
+            row: 3,
+            col: 20,
+            shift: false,
+            ctrl: false,
+        };
+        assert!(
+            inbox_mouse(&mut s, &click).is_none(),
+            "its click is the question's"
+        );
+        s.armed = None;
+        s.modes.resizing = true;
+        assert!(s.ibx_view().is_none(), "over a mode");
+        s.modes.resizing = false;
+        assert!(s.ibx_view().is_some());
+    }
+
+    /// A refusal of an Inbox answer is said under its card, never as the daemon's raw code on the
+    /// status row.
+    #[test]
+    fn a_refusal_of_an_inbox_answer_is_not_said_raw_on_the_status_row() {
+        let (mut request, mut dirty) = (0u64, false);
+        let mut s = inbox_state();
+        s.message = None;
+        s.hint = None;
+        apply(
+            &mut s,
+            ControlResponse::Failed {
+                id: format!("{}1", crate::inbox_pane::ID),
+                reason: "already_answered".into(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(
+            s.message.is_none() && s.hint.is_none(),
+            "{:?} {:?}",
+            s.message,
+            s.hint
+        );
     }
 }

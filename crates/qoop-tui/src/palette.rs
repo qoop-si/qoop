@@ -135,6 +135,10 @@ pub struct Palette {
     /// What the plugin host listed when the palette opened: its actions, still on its way,
     /// or that it is not running.
     pub plugins: crate::plugins::Listed,
+    /// The terminals of what the Inbox counts as needing the person, oldest first, taken when
+    /// the palette opened: the "needs you" section lists these and no others. A hand to qass
+    /// and finished work nobody read are not in it.
+    pub needs: Vec<u32>,
 }
 
 impl Palette {
@@ -209,11 +213,23 @@ impl Palette {
     ) -> Vec<Entry> {
         let mut out = Vec::new();
         let listed: Vec<&AgentRow> = rows.iter().collect();
-        for agent in listed
-            .iter()
-            .filter(|a| matches!(crate::sidebar::shown_state(a), "blocked" | "failed"))
-        {
-            out.push(terminal_entry(agent, spaces, "needs you"));
+        for terminal in &self.needs {
+            if let Some(agent) = listed.iter().find(|a| a.terminal == *terminal) {
+                out.push(terminal_entry(agent, spaces, "needs you"));
+            }
+        }
+        // Blocked or failed and not counted: handed to qass, or qass's own tab. Still a tab
+        // somebody may want to go to, so it is found, under its own word.
+        for agent in listed.iter().filter(|a| {
+            matches!(crate::sidebar::shown_state(a), "blocked" | "failed")
+                && !self.needs.contains(&a.terminal)
+        }) {
+            let section = if agent.with_qass {
+                "with qass"
+            } else {
+                "waiting"
+            };
+            out.push(terminal_entry(agent, spaces, section));
         }
         for agent in listed
             .iter()
@@ -709,10 +725,22 @@ mod tests {
         )
     }
 
+    /// A palette opened the way the client opens one: with the terminals the Inbox counts.
+    fn opened_for(rows: &[AgentRow]) -> Palette {
+        Palette {
+            needs: rows
+                .iter()
+                .filter(|r| matches!(crate::sidebar::shown_state(r), "blocked" | "failed"))
+                .map(|r| r.terminal)
+                .collect(),
+            ..Palette::open()
+        }
+    }
+
     #[test]
     fn an_empty_query_lists_what_needs_you_first() {
         let (rows, spaces) = sample();
-        let entries = Palette::open().items(
+        let entries = opened_for(&rows).items(
             &rows,
             &spaces,
             0,
@@ -820,7 +848,7 @@ mod tests {
     #[test]
     fn typing_filters_spaces_agents_and_actions_together() {
         let (rows, spaces) = sample();
-        let mut palette = Palette::open();
+        let mut palette = opened_for(&rows);
         for c in "webshop".chars() {
             palette.push(c);
         }
@@ -948,7 +976,7 @@ mod tests {
     #[test]
     fn picked_follows_the_selection() {
         let (rows, spaces) = sample();
-        let mut palette = Palette::open();
+        let mut palette = opened_for(&rows);
         assert_eq!(
             palette.picked(
                 &rows,

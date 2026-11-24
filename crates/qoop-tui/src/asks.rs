@@ -2590,7 +2590,7 @@ fn bottom_line(pane: &Pane, tab: Option<InTab>, cw: usize, cut: bool) -> Vec<Seg
             false => "ctrl-a T folds this".to_string(),
         }
     } else if !pane.focus {
-        "ctrl-a i focuses this".to_string()
+        "click here to focus this".to_string()
     } else if cut {
         pick_keys(
             cw,

@@ -16,6 +16,7 @@ pub mod graphics;
 pub mod hyperlink;
 pub mod icons;
 pub mod inbox;
+pub mod inbox_pane;
 pub mod input;
 pub mod keys;
 pub mod layout;

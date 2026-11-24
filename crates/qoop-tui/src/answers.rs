@@ -70,6 +70,9 @@ pub enum Pick {
     CardText { card: String, text: String },
     /// A card handed to qass to decide (`AskWrite` `Answer` with `to_qass`).
     CardQass { card: String },
+    /// A card put away unanswered (`AskWrite` `Dismiss`): held like an answer, so it can be
+    /// undone.
+    PutAway { card: String },
     /// The person's words for an agent that ended its turn waiting on them (no menu, so no
     /// seal): typed into its terminal. Keyed by the agent's turn, its `AgentRow::stop`, which
     /// changes when it moves on.
@@ -405,6 +408,37 @@ pub fn note_qass(q: &mut HandInput, rows: &[AgentRow], now: i64) {
     }
     q.away_seen = seen;
     q.listed_machines = rows.iter().map(|r| machine_of(r.workspace)).collect();
+}
+
+/// How a refusal of `pick` reads as a sentence: the daemon's code never reaches the screen.
+/// `machine` is the computer the agent runs on as a person names it ("This Mac", "staging").
+pub fn refusal_words(reason: &str, machine: &str, pick: &Pick) -> String {
+    let here = machine == "This Mac";
+    let max = qoop_runtime::menu::TEXT_MAX;
+    match reason {
+        "already_answered" => "Someone already answered this question.".into(),
+        "busy" => "The agent was still taking keys. Try again in a moment.".into(),
+        "no_such_answer" => "That answer is no longer on the agent's screen.".into(),
+        "not_at_input" => "The agent did not open its answer field, so nothing was typed.".into(),
+        "no_text_field" => "This question takes no typed answer.".into(),
+        "empty" => "There were no words to send.".into(),
+        "too_long" => format!("The answer is too long. Keep it under {max} characters."),
+        "not_a_person" => {
+            "Only a person's window can answer, and this one was not taken as one.".into()
+        }
+        "qass_not_running" if here => "qass is not running, so it cannot take this.".into(),
+        "qass_not_running" => format!("qass is not running on {machine}, so it cannot take this."),
+        "not_watching" => "qass is not watching, so it cannot take this.".into(),
+        "skipped" => "qass leaves this agent alone, so it cannot take this.".into(),
+        r if crate::mux::refused_as_old(r) => match pick {
+            Pick::Qass | Pick::CardQass { .. } => {
+                format!("qoop on {machine} is too old to hand questions to qass.")
+            }
+            Pick::Text { .. } => format!("qoop on {machine} is too old for typed answers."),
+            _ => format!("qoop on {machine} is too old for this answer."),
+        },
+        other => other.to_string(),
+    }
 }
 
 /// qass's rules as its lessons file counts them: the lessons that keep a question the owner's

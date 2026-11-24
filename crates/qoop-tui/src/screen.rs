@@ -179,6 +179,26 @@ pub struct Chrome<'a> {
     pub tab_rails: Vec<crate::tabq::Paint<'a>>,
     /// The question cards as this client last read them, for the column's counts.
     pub cards: &'a [qoop_runtime::control::AskInfo],
+    /// What `ctrl-a tab` goes to next: the first of what the Inbox counts after the agent the
+    /// keyboard is on. `None` when nothing waits.
+    pub next: Option<Next>,
+    /// qass takes a hand-off now: the key row offers `h`.
+    pub hand: bool,
+    /// An answer is on hold in the Inbox: the key row offers `u` and `enter`.
+    pub holding: bool,
+    /// The Inbox's selected card takes the person's own words: the key row offers `r`.
+    pub words: bool,
+}
+
+/// The next thing that needs the person, as the status line names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Next {
+    /// "space/agent".
+    pub who: String,
+    /// What it is doing: "blocked", "failed", "asking".
+    pub word: &'static str,
+    /// Failed, so the line wears the failed ink.
+    pub failed: bool,
 }
 
 /// qass's rail, in pane cells: its tabs start at (`x`, `y`) and are `w` wide, one row per pane in
@@ -276,6 +296,10 @@ impl Default for Chrome<'_> {
             agent_order: None,
             tab_rails: Vec::new(),
             cards: &[],
+            next: None,
+            hand: false,
+            holding: false,
+            words: false,
         }
     }
 }
@@ -343,6 +367,8 @@ pub enum KeyContext {
     Qass,
     /// An agent tab's questions pane has the keyboard (`crate::tabq`): its own keys.
     Questions,
+    /// The Inbox is open over the pane: its own keys.
+    Inbox,
 }
 
 /// One entry of the key row: the key, what it does, and how soon it goes when the row
@@ -360,6 +386,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("n", Some("next"), 3),
             ("m", Some("menu"), 4),
             ("t", Some("chat"), 4),
+            ("i", Some("inbox"), 5),
             ("v", Some("split"), 5),
             ("f", Some("fold"), 6),
             ("F", Some("focus"), 6),
@@ -381,11 +408,22 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("click title", Some("fold or open"), 1),
             ("ctrl-a:", None, 0),
             ("T", Some("fold pane"), 2),
-            ("i", Some("questions"), 2),
+            ("i", Some("inbox"), 2),
             ("t", Some("chat"), 3),
             ("space", Some("find"), 3),
             ("?", Some("keys"), 4),
             ("d", Some("detach"), 0),
+        ],
+        KeyContext::Inbox => &[
+            ("inbox:", None, 0),
+            ("1-9", Some("answer"), 1),
+            ("u", Some("undo"), 2),
+            ("enter", Some("send now"), 2),
+            ("h", Some("hand to qass"), 3),
+            ("r", Some("reply"), 3),
+            ("f", Some("from qass"), 4),
+            ("j k", Some("move"), 5),
+            ("esc", Some("back"), 0),
         ],
         KeyContext::Questions => &[
             ("questions:", None, 0),
@@ -406,7 +444,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("x", Some("close"), 2),
             ("P", Some("save"), 5),
             ("T", Some("fold pane"), 2),
-            ("i", Some("questions"), 3),
+            ("i", Some("inbox"), 1),
             ("r", Some("rename"), 4),
             ("t", Some("chat"), 4),
             ("1..9", Some("go to"), 6),
@@ -454,14 +492,28 @@ pub struct Place {
     pub spaces: bool,
     /// The focused terminal is an agent's, the only kind `t` shows as a chat.
     pub chat: bool,
+    /// qass takes a hand-off now, so `h` in the Inbox does something.
+    pub hand: bool,
+    /// An answer is on hold, so `u` and `enter` in the Inbox do something.
+    pub holding: bool,
+    /// The selected card takes the person's own words, so `r` in the Inbox does something.
+    pub words: bool,
 }
 
 /// Keys that do nothing in some places, and the fact that makes them work.
-fn works(key: &str, place: Place) -> bool {
+fn works(context: KeyContext, key: &str, place: Place) -> bool {
+    // The Inbox's keys mean their own things: `f` is its filter, `r` its reply.
+    if context == KeyContext::Inbox {
+        return match key {
+            "h" => place.hand,
+            "u" | "enter" => place.holding,
+            "r" => place.words,
+            _ => true,
+        };
+    }
     match key {
         "f" => place.fold,
         "T" => place.qass_split,
-        "i" => place.qass,
         "z" => place.panes || place.qass,
         "o" | "e" | "=" => place.panes,
         "s/S" => place.spaces,
@@ -475,7 +527,7 @@ fn works(key: &str, place: Place) -> bool {
 fn hints(context: KeyContext, place: Place) -> Vec<Hint> {
     all_hints(context)
         .iter()
-        .filter(|h| h.1.is_none() || works(h.0, place))
+        .filter(|h| h.1.is_none() || works(context, h.0, place))
         .filter(|h| !place.collapsed || h.0 != "drag edge")
         .map(|h| {
             if place.collapsed && h.1 == Some("hide column") {
@@ -1740,20 +1792,8 @@ pub fn paint(frame: &Frame) -> String {
     // is. Never empty: a blank row is a row that has to be explained.
     // qass's own idling and finishing is not the owner's to see to: only what he watches.
     let (_, watched) = sidebar::shown(frame.spaces, frame.rows);
-    let (notice, notice_role) = match (
-        message,
-        triage(
-            watched,
-            frame.spaces,
-            frame.focused,
-            frame.seen,
-            frame.unseen,
-        ),
-    ) {
-        (Some(message), _) => (
-            message.to_string(),
-            waiting(watched, frame.focused, frame.seen, frame.unseen),
-        ),
+    let (notice, notice_role) = match (message, triage(frame.chrome.next.as_ref())) {
+        (Some(message), _) => (message.to_string(), waiting(frame.chrome.next.as_ref())),
         // Being somewhere other than the bottom wins over what needs a person, because it
         // is the one thing on this row that explains what the pane is showing: a screen
         // that is not moving while an agent works looks broken until it says why.
@@ -1777,7 +1817,7 @@ pub fn paint(frame: &Frame) -> String {
                 true => format!("{next}  \u{b7}  {}", zoomed_note()),
                 false => next,
             },
-            waiting(watched, frame.focused, frame.seen, frame.unseen),
+            waiting(frame.chrome.next.as_ref()),
         ),
         (None, None) => match frame.hint {
             Some(hint) => (hint.to_string(), None),
@@ -1859,6 +1899,9 @@ pub fn paint(frame: &Frame) -> String {
                         .rows
                         .iter()
                         .any(|r| r.terminal == frame.focused && r.agent),
+                hand: frame.chrome.hand,
+                holding: frame.chrome.holding,
+                words: frame.chrome.words,
             },
             frame.cols as usize,
         ))),
@@ -2016,36 +2059,16 @@ pub fn paint(frame: &Frame) -> String {
     out
 }
 
-/// The single next thing to do, when something is waiting: the first of the next row's
-/// queue, so the status line, the next row and `ctrl-a tab` name the same agent.
-///
-/// Blocked first, then failed, then finished-while-away: the first of each in
-/// daemon order, never the focused one. `None` when nothing waits, and then the
-/// status line carries the key list instead, which is how a person finds out they
-/// are done.
-fn triage(
-    rows: &[AgentRow],
-    spaces: &[WorkspaceRow],
-    focused: u32,
-    seen: &sidebar::Seen,
-    unseen: &sidebar::Unseen,
-) -> Option<String> {
-    let row = *sidebar::queue(rows, focused, seen, unseen).first()?;
-    let space = spaces
-        .iter()
-        .find(|s| s.id == row.workspace)
-        .map(|s| s.name.clone())
-        .unwrap_or_else(|| row.workspace.to_string());
-    // A derived idle-after-work is news, not calm: name it finished work
-    // rather than repeating the daemon's idle word.
-    let word = if sidebar::is_new(row, focused, seen, unseen) {
-        "done"
-    } else {
-        crate::sidebar::shown_state(row)
-    };
+/// The single next thing to do, when something is waiting: what `ctrl-a tab` goes to, which
+/// is the first of what the Inbox counts after the agent the keyboard is on, so the status
+/// line, the key and the Inbox name the same one. Finished work nobody read is not in it.
+/// `None` when nothing waits, and then the status line carries the key list instead, which is
+/// how a person finds out they are done.
+fn triage(next: Option<&Next>) -> Option<String> {
+    let next = next?;
     Some(crate::keys::named(&format!(
-        "next: {space}/{} is {word}  ctrl-a tab",
-        crate::palette::label(row),
+        "next: {} is {}  ctrl-a tab",
+        next.who, next.word
     )))
 }
 
@@ -2116,17 +2139,16 @@ fn calm(frame: &Frame, watched: &[AgentRow]) -> String {
     here(frame)
 }
 
-/// The state of the thing the status line is about to name, when something waits.
-///
-/// The same queue [`triage`] reads, so the colour and the words are about one terminal.
-fn waiting(
-    rows: &[AgentRow],
-    focused: u32,
-    seen: &sidebar::Seen,
-    unseen: &sidebar::Unseen,
-) -> Option<theme::Role> {
-    let queue = sidebar::queue(rows, focused, seen, unseen);
-    sidebar::urgency_ink(queue, focused, seen, unseen)
+/// The ink of the thing the status line is about to name, when something waits: the one
+/// [`triage`] reads, so the colour and the words are about one agent.
+fn waiting(next: Option<&Next>) -> Option<theme::Role> {
+    next.map(|n| {
+        if n.failed {
+            theme::Role::Failed
+        } else {
+            theme::Role::Blocked
+        }
+    })
 }
 
 /// How wide the palette box is: most of the window on a narrow one, a centred
@@ -3063,7 +3085,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("c", "new tab"),
             ("r", "rename tab"),
             ("x/P", "close, save"),
-            ("i/T", "questions, fold"),
+            ("i/T", "inbox, fold"),
         ],
     ),
     (
@@ -4520,6 +4542,24 @@ pub fn paint_answer(frame: &Frame, answer: &crate::answer::Answer, out: &mut Str
         }
     }
     out.push_str("\x1b[?25l");
+}
+
+/// The Inbox over the pane: from the first screen row (it takes the tab bar's rows too, the
+/// tabs are a terminal view's), as wide as the pane, every row covered so nothing of the
+/// terminal shows through. The cursor goes where the person types while the box is open.
+pub fn paint_inbox(frame: &Frame, view: &crate::inbox_pane::View, out: &mut String) {
+    let left = left_for(frame.cols, frame.collapsed, frame.sidebar_width);
+    for (i, row) in view.rows.iter().enumerate() {
+        out.push_str(&at(1 + i, left + 1));
+        out.push_str(row);
+    }
+    match view.cursor {
+        Some((row, col)) => {
+            out.push_str(&at(1 + row, left + 1 + col));
+            out.push_str("\x1b[?25h");
+        }
+        None => out.push_str("\x1b[?25l"),
+    }
 }
 
 /// The escape sequence for one run's style, at the session's colour level.
@@ -6813,6 +6853,40 @@ mod tests {
     /// While `ctrl-a` waits the row reads in the keys box's groups, offers no key that
     /// would do nothing here, and a group whose keys all went takes its name with it.
     #[test]
+    fn the_inboxs_key_row_offers_undo_only_with_a_hold_and_reply_only_where_words_are_taken() {
+        let row = |place| strip(&key_row(KeyContext::Inbox, place, 200));
+        let idle = row(Place::default());
+        for gone in [
+            "[u\u{2192}undo]",
+            "[enter\u{2192}send now]",
+            "[r\u{2192}reply]",
+            "[h\u{2192}",
+        ] {
+            assert!(
+                !idle.contains(gone),
+                "{gone} offered with nothing to do: {idle:?}"
+            );
+        }
+        // The Inbox's own `f` is its filter, whether or not a space can fold.
+        assert!(idle.contains("[f\u{2192}from qass]"), "{idle:?}");
+        let holding = row(Place {
+            holding: true,
+            ..Place::default()
+        });
+        assert!(holding.contains("[u\u{2192}undo]") && holding.contains("[enter\u{2192}send now]"));
+        assert!(!holding.contains("[r\u{2192}reply]"));
+        let words = row(Place {
+            words: true,
+            hand: true,
+            ..Place::default()
+        });
+        assert!(words.contains("[r\u{2192}reply]") && words.contains("[h\u{2192}hand to qass]"));
+        // The prefix row's `r` is rename, whatever the Inbox can take.
+        let prefix = strip(&key_row(KeyContext::Prefix, Place::default(), 400));
+        assert!(prefix.contains("[r\u{2192}rename]"), "{prefix:?}");
+    }
+
+    #[test]
     fn the_prefix_row_is_grouped_and_offers_only_what_works_here() {
         let row = |place, cols| strip(&key_row(KeyContext::Prefix, place, cols));
         let one = row(Place::default(), 400);
@@ -6822,7 +6896,7 @@ mod tests {
         let general = one.find("  general [space\u{2192}find]").expect(&one);
         assert!(tab < pane && pane < space && space < general, "{one:?}");
         // One pane, one space, off qass's tab, priority view: nothing that would be refused.
-        for gone in ["[T", "[i", "[z", "[o", "[e", "[=", "[s/S", "[f\u{2192}"] {
+        for gone in ["[T", "[z", "[o", "[e", "[=", "[s/S", "[f\u{2192}"] {
             assert!(
                 !one.contains(gone),
                 "{gone} offered where it does nothing: {one:?}"
@@ -7622,20 +7696,26 @@ mod tests {
         }
     }
 
-    /// The status line's words and colour read one queue, so they name one agent: with
-    /// the keyboard on a blocked agent and another failed, both say failed.
+    /// The status line's words and colour read one next, so they name one agent: a failed one
+    /// says failed and wears the failed ink, a blocked one wears blocked; nothing next, nothing said.
     #[test]
     fn the_status_line_words_and_colour_name_the_same_agent() {
-        let mut failed = blocked_row(2, "claude");
-        failed.state = "failed".to_string();
-        let rows = [blocked_row(1, "codex"), failed];
-        let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
-        let words = triage(&rows, &spaces(), 1, &seen, &unseen).expect("one waits");
-        assert!(words.contains("claude is failed"), "{words}");
-        assert_eq!(waiting(&rows, 1, &seen, &unseen), Some(theme::Role::Failed));
-        // Nothing but the focused agent waits: nothing is next.
-        assert_eq!(triage(&rows[..1], &spaces(), 1, &seen, &unseen), None);
-        assert_eq!(waiting(&rows[..1], 1, &seen, &unseen), None);
+        let failed = Next {
+            who: "work/claude".to_string(),
+            word: "failed",
+            failed: true,
+        };
+        let words = triage(Some(&failed)).expect("one waits");
+        assert!(words.contains("work/claude is failed"), "{words}");
+        assert_eq!(waiting(Some(&failed)), Some(theme::Role::Failed));
+        let blocked = Next {
+            word: "blocked",
+            failed: false,
+            ..failed
+        };
+        assert_eq!(waiting(Some(&blocked)), Some(theme::Role::Blocked));
+        assert_eq!(triage(None), None);
+        assert_eq!(waiting(None), None);
     }
 
     /// Triage: one line saying what to do next, while something waits and the keyboard
@@ -7681,7 +7761,14 @@ mod tests {
             },
             image_notice: None,
             toast: None,
-            chrome: Default::default(),
+            chrome: Chrome {
+                next: Some(Next {
+                    who: "app/codex".to_string(),
+                    word: "blocked",
+                    failed: false,
+                }),
+                ..Default::default()
+            },
         });
         assert!(
             painted.contains("next: app/codex is blocked"),
@@ -7869,7 +7956,10 @@ mod tests {
     fn an_open_palette_lists_what_needs_you_over_the_pane() {
         let rows = [blocked_row(1, "codex"), row(2, "claude", "working")];
         let snapshot = snapshot(&["terminal output"]);
-        let palette = Palette::open();
+        let palette = Palette {
+            needs: vec![1],
+            ..Palette::open()
+        };
         let painted = paint(&Frame {
             armed: None,
             drawer: None,

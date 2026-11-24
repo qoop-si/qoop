@@ -153,7 +153,8 @@ pub enum Action {
     /// Uppercase, like the other pages and boxes on the capitals; the lowercase letter stays
     /// free.
     Qass,
-    /// ctrl-a i, the question inbox beside qass's terminal: open and focus it, or put it away.
+    /// ctrl-a i, the Inbox over the pane, from any tab: everything that needs the person, open
+    /// with the keyboard in it, or put away.
     Asks,
     /// ctrl-a C, the schedules on qass's screen: open and focus the panel, or
     /// put the keyboard back.
