@@ -1409,6 +1409,38 @@ mod place_tests {
             assert!(space < agent && agent < branch && branch < task, "{fields}");
         }
 
+        /// The branch field is never cut: a long branch wraps at the pane's edge and every
+        /// character is there. A branch named after the task is its first five words, which
+        /// is the one rule every client shares (`branch_for`), not a cut of the field.
+        #[test]
+        fn a_long_branch_is_read_whole_at_every_width() {
+            let w = world();
+            let mut new = w.with(|env| NewWork::open(env, Some(1)));
+            // Task, agent, space, then the branch.
+            for _ in 0..3 {
+                new.key(b"\t");
+            }
+            let branch = "feat/fix-the-retry-loop-in-the-webhook-handler-before-friday";
+            new.key(branch.as_bytes());
+            for cols in [24, 40, 80] {
+                let rows = text(&new.view(cols, 24));
+                let at = rows.find("branch ").expect("the branch row");
+                // The value starts on the label's row or, when it is longer than the row,
+                // under it: either way, the rows up to the next blank one.
+                let tail: String = rows[at + 6..]
+                    .lines()
+                    .skip_while(|l| l.trim().is_empty())
+                    .take_while(|l| !l.trim().is_empty())
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect();
+                assert!(tail.starts_with(branch), "{cols}: {tail}\n{rows}");
+            }
+            let mut auto = w.with(|env| NewWork::open(env, Some(1)));
+            auto.key(b"fix the retry loop in the webhook handler");
+            assert_eq!(auto.branch(), "feat/fix-the-retry-loop-in");
+        }
+
         /// The Board's footer says esc closes the whole Inbox, not that it goes back.
         #[test]
         fn the_boards_footer_says_esc_closes() {

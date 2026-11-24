@@ -13132,9 +13132,11 @@ fn out_of_qass(state: &State, rows: &[AgentRow]) -> Option<u32> {
 }
 
 /// `ctrl-a i`: open the Inbox over the pane from any tab and give it the keyboard, or put it
-/// away. True when the agents column was unfolded again, so the terminals must be sized.
+/// away when its list is showing. A place over it (qass's ledger) goes back to the list: the key
+/// means "show me the Inbox", never "close whatever is up". True when the agents column was
+/// unfolded again, so the terminals must be sized.
 fn inbox_toggle(state: &mut State) -> bool {
-    if state.ibx.open {
+    if state.ibx.open && state.ibx.place.is_none() {
         return close_inbox(state);
     }
     open_inbox(state);
@@ -24167,6 +24169,37 @@ mod tests {
         }
     }
 
+    /// The Inbox over an agent page repaints the divider whole: the page's frame under it joins
+    /// the divider at the pane's top and bottom lines (`├`, `┴`), and the Inbox has no such
+    /// lines. The divider is a plain line from the top bend to the bottom one.
+    #[test]
+    fn the_inbox_repaints_the_divider_without_the_pages_joints() {
+        let state = tiled_state();
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let rule = left - 1;
+        let frame = state.frame();
+        let mut painted = screen::paint(&frame);
+        let rows = state.ibx_size().1;
+        let view = crate::inbox_pane::View {
+            rows: vec![String::new(); rows],
+            plain: Vec::new(),
+            targets: Vec::new(),
+            cursor: None,
+        };
+        let joined = cells_of(&painted, state.cols as usize, state.lines as usize);
+        assert!(
+            (1..rows).any(|i| matches!(joined[i][rule], '\u{251c}' | '\u{2534}')),
+            "the page's frame joins the divider before the Inbox covers it"
+        );
+        screen::paint_inbox(&frame, &view, &mut painted);
+        let grid = cells_of(&painted, state.cols as usize, state.lines as usize);
+        assert_eq!(grid[0][rule], '\u{256e}', "the top bend stays");
+        for (at, row) in grid.iter().enumerate().take(rows - 1).skip(1) {
+            assert_eq!(row[rule], '\u{2502}', "row {at}");
+        }
+        assert_eq!(grid[rows - 1][rule], '\u{256f}', "the bottom bend");
+    }
+
     fn ask_card(n: u32, handle: &str) -> qoop_runtime::control::AskInfo {
         use qoop_runtime::control::{AskCard, AskInfo, AskOption};
         AskInfo {
@@ -26825,6 +26858,27 @@ mod tests {
         focus(&mut s, 1, &mut seq, &mut seqs).expect("focus");
         assert!(!s.ibx.open);
         assert_eq!(s.focused, 1);
+    }
+
+    /// `ctrl-a i` with qass's ledger up (opened over the Inbox or not) shows the Inbox list, as
+    /// the key says: it never closes whatever is up, which left the person on the terminal with
+    /// the next keys typed into it. On the list itself it puts the Inbox away.
+    #[test]
+    fn ctrl_a_i_from_the_ledger_shows_the_inbox_list() {
+        for over_the_inbox in [true, false] {
+            let mut s = inbox_state();
+            s.cols = 104;
+            s.lines = 30;
+            if over_the_inbox {
+                open_inbox(&mut s);
+            }
+            assert!(!ledger_toggle(&mut s));
+            assert!(matches!(s.ibx.place, Some(crate::places::Place::Ledger(_))));
+            assert!(!inbox_toggle(&mut s));
+            assert!(s.ibx.open && s.ibx.place.is_none(), "the list shows");
+            assert!(!inbox_toggle(&mut s));
+            assert!(!s.ibx.open, "on the list the key puts it away");
+        }
     }
 
     #[test]
