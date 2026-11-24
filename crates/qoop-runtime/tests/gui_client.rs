@@ -80,6 +80,20 @@ async fn a_window_asking_for_deltas_gets_rows_title_and_cursor_and_is_a_person()
     assert!(rows.len() < screen.rows, "a delta names some rows, not all");
     assert!(rows.windows(2).all(|w| w[0] < w[1]), "in order: {rows:?}");
 
+    // The line above ended with Enter, which holds nothing: a key after it is a draft.
+    let key = client::encode_command_to(
+        terminal,
+        &ClientWire::Input {
+            bytes: b"x".to_vec(),
+            from_terminal: None,
+            from_token: None,
+        },
+        &mut seq,
+    )
+    .expect("encode");
+    wr.write_all(&key).await.expect("type");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
     let mut asker = d.attach("qoop-agents").await;
     let until = match asker
         .control(

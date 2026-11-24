@@ -58,13 +58,13 @@ async fn only_a_person_s_keys_hold_a_terminal() {
     );
     ui.input_to(terminal, b"half a sent").await;
     settle().await;
-    let draft = until(&mut asker, terminal).await.expect("a draft holds it");
+    until(&mut asker, terminal).await.expect("a draft holds it");
     ui.input_to(terminal, b"ence\r").await;
     settle().await;
-    let line = until(&mut asker, terminal).await.expect("a line holds it");
-    assert!(
-        line < draft + 1,
-        "a sent line holds less long than a draft: {line} {draft}"
+    assert_eq!(
+        until(&mut asker, terminal).await,
+        None,
+        "a line already sent holds nothing"
     );
 }
 

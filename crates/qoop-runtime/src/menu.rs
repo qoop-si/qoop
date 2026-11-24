@@ -996,13 +996,7 @@ pub(crate) async fn answer_text(
             bytes: bytes::Bytes::from(bytes),
         })
     };
-    agents.note_person(
-        terminal,
-        words.as_bytes(),
-        true,
-        kind,
-        crate::agents::now_unix(),
-    );
+    agents.note_answer(terminal, kind, crate::agents::now_unix());
     if typed(words.into_bytes()).await.is_err() {
         return refuse(id, ALREADY_ANSWERED);
     }

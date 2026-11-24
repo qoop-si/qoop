@@ -1845,8 +1845,8 @@ pub(crate) fn send_keys_to(
 }
 
 /// `text` into `terminal`, as `qoop send` types it: a paste with `paste`, Enter after it with
-/// `enter`. Refused while a person is at the tab ([`person_refusal`]), unless `grant` lets it
-/// through; only the plugin host passes one.
+/// `enter`. Refused while a person has an unsent draft at the tab ([`person_refusal`]); only the
+/// plugin host passes a `grant`.
 pub(crate) fn send_text_to(
     terminal: u32,
     mut text: String,
@@ -2293,10 +2293,10 @@ pub(crate) struct PersonGrant {
 /// A person at the target tab, as the daemon saw their keys (`PersonAt`): refused, with the
 /// second it frees, so a caller can wait that long. `None` once it is past or nobody is there.
 ///
-/// With a `grant`, a line the person sent there (the 120 s window) no longer holds the write,
-/// but a draft they are typing (the 180 s window: the daemon's `until` is then their last key
-/// plus that) still does, and so do a trust prompt, a blocked agent and a sleeping tab. An
-/// `own` grant (the plugin's own pane) passes the person's windows, draft too, and nothing else.
+/// Only an unsent draft holds a write (the daemon's `until` is their last key plus 180 s); a
+/// line they already sent holds nothing. With a `grant`, a trust prompt, a blocked agent and a
+/// sleeping tab refuse as well. An `own` grant (the plugin's own pane) passes the person's draft
+/// too, and nothing else.
 pub(crate) fn person_refusal(
     until: Option<i64>,
     terminal: u32,
@@ -2312,18 +2312,10 @@ pub(crate) fn person_refusal(
         return None;
     }
     let until = until.filter(|u| *u > now)?;
-    let draft = grant.is_none_or(|g| {
-        g.target
-            .typed_by
-            .as_ref()
-            .is_some_and(|t| t.at + qoop_runtime::agents::PERSON_DRAFT_SECS == until)
-    });
-    draft.then(|| {
-        format!(
-            "a person is at terminal {terminal} until {until} (in {} s): nothing was sent",
-            until - now
-        )
-    })
+    Some(format!(
+        "a person is at terminal {terminal} until {until} (in {} s): nothing was sent",
+        until - now
+    ))
 }
 
 /// [`person_at`] on a connection of its own, for a caller with no runtime: `None` on any
@@ -3936,11 +3928,11 @@ mod tests {
         assert!(why.contains("until 160 (in 60 s)"), "{why}");
     }
 
-    /// A grant lets a write through a line the person sent, never through their draft, a
-    /// trust prompt, a blocked agent or a sleeping tab.
+    /// A draft holds a write with or without a grant, and so do a trust prompt, a blocked agent
+    /// and a sleeping tab; the plugin's own pane passes the draft and nothing else.
     #[test]
-    fn a_grant_passes_a_sent_line_but_never_a_draft() {
-        use qoop_runtime::agents::{PERSON_DRAFT_SECS, PERSON_SENT_SECS};
+    fn a_draft_holds_with_or_without_a_grant() {
+        use qoop_runtime::agents::PERSON_DRAFT_SECS;
         let row = |extra: serde_json::Value| {
             let mut fields = serde_json::json!({"terminal": 4, "workspace": 1, "state": "idle",
                                                 "readiness": "ready"});
@@ -3953,28 +3945,25 @@ mod tests {
             target: row(extra),
             own: false,
         };
-        // A line sent at 90, the last key with it: held until 90 + 120.
-        let sent = grant(serde_json::json!({"typed_by": {"kind": "computer", "at": 90}}));
-        let until = Some(90 + PERSON_SENT_SECS);
+        // Keys at 95 with no Enter after them, a draft: held until the last key plus 180.
+        let until = Some(95 + PERSON_DRAFT_SECS);
+        let idle = grant(serde_json::json!({}));
         assert!(
             person_refusal(until, 4, 100, None).is_some(),
             "no grant: held"
         );
-        assert_eq!(person_refusal(until, 4, 100, Some(&sent)), None, "granted");
-        // Keys after it, a draft: held until the last key plus 180, grant or not.
-        let draft = grant(serde_json::json!({"typed_by": {"kind": "computer", "at": 95}}));
-        let until = Some(95 + PERSON_DRAFT_SECS);
         assert!(
-            person_refusal(until, 4, 100, Some(&draft)).is_some(),
+            person_refusal(until, 4, 100, Some(&idle)).is_some(),
             "a draft holds"
         );
+        assert_eq!(person_refusal(None, 4, 100, Some(&idle)), None, "no draft");
         let blocked = grant(serde_json::json!({"state": "blocked"}));
         let why = person_refusal(None, 4, 100, Some(&blocked)).expect("blocked");
         assert!(why.contains("waiting on an answer"), "{why}");
         let asleep = grant(serde_json::json!({"state": "sleeping"}));
         assert!(person_refusal(None, 4, 100, Some(&asleep)).is_some());
         // The plugin's own pane: even a draft there does not hold it, a blocked one still does.
-        let mut own = grant(serde_json::json!({"typed_by": {"kind": "computer", "at": 95}}));
+        let mut own = grant(serde_json::json!({}));
         own.own = true;
         assert_eq!(
             person_refusal(until, 4, 100, Some(&own)),

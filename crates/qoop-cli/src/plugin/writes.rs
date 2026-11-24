@@ -769,9 +769,9 @@ fn person_kind(kind: &str) -> bool {
     matches!(kind, "computer" | "phone" | "browser" | "attach")
 }
 
-/// As [`send`], through the same code `qoop send` runs, in this process with `grant`: a line
-/// the person sent at the target does not hold it back; everything else that refuses a send
-/// still does ([`crate::person_refusal`]).
+/// As [`send`], through the same code `qoop send` runs, in this process with `grant`: what
+/// refuses a send (a draft, a trust prompt, a blocked agent, a sleeping tab) still does
+/// ([`crate::person_refusal`]).
 async fn send_granted(
     terminal: u32,
     text: &str,
