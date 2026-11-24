@@ -13,8 +13,9 @@ use crate::layout::Rect;
 use crate::theme::{self, Role};
 use crate::width;
 
-/// What the line says under an agent that needs the person. Fixed words: a question is never
-/// cut to fit here, it is read in the Inbox.
+/// What the line says under an agent that needs the person, written with the default prefix and
+/// named for the person's own (`keys::named`). Fixed words: a question is never cut to fit here,
+/// it is read in the Inbox.
 pub const WORDS: &str = "needs you: ctrl-a i answers";
 
 /// A tile smaller than this, frame included, gets no line at all: the agent needs the room more.
@@ -77,7 +78,9 @@ fn progress(task: &TaskRef) -> Vec<String> {
 pub fn row(paint: &Paint, task: Option<&TaskRef>, fade: bool) -> String {
     let w = paint.rect.cols;
     let ink = |role: Role| theme::fg(if fade { Role::Unobserved } else { role });
-    let words = paint.waiting.then_some(WORDS);
+    // Said with the prefix the person chose: `ctrl-a` and `ctrl-b` are the same width.
+    let named = crate::keys::named(WORDS);
+    let words = paint.waiting.then_some(named.as_str());
     // A blank in from each edge, and two between the words and the progress.
     let left = words.map_or(0, |t| 1 + width::width(t));
     let right = task.and_then(|task| {
@@ -131,6 +134,26 @@ mod tests {
             steps_done: done,
             steps_total: total,
         }
+    }
+
+    /// The line names the prefix the person chose, not the default.
+    #[test]
+    fn the_line_names_the_chosen_prefix() {
+        crate::keys::TEST_PREFIX.with(|c| c.set(Some(0x02)));
+        let paint = Paint {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                cols: 60,
+                rows: 1,
+            },
+            terminal: 1,
+            waiting: true,
+        };
+        let said = text(&row(&paint, None, false));
+        crate::keys::TEST_PREFIX.with(|c| c.set(None));
+        assert!(said.contains("needs you: ctrl-b i answers"), "{said:?}");
+        assert!(!said.contains("ctrl-a"), "{said:?}");
     }
 
     /// The line's text, escapes taken out and trailing blanks kept.

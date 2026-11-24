@@ -1579,9 +1579,6 @@ impl Desk {
                                         Some(k) => ui::word_ink(k, t),
                                         None => t.t2,
                                     }))
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
                                     .child(words),
                             )
                             .child(
@@ -1591,15 +1588,7 @@ impl Desk {
                                     .text_color(c(t.t2))
                                     .child(state::took(r).unwrap_or_default()),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(line),
-                            )
+                            .child(div().flex_1().min_w_0().child(line))
                             .child({
                                 let id = r.id;
                                 ui::link_button(("earlier", id as u64), "Report", t)

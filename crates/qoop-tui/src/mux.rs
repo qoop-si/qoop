@@ -250,7 +250,7 @@ struct Link {
     /// The answers (to a menu, to qass) sent and not answered, by request id, with the request's
     /// name: a daemon too old to read one refuses it with no id, naming only the variant, and
     /// the refusal is given back under the id of the request it was for.
-    answers: BTreeMap<String, &'static str>,
+    answers: Vec<(String, &'static str)>,
     /// This link just created, closed or renamed something and its lists in the cache are
     /// older than that answer. The interface asks for fresh ones right after such an
     /// answer, and a merged list built from the old one in between would show a new tab
@@ -288,7 +288,7 @@ impl Link {
             desired: BTreeSet::new(),
             hidden: BTreeSet::new(),
             inflight: BTreeSet::new(),
-            answers: BTreeMap::new(),
+            answers: Vec::new(),
             stale_agents: false,
             stale_spaces: false,
             agents_seen: false,
@@ -913,7 +913,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             if sent {
                 l.inflight.insert(id.clone());
                 if let Some(name) = answer_variant(&request) {
-                    l.answers.insert(id.clone(), name);
+                    l.answers.push((id.clone(), name));
                 }
             }
             sent
@@ -1712,6 +1712,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 l.agents.clear();
                 l.splits.clear();
                 l.desired.clear();
+                note_unlisted(link, true);
                 // Asked for while it closed: up again at once for what is waiting.
                 if !l.pending.is_empty() {
                     l.parked.send_replace(false);
@@ -1884,7 +1885,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             return Ok(());
         };
         l.inflight.remove(&id);
-        l.answers.remove(&id);
+        l.answers.retain(|(i, _)| *i != id);
         let name = l.name.clone();
         match response {
             C::Agents { agents, splits, .. } => {
@@ -1902,6 +1903,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     .collect();
                 l.stale_agents = false;
                 l.agents_seen = true;
+                note_unlisted(link, false);
                 let id = if id.starts_with("mux-") {
                     "mux".to_string()
                 } else {
@@ -2052,21 +2054,16 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             // A machine running a qoop from before an ask existed says so in its own words,
             // which name a fix for itself. Over ssh that fix is on the other machine, and a
             // newer qoop there may be on its way from here already: said as it is, no more.
-            C::Failed { id, reason }
-                if !name.is_empty() && reason.contains("older than the client") =>
-            {
-                // No id: the daemon could not read the request. The one it names is the answer
-                // asked under that variant, and the refusal goes back under its id.
+            C::Failed { id, reason } if reason.contains("older than the client") => {
+                // No id: the daemon could not read the request. The oldest one asked under the
+                // variant it names is the answer, and the refusal goes back under its id: for
+                // This Mac's daemon too, which an interface just updated past can be older.
                 let id = if id.is_empty() {
                     self.link(link)
                         .and_then(|l| {
                             let variant = refused_variant(&reason)?;
-                            let at = l
-                                .answers
-                                .iter()
-                                .find(|(_, v)| **v == variant)
-                                .map(|(id, _)| id.clone())?;
-                            l.answers.remove(&at);
+                            let at = l.answers.iter().position(|(_, v)| *v == variant)?;
+                            let (at, _) = l.answers.remove(at);
                             l.inflight.remove(&at);
                             Some(at)
                         })
@@ -2074,7 +2071,8 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 } else {
                     id
                 };
-                self.failed(id, format!("{name} {OLDER_QOOP}")).await
+                let who = if name.is_empty() { "This Mac" } else { &name };
+                self.failed(id, format!("{who} {OLDER_QOOP}")).await
             }
             C::WorkspaceAsleep {
                 id,
@@ -2415,13 +2413,18 @@ pub fn refused_as_old(reason: &str) -> bool {
     qoop_runtime::control::too_old_for(reason, None) || reason.contains(OLDER_QOOP)
 }
 
-/// The name of an answer to a menu or to qass, for [`Link::answers`]: the requests a remote
-/// from before them refuses as unknown.
+/// The name of a request a daemon from before it refuses as unknown (an answer to a menu or to
+/// qass, a read of a chat, the cards, what qass did or the board), for [`Link::answers`]: the
+/// refusal names only the variant and gives no id, so it is matched back to its request here.
 fn answer_variant(request: &ControlRequest) -> Option<&'static str> {
     match request {
         ControlRequest::AnswerMenu { .. } => Some("AnswerMenu"),
         ControlRequest::AnswerMenuText { .. } => Some("AnswerMenuText"),
         ControlRequest::HandToQass { .. } => Some("HandToQass"),
+        ControlRequest::Messages { .. } => Some("Messages"),
+        ControlRequest::AskRead { .. } => Some("AskRead"),
+        ControlRequest::QassActs { .. } => Some("QassActs"),
+        ControlRequest::TaskRead { .. } => Some("TaskRead"),
         _ => None,
     }
 }
@@ -2442,6 +2445,28 @@ static NO_MENUS: std::sync::Mutex<BTreeSet<usize>> = std::sync::Mutex::new(BTree
 
 pub fn machines_without_menus() -> BTreeSet<usize> {
     NO_MENUS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The machines (by number, This Mac's included) whose link dropped and has not yet given an agent
+/// list since: what the interface holds an answer for, because the terminal numbers it knows may
+/// be other agents' after a restart or a reconnect.
+static UNLISTED: std::sync::Mutex<BTreeSet<usize>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// Empty under test, so a mux test of one link never holds another test's answers.
+pub fn machines_unlisted() -> BTreeSet<usize> {
+    if cfg!(test) {
+        return BTreeSet::new();
+    }
+    UNLISTED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn note_unlisted(link: usize, unlisted: bool) {
+    let mut set = UNLISTED.lock().unwrap_or_else(|e| e.into_inner());
+    if unlisted {
+        set.insert(link);
+    } else {
+        set.remove(&link);
+    }
 }
 
 fn note_menus(link: usize, version: &str) {
@@ -3181,6 +3206,153 @@ mod tests {
         );
         // Another failure is not taken for it.
         assert!(!refused_as_old("busy") && !refused_as_old("already_answered"));
+    }
+
+    /// This Mac's own daemon, older than the interface (it was just updated past it), refuses
+    /// a read it does not know with no id: the refusal is matched back to the oldest request
+    /// asked under that variant, the chat, the cards, what qass did and the board included, so a
+    /// screen does not wait on it for good.
+    #[tokio::test]
+    async fn an_older_home_daemons_refusal_with_no_id_goes_back_to_its_request() {
+        let (mut mux, mut home_rx, _remote_rx, _events) = two_links();
+        let reads = [
+            (
+                "Messages",
+                ControlRequest::Messages {
+                    id: "chat-10".into(),
+                    terminal: 3,
+                    skip: 0,
+                    limit: 20,
+                    revision: None,
+                },
+            ),
+            (
+                "AskRead",
+                ControlRequest::AskRead {
+                    id: "asks-9".into(),
+                    all: false,
+                },
+            ),
+            (
+                "QassActs",
+                ControlRequest::QassActs {
+                    id: "acts-9".into(),
+                    since: 0,
+                },
+            ),
+            (
+                "TaskRead",
+                ControlRequest::TaskRead {
+                    id: "board-9".into(),
+                    board: true,
+                    task: None,
+                    terminal: None,
+                    token: None,
+                    before: None,
+                },
+            ),
+        ];
+        for (variant, request) in reads {
+            let id = request.request_id().to_string();
+            mux.control(request).await.expect("sent");
+            let _: ControlRequest = body_of(&home_rx.try_recv().expect("home was asked"));
+            mux.down.clear();
+            mux.answer(
+                0,
+                ControlResponse::Failed {
+                    id: String::new(),
+                    reason: format!(
+                        "this daemon is older than the client that called it: it does not know \
+                         the method that was asked for (unknown variant `{variant}`)"
+                    ),
+                },
+            )
+            .await
+            .expect("answered");
+            let said: ControlResponse = body_of(&mux.down);
+            let ControlResponse::Failed { id: back, reason } = &said else {
+                panic!("{said:?}");
+            };
+            assert_eq!(
+                back, &id,
+                "{variant}: the refusal is not under its request's id"
+            );
+            assert!(
+                refused_as_old(reason) && reason.starts_with("This Mac"),
+                "{reason}"
+            );
+        }
+        // Sent in order, ids ordered as text ("x-10" before "x-9"): the older one is answered first.
+        for id in ["read-9", "read-10"] {
+            mux.control(ControlRequest::AskRead {
+                id: id.into(),
+                all: false,
+            })
+            .await
+            .expect("sent");
+            let _: ControlRequest = body_of(&home_rx.try_recv().expect("asked"));
+        }
+        mux.down.clear();
+        mux.answer(
+            0,
+            ControlResponse::Failed {
+                id: String::new(),
+                reason: "older than the client: unknown variant `AskRead`".into(),
+            },
+        )
+        .await
+        .expect("answered");
+        let said: ControlResponse = body_of(&mux.down);
+        assert_eq!(said.request_id(), "read-9");
+    }
+
+    /// A link that dropped is unlisted until it gives an agent list again, so the interface holds
+    /// its answers meanwhile; a list from another link changes nothing for it.
+    #[tokio::test]
+    async fn a_dropped_link_is_unlisted_until_its_agents_are_listed_again() {
+        // A link number no other test uses: the set is the process's.
+        let link = 98;
+        let (events, _events) = mpsc::channel(1);
+        let mut links: Vec<Option<Link>> = (0..=link).map(|_| None).collect();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut far = Link::new("far".into(), None);
+        far.conn = Some((1, tx));
+        links[link] = Some(far);
+        let mut mux = Mux {
+            links,
+            home: link,
+            down: Vec::new(),
+            down_seqs: BTreeMap::new(),
+            pushed_spaces: Vec::new(),
+            last_link: link,
+            order: Vec::new(),
+            order_file: None,
+            events,
+            only: None,
+            tried: BTreeSet::new(),
+        };
+        let listed = || UNLISTED.lock().unwrap().contains(&link);
+        assert!(!listed());
+        mux.on_link(FromLink::Down {
+            link,
+            conn: 1,
+            reason: "gone".into(),
+        })
+        .await
+        .expect("down");
+        assert!(listed(), "dropped, no list since");
+        mux.answer(
+            link,
+            ControlResponse::Agents {
+                id: "mux-agents".into(),
+                agents: Vec::new(),
+                splits: Vec::new(),
+                qass_checks: None,
+            },
+        )
+        .await
+        .expect("answered");
+        assert!(!listed(), "its agents are listed again");
     }
 
     /// A machine from before menus (0.14.0 and older) is known as one, for the Inbox to offer Open

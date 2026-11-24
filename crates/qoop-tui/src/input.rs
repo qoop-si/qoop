@@ -34,6 +34,17 @@ pub const HOLD: Duration = Duration::from_millis(10);
 /// is a report, and typing it into the pane would be the one wrong answer.
 const DRAG_HOLD: Duration = Duration::from_secs(1);
 
+/// What opens and closes a bracketed paste.
+pub const PASTE_ON: &[u8] = b"\x1b[200~";
+pub const PASTE_OFF: &[u8] = b"\x1b[201~";
+
+/// How long the start of a paste's opening bracket (`ESC [`, `ESC [ 2`, `ESC [ 20`, `ESC [ 200`)
+/// waits for the rest. Longer than [`HOLD`]: the bytes after it are a paste, and typed as keys
+/// they would be commands. One more case is not held: a read that ends on a lone `ESC` cannot
+/// be told from the Esc key, which an overlay must close on at once, so a bracket cut there
+/// stays cut.
+const PASTE_HOLD: Duration = Duration::from_millis(100);
+
 /// The longest report this reads. A colour answer is about thirty bytes; anything much
 /// longer that has not ended is not one of these and is handed on as typed.
 const MAX_REPORT: usize = 96;
@@ -152,6 +163,8 @@ impl Reports {
     pub fn deadline(&self) -> Option<Instant> {
         let wait = if self.held.starts_with(b"\x1b]72;") {
             DRAG_HOLD
+        } else if PASTE_ON.starts_with(&self.held) {
+            PASTE_HOLD
         } else {
             HOLD
         };
@@ -186,6 +199,11 @@ fn classify(bytes: &[u8]) -> Found {
 
 /// `CSI I`, `CSI O`, `CSI ? 997 ; n n` and the device attributes `CSI ? ... c`.
 fn csi(bytes: &[u8]) -> Found {
+    // The start of a paste's opening bracket cut off by the read: held for the rest, so what
+    // follows is a paste and never keys. The whole bracket is not a report and passes.
+    if bytes.len() < PASTE_ON.len() && PASTE_ON.starts_with(bytes) {
+        return Found::Partial;
+    }
     match bytes.get(2) {
         None => return Found::Partial,
         Some(b'I') => return Found::Report(3, Some(Report::Focus(true))),
@@ -395,6 +413,37 @@ mod tests {
         let (out, reports) = strip(b"ab\x1b[Ocd\x1b[I");
         assert_eq!(out, b"abcd");
         assert_eq!(reports, vec![Report::Focus(false), Report::Focus(true)]);
+    }
+
+    /// An opening paste bracket cut by the end of a read at any point (`ESC [`, `ESC [ 2`,
+    /// `ESC [ 20`, `ESC [ 200`) is held and joined to the next read, so the paste is a paste
+    /// and never keys; the wait is the longer paste one. A lone `ESC` stays the Esc key.
+    #[test]
+    fn an_opening_paste_bracket_cut_by_a_read_is_held_and_rejoined() {
+        for cut in 2..PASTE_ON.len() {
+            let mut filter = Reports::default();
+            let (out, reports) = filter.strip(&[b"a".as_slice(), &PASTE_ON[..cut]].concat());
+            assert_eq!(out, b"a", "cut at {cut}");
+            assert!(reports.is_empty());
+            let wait = filter.deadline().expect("held") - Instant::now();
+            assert!(
+                wait > HOLD * 3,
+                "cut at {cut}: the paste wait, not the key wait"
+            );
+            let (out, _) = filter.strip(&[&PASTE_ON[cut..], b"2\rxh\n"].concat());
+            assert_eq!(out, [PASTE_ON, b"2\rxh\n"].concat(), "cut at {cut}");
+        }
+        // The whole bracket and a lone escape are not held.
+        let mut filter = Reports::default();
+        let (out, _) = filter.strip(PASTE_ON);
+        assert_eq!(out, PASTE_ON);
+        assert_eq!(filter.deadline(), None);
+        // Nothing came after the start: given back as typed once the wait ran out.
+        let (out, _) = filter.strip(&PASTE_ON[..4]);
+        assert!(out.is_empty());
+        filter.expire();
+        let (out, _) = filter.strip(b"q");
+        assert_eq!(out, [&PASTE_ON[..4], b"q"].concat());
     }
 
     #[test]

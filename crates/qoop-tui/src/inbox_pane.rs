@@ -24,7 +24,8 @@ use crate::answers::{
 };
 use crate::asks::wrap_whole;
 use crate::inbox::{Context, Inbox, Item, ItemKind, OwnAnswer};
-use crate::mux::machine_of;
+use crate::input::{PASTE_OFF, PASTE_ON};
+use crate::mux::{machine_of, machine_of_terminal};
 use crate::places::{Beside, Place, PlaceOut};
 use crate::segs::{Seg, bold, line, seg};
 use crate::theme::Role;
@@ -318,7 +319,27 @@ pub struct Pane {
     offset: Cell<usize>,
     max_offset: Cell<usize>,
     follow: Cell<bool>,
+    /// Between a paste's opening bracket and its closing one: the client reads stdin in blocks,
+    /// so one paste comes in several reads and the state outlives each of them.
+    in_paste: bool,
+    /// The card the person had selected left the list and the selection fell to another: digits
+    /// answer nothing until a key moves the selection, so a digit typed at that moment never
+    /// answers for an agent the person was not looking at.
+    fell: bool,
+    /// The start of a closing bracket cut off at the end of a read, for the next one.
+    carry: Vec<u8>,
+    /// When the last read inside a paste came: a paste with no byte for [`PASTE_IDLE`] is over.
+    paste_seen: Option<Instant>,
+    /// The machines whose link dropped and has not given an agent list since: a pick for one of
+    /// them stays held (the terminal numbers it knows may be other agents' now).
+    pub unlisted: BTreeSet<usize>,
+    /// The parts of the last read not yet taken up: what is left after a part that asked something
+    /// of the client (see [`Pane::key`]).
+    parts: std::collections::VecDeque<(bool, Vec<u8>, bool)>,
 }
+
+/// How long a paste may go without a byte before its missing closing bracket is given up on.
+const PASTE_IDLE: Duration = Duration::from_secs(1);
 
 impl Pane {
     pub fn new() -> Pane {
@@ -328,6 +349,10 @@ impl Pane {
     /// Open the Inbox over the pane.
     pub fn open(&mut self) {
         self.stash_place();
+        self.in_paste = false;
+        self.carry.clear();
+        self.parts.clear();
+        self.fell = false;
         self.open = true;
         self.whole = false;
         self.board = false;
@@ -419,7 +444,17 @@ impl Pane {
             .cloned()
     }
 
-    fn select(&mut self, slot: Slot) {
+    /// The selection left the list: note it, and fall to the first until a key moves it.
+    fn note_fell(&mut self, env: &Env) {
+        let order = self.order(&self.inbox(env));
+        if self.sel.as_ref().is_some_and(|s| !order.contains(s)) {
+            self.sel = None;
+            self.fell = !order.is_empty();
+        }
+    }
+
+    pub fn select(&mut self, slot: Slot) {
+        self.fell = false;
         if self.sel.as_ref() != Some(&slot) {
             self.whole = false;
             self.stash_typing();
@@ -772,7 +807,18 @@ impl Pane {
 
     /// Send the held answer of `slot` now, else the newest.
     fn send_now(&mut self, slot: Option<&Slot>, env: &Env) {
+        self.drop_stale(env);
         let slot = slot.filter(|s| self.holds.of(s).is_some());
+        let target = slot
+            .and_then(|s| self.holds.of(s))
+            .or(self.holds.held.last());
+        if target.is_some_and(|h| Self::unlisted_hold(&self.unlisted, h)) {
+            self.say(
+                "that computer is reconnecting: it is sent once its agents are listed",
+                env,
+            );
+            return;
+        }
         let taken = self.holds.send_now(slot);
         self.send(taken, env);
     }
@@ -820,11 +866,22 @@ impl Pane {
                     // Never into a line the person began in that terminal since the reply was
                     // held: the words go back to a draft on the card.
                     let began = hold.until.checked_sub(HOLD);
-                    if env
+                    // Not into a number that may be another agent's after a reconnect.
+                    if Self::unlisted_hold(&self.unlisted, &hold) {
+                        self.drafts.insert(hold.slot.clone(), text.clone());
+                        self.said.insert(
+                            hold.slot.clone(),
+                            "that computer is reconnecting, so nothing was typed; your reply is kept here"
+                                .into(),
+                        );
+                        continue;
+                    }
+                    let by_me = env
                         .typed
                         .get(&terminal)
-                        .is_some_and(|at| began.is_none_or(|b| *at > b))
-                    {
+                        .is_some_and(|at| began.is_none_or(|b| *at > b));
+                    // Or by any other client: the daemon records the last person to type there.
+                    if by_me || hold.typed_since(env.row(terminal), env.now, env.now_unix) {
                         self.drafts.insert(hold.slot.clone(), text.clone());
                         self.said.insert(
                             hold.slot.clone(),
@@ -1057,25 +1114,46 @@ impl Pane {
                 }
             }
         }
-        for hold in self.holds.menus(env.rows, env.now) {
-            let by = hold
-                .terminal()
-                .and_then(|t| env.row(t))
-                .and_then(|r| r.answered.as_ref())
-                .map(|a| {
-                    format!(
-                        "Answered on the {}: {}.",
-                        match a.by.as_str() {
-                            "computer" => "Mac",
-                            "phone" => "iPhone",
-                            "attach" => "terminal",
-                            other => other,
-                        },
-                        a.label
-                    )
-                });
-            let words =
-                by.unwrap_or_else(|| refusal_words("already_answered", "This Mac", &hold.pick));
+        self.drop_stale(env);
+        self.note_fell(env);
+    }
+
+    /// Whether `hold` is for an agent of a machine that has not listed its agents since its link
+    /// dropped.
+    fn unlisted_hold(unlisted: &BTreeSet<usize>, hold: &Hold) -> bool {
+        hold.terminal()
+            .is_some_and(|t| unlisted.contains(&machine_of_terminal(t)))
+    }
+
+    /// Drop the picks that no longer stand, and say under their card why: a menu that changed
+    /// or went, a card that is no longer open, a computer that is not reached. Run on every
+    /// new list or card read, and again right before anything is sent.
+    fn drop_stale(&mut self, env: &Env) {
+        let mut dropped = self.holds.menus(env.rows, env.now);
+        dropped.extend(self.holds.stale(env.cards, &env.ctx.lost));
+        for hold in dropped {
+            let words = match &hold.slot {
+                Slot::Card(_) => "This card is no longer open, so nothing was sent.".to_string(),
+                Slot::Agent(t) if env.ctx.lost.contains(&machine_of_terminal(*t)) => {
+                    "That computer is not reached, so nothing was sent.".to_string()
+                }
+                Slot::Agent(t) => env
+                    .row(*t)
+                    .and_then(|r| r.answered.as_ref())
+                    .map(|a| {
+                        format!(
+                            "Answered on the {}: {}.",
+                            match a.by.as_str() {
+                                "computer" => "Mac",
+                                "phone" => "iPhone",
+                                "attach" => "terminal",
+                                other => other,
+                            },
+                            a.label
+                        )
+                    })
+                    .unwrap_or_else(|| refusal_words("already_answered", "This Mac", &hold.pick)),
+            };
             self.said.insert(hold.slot, words);
         }
     }
@@ -1084,7 +1162,13 @@ impl Pane {
     /// [`Pane::take`]. True when the screen changed.
     pub fn tick(&mut self, env: &Env) -> bool {
         let mut moved = false;
-        let due = self.holds.due(env.now);
+        // What a hold was made on is looked at again before it is sent: rows and cards that
+        // changed since, a computer that went away.
+        self.drop_stale(env);
+        let unlisted = &self.unlisted;
+        let due = self
+            .holds
+            .due_where(env.now, |h| !Self::unlisted_hold(unlisted, h));
         if !due.is_empty() {
             self.send(due, env);
             moved = true;
@@ -1112,11 +1196,17 @@ impl Pane {
 
     /// Send what is on hold now, Undo or not: the interface is leaving.
     pub fn flush(&mut self, env: &Env) {
+        self.drop_stale(env);
         let all = self.holds.flush();
         self.send(all, env);
         for (_, hold) in std::mem::take(&mut self.retry) {
             self.send_one(hold, true);
         }
+    }
+
+    /// Whether an answer was asked and the daemon has not answered it yet.
+    pub fn awaiting(&self) -> bool {
+        !self.sending.is_empty()
     }
 
     /// Whether something is waiting to be sent.
@@ -1174,9 +1264,129 @@ impl Pane {
 
     /// A key, or the bytes of several. `prefix` is the interface's prefix byte, which with a
     /// mouse report or a detach is not the Inbox's and goes back.
+    ///
+    /// A read is cut at the paste brackets and its parts are taken in order. A part that asks
+    /// something of the client (a jump, a box, the prefix) stops the run: what is left waits in
+    /// the pane for [`Pane::resume`] and [`Pane::take_rest`], so no byte after a command is lost.
     pub fn key(&mut self, bytes: &[u8], prefix: u8, env: &Env) -> Out {
-        // From the prefix, a mouse report or a detach on, the bytes are the ordinary path's,
-        // wherever in the read they come: what came before them is the Inbox's.
+        // A paste whose closing bracket never came: no byte for a second, or a mouse report,
+        // ends it, so the prefix and Esc work again.
+        if self.in_paste
+            && (bytes.starts_with(b"\x1b[<")
+                || self
+                    .paste_seen
+                    .is_some_and(|at| env.now.saturating_duration_since(at) >= PASTE_IDLE))
+        {
+            self.in_paste = false;
+            self.carry.clear();
+        }
+        self.parts = self.paste_parts(bytes).into();
+        self.paste_seen = self.in_paste.then_some(env.now);
+        self.resume(prefix, env)
+    }
+
+    /// Take the parts left by [`Pane::key`] up again, once what it asked has been done. `Stay`
+    /// when none is left.
+    pub fn resume(&mut self, prefix: u8, env: &Env) -> Out {
+        while let Some((pasted, part, _)) = self.parts.pop_front() {
+            let out = if pasted {
+                self.paste_keys(&part, env)
+            } else {
+                self.plain_keys(&part, prefix, env)
+            };
+            if !matches!(out, Out::Stay) {
+                return out;
+            }
+        }
+        Out::Stay
+    }
+
+    /// Whether parts of a read wait to be taken up.
+    pub fn has_rest(&self) -> bool {
+        !self.parts.is_empty()
+    }
+
+    /// What is left of the read as the bytes it came as, the brackets put back, for the
+    /// ordinary path when the Inbox is no longer the one reading.
+    pub fn take_rest(&mut self) -> Vec<u8> {
+        self.in_paste = false;
+        self.carry.clear();
+        std::mem::take(&mut self.parts)
+            .into_iter()
+            .flat_map(|(pasted, part, closed)| {
+                if pasted {
+                    let off: &[u8] = if closed { PASTE_OFF } else { b"" };
+                    [PASTE_ON, &part, off].concat()
+                } else {
+                    part
+                }
+            })
+            .collect()
+    }
+
+    /// `bytes` cut at the paste brackets, brackets left out: each part with whether it is inside
+    /// a paste, and whether that paste was closed in this read. Whether a read is inside one is
+    /// kept from the reads before it. An opening bracket cut by the end of a read never gets
+    /// here: the report filter holds its start for the rest (`input::Reports`), but for a lone
+    /// `ESC`, which cannot be told from the Esc key.
+    fn paste_parts(&mut self, bytes: &[u8]) -> Vec<(bool, Vec<u8>, bool)> {
+        let mut data = std::mem::take(&mut self.carry);
+        data.extend_from_slice(bytes);
+        let mut parts = Vec::new();
+        let mut at = 0;
+        loop {
+            let rest = &data[at..];
+            let bracket = if self.in_paste { PASTE_OFF } else { PASTE_ON };
+            if let Some(i) = rest.windows(bracket.len()).position(|w| w == bracket) {
+                if i > 0 {
+                    parts.push((self.in_paste, rest[..i].to_vec(), self.in_paste));
+                }
+                self.in_paste = !self.in_paste;
+                at += i + bracket.len();
+                continue;
+            }
+            // A bracket cut off by the end of the read waits for the next, with no timer: inside a
+            // paste its closing one, and outside the part of an opening one that is already more
+            // than an Esc and a bracket (`ESC [ 2`, `ESC [ 20`, `ESC [ 200`), which means nothing to
+            // the Inbox as keys. The report filter holds them too, for a moment; this is for the
+            // read that comes later.
+            let least = if self.in_paste { 1 } else { 3 };
+            let wait = (least..bracket.len())
+                .rev()
+                .find(|&n| rest.ends_with(&bracket[..n]))
+                .unwrap_or(0);
+            let end = rest.len() - wait;
+            if end > 0 {
+                parts.push((self.in_paste, rest[..end].to_vec(), false));
+            }
+            self.carry = rest[end..].to_vec();
+            return parts;
+        }
+    }
+
+    /// Whether a box that takes words is open: a paste is text for it, and nothing anywhere else.
+    fn box_open(&self) -> bool {
+        match &self.place {
+            Some(Place::Ledger(ledger)) => ledger.typing(),
+            Some(Place::New(_)) => true,
+            Some(Place::Computer(_)) => false,
+            None => self.typing.is_some(),
+        }
+    }
+
+    /// Pasted text: words for an open box, as one paste; dropped otherwise, so no byte of it is a
+    /// command (`2` holds an option, `\r` sends it, `x` puts a card away).
+    fn paste_keys(&mut self, text: &[u8], env: &Env) -> Out {
+        if !self.box_open() {
+            return Out::Stay;
+        }
+        let whole = [PASTE_ON, text, PASTE_OFF].concat();
+        self.own_keys(&whole, env)
+    }
+
+    /// Typed keys: from the prefix, a mouse report or a detach on, the bytes are the ordinary
+    /// path's, wherever in the read they come: what came before them is the Inbox's.
+    fn plain_keys(&mut self, bytes: &[u8], prefix: u8, env: &Env) -> Out {
         let at = (0..bytes.len())
             .find(|&i| bytes[i] == prefix || bytes[i] == 0x11 || bytes[i..].starts_with(b"\x1b[<"));
         let (mine, rest) = match at {
@@ -1292,6 +1502,7 @@ impl Pane {
         if self.board {
             return self.board_key(key, env);
         }
+        self.note_fell(env);
         let inbox = self.inbox(env);
         let item = self.item(&inbox);
         let order = self.order(&inbox);
@@ -1333,6 +1544,12 @@ impl Pane {
                 self.step(false, env);
                 Out::Stay
             }
+            // Enter is Send now or Open: for the card the person was on, not the one that took its
+            // place.
+            Key::Char(b'1'..=b'9' | b'\r' | b'\n') if self.fell => {
+                self.say("that card went, press j or k to pick one first", env);
+                Out::Stay
+            }
             Key::Char(d @ b'1'..=b'9') => {
                 let Some(item) = item else {
                     return self.go_quiet(slot.as_ref(), d, env);
@@ -1350,8 +1567,8 @@ impl Pane {
                 Out::Stay
             }
             Key::Char(b'\r' | b'\n') => {
-                // Send now: the selected card's hold, else the newest (the bar says so).
-                if !self.holds.held.is_empty() {
+                // Send now: the selected card's own hold, never another card's.
+                if slot.as_ref().is_some_and(|s| self.holds.of(s).is_some()) {
                     self.send_now(slot.as_ref(), env);
                     return Out::Stay;
                 }
@@ -1617,10 +1834,19 @@ pub fn next_words(item: &Item, env: &Env) -> (String, String, &'static str) {
     (who, env.who(item), says)
 }
 
+/// qass's data folder, where the hand id is read and made: nowhere under test, so a test never
+/// reaches the owner's files (a test passes the folder it wants).
+pub fn hand_dir() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    qoop_runtime::paths::qass_data_dir()
+}
+
 /// What the client knows about qass and the hands to it, read off its lists: This Mac's qass
 /// (the first agent in its space), its switch, the machines that refused a hand as too old, the
-/// remote machines' names, this Mac's hand id (read once, when a hand from or to another machine
-/// can matter), and the hands noted at `now`. Idempotent: called with every new list and before
+/// remote machines' names, this Mac's hand id (read once from `hand.dir`, when a hand from or to
+/// another machine can matter), and the hands noted at `now`. Idempotent: called with every new list and before
 /// every frame.
 pub fn update_hand(
     hand: &mut HandInput,
@@ -1655,10 +1881,22 @@ pub fn update_hand(
             .iter()
             .any(|r| r.qass_away.is_some() || machine_of(r.workspace) != 0)
     {
-        hand.hand_id = qoop_runtime::paths::hand_id().ok();
+        hand.hand_id = hand
+            .dir
+            .as_deref()
+            .and_then(|dir| qoop_runtime::paths::hand_id_in(dir).ok());
     }
     hand.set_carded(cards);
     crate::answers::note_qass(hand, rows, now);
+}
+
+/// The computers the link to is down, by their machine numbers.
+pub fn lost_machines(spaces: &[WorkspaceRow]) -> BTreeSet<usize> {
+    spaces
+        .iter()
+        .filter(|w| w.link == Some(qoop_runtime::control::LinkState::Down))
+        .map(|w| machine_of(w.id))
+        .collect()
 }
 
 /// What the Inbox needs around the rows: when the person's day began, the machines not
@@ -1666,11 +1904,7 @@ pub fn update_hand(
 pub fn context(spaces: &[WorkspaceRow], day_start: i64, old: BTreeSet<usize>) -> Context {
     Context {
         day_start,
-        lost: spaces
-            .iter()
-            .filter(|w| w.link == Some(qoop_runtime::control::LinkState::Down))
-            .map(|w| machine_of(w.id))
-            .collect(),
+        lost: lost_machines(spaces),
         old,
         qass_spaces: spaces
             .iter()
@@ -3126,6 +3360,111 @@ mod tests {
         assert!(pane.take().is_empty());
     }
 
+    /// A paste arrives in several reads. Inside one, `\n` is a space and `2`, `\r`, `x` and `h`
+    /// are letters of the text: never an answer, a send, a put away or a hand-off.
+    #[test]
+    fn a_paste_split_across_reads_stays_text_in_a_reply_box() {
+        let w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        let slot = Slot::Agent(4);
+        pane.select(slot.clone());
+        press(&mut pane, &w, ready, b"r");
+        for reads in [
+            vec![&b"\x1b[200~use xheron\n2\rx h\nh more\x1b[201~"[..]],
+            vec![
+                &b"\x1b[200~use xheron\n2"[..],
+                &b"\rx h\nh more\x1b[201~"[..],
+            ],
+            vec![
+                &b"\x1b[200~use xheron\n2"[..],
+                &b"\rx h\n"[..],
+                &b"h more\x1b[201~"[..],
+            ],
+        ] {
+            pane.text.clear();
+            for read in reads {
+                assert!(matches!(press(&mut pane, &w, ready, read), Out::Stay));
+            }
+            assert!(pane.typing(), "the box stayed open");
+            assert_eq!(pane.text, "use xheron 2 x h h more");
+            assert!(pane.holds.held.is_empty(), "a pasted byte sent something");
+        }
+        // The closing bracket itself cut in two by a read.
+        pane.text.clear();
+        press(&mut pane, &w, ready, b"\x1b[200~a\r2\x1b[20");
+        press(&mut pane, &w, ready, b"1~");
+        assert_eq!(pane.text, "a 2");
+        // The paste is over: a typed Enter sends.
+        press(&mut pane, &w, ready, b"\r");
+        assert!(pane.holds.of(&slot).is_some(), "typing works after a paste");
+    }
+
+    /// With no box open a paste is dropped, whole, however it is cut: it holds no answer, sends
+    /// nothing and puts nothing away. And the bytes left over once a box closes are dropped.
+    #[test]
+    fn a_paste_with_no_box_open_is_never_a_command() {
+        let w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        pane.select(menu_slot());
+        for reads in [
+            vec![&b"\x1b[200~2\rx"[..], &b"h\n2\r\x1b[201~"[..]],
+            vec![&b"\x1b[200~"[..], &b"2\rxh"[..], &b"\n\x1b[201~"[..]],
+        ] {
+            for read in reads {
+                assert!(matches!(press(&mut pane, &w, ready, read), Out::Stay));
+            }
+            assert!(pane.holds.held.is_empty(), "a pasted byte held an answer");
+            assert!(pane.take().is_empty(), "a pasted byte sent something");
+        }
+        // A box that closes mid-paste: the rest of the paste is dropped.
+        pane.select(Slot::Agent(4));
+        press(&mut pane, &w, ready, b"r");
+        press(&mut pane, &w, ready, b"\x1b[200~ab");
+        pane.stash_typing();
+        press(&mut pane, &w, ready, b"2\rx\x1b[201~");
+        assert!(pane.holds.held.is_empty());
+        assert!(pane.take().is_empty());
+        // Typed keys work again once the paste is over.
+        pane.select(menu_slot());
+        press(&mut pane, &w, ready, b"1");
+        assert!(pane.holds.of(&menu_slot()).is_some());
+    }
+
+    /// The new agent box and qass's ask line take a split paste as text too: an Enter inside it
+    /// starts nothing and asks nothing.
+    #[test]
+    fn a_split_paste_never_starts_an_agent_or_sends_an_ask() {
+        let w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        let new = crate::places::NewWork::open(&env(&w, ready), None);
+        pane.open_place(Place::New(new), false);
+        for read in [
+            &b"\x1b[200~fix it"[..],
+            &b"now\rdone"[..],
+            &b"\n\x1b[201~"[..],
+        ] {
+            assert!(
+                matches!(press(&mut pane, &w, ready, read), Out::Stay),
+                "started"
+            );
+        }
+        assert!(matches!(pane.place, Some(Place::New(_))));
+        let mut ledger = crate::ledger::Ledger::default();
+        ledger.keep(String::new());
+        pane.open_place(Place::Ledger(ledger), false);
+        for read in [
+            &b"\x1b[200~look at"[..],
+            &b"this\r"[..],
+            &b"now\x1b[201~"[..],
+        ] {
+            assert!(
+                matches!(press(&mut pane, &w, ready, read), Out::Stay),
+                "asked"
+            );
+        }
+        assert!(matches!(&pane.place, Some(Place::Ledger(l)) if l.draft() == "look atthis now"));
+    }
+
     #[test]
     fn own_words_for_a_menu_go_as_a_typed_menu_answer() {
         let mut w = world("normal");
@@ -3787,6 +4126,314 @@ mod tests {
         press(&mut pane, &w, ready, b"use xheron\r");
         pane.tick(&env(&w, ready + HOLD));
         assert_eq!(pane.take().typed.len(), 2);
+    }
+
+    /// A put away is dropped when its card leaves `open` (the phone answered it, so it is
+    /// queued), on the read that says so and again right before it would be sent: closing a card
+    /// with an answer on its way would lose that answer.
+    #[test]
+    fn a_put_away_is_dropped_once_its_card_leaves_open() {
+        let mut w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        let slot = Slot::Card("Q15".into());
+        pane.select(slot.clone());
+        press(&mut pane, &w, ready, b"x");
+        assert!(pane.holds.of(&slot).is_some());
+        let card = w.cards.iter_mut().find(|c| c.card == "Q15").expect("Q15");
+        card.status = "queued".into();
+        pane.rows_changed(&env(&w, ready));
+        assert!(pane.holds.held.is_empty(), "the read dropped it");
+        pane.tick(&env(&w, ready + HOLD));
+        assert!(pane.take().is_empty(), "nothing was dismissed");
+        // Between two reads: the tick before sending looks again.
+        w.cards
+            .iter_mut()
+            .find(|c| c.card == "Q15")
+            .expect("Q15")
+            .status = "open".into();
+        pane.said.clear();
+        pane.select(slot.clone());
+        press(&mut pane, &w, ready, b"x");
+        assert!(pane.holds.of(&slot).is_some(), "held again");
+        w.cards
+            .iter_mut()
+            .find(|c| c.card == "Q15")
+            .expect("Q15")
+            .status = "queued".into();
+        pane.tick(&env(&w, ready + HOLD));
+        assert!(
+            pane.take().is_empty(),
+            "sent against a card that was no longer open"
+        );
+        assert!(
+            pane.said
+                .get(&slot)
+                .is_some_and(|said| said.contains("no longer open")),
+            "{:?}",
+            pane.said
+        );
+        // An open card is put away as before.
+        w.cards
+            .iter_mut()
+            .find(|c| c.card == "Q15")
+            .expect("Q15")
+            .status = "open".into();
+        pane.select(slot.clone());
+        press(&mut pane, &w, ready, b"x");
+        pane.tick(&env(&w, ready + HOLD));
+        assert!(matches!(
+            &pane.take().requests[..],
+            [ControlRequest::AskWrite {
+                action: AskOp::Dismiss { .. },
+                ..
+            }]
+        ));
+    }
+
+    /// A hold on an agent of a computer that is not reached is dropped before it is sent: the
+    /// rows it was held on are the link's old word.
+    #[test]
+    fn a_hold_for_a_computer_that_was_lost_is_dropped_before_it_is_sent() {
+        let mut w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        // The agent of machine 3 that asks a menu and is not handed to qass.
+        let remote = w
+            .rows
+            .iter()
+            .find(|r| r.terminal == 2197815297 && r.menu.is_some())
+            .expect("a remote agent with a menu");
+        let (terminal, machine) = (remote.terminal, machine_of(remote.workspace));
+        pane.select(Slot::Agent(terminal));
+        press(&mut pane, &w, ready, b"1");
+        assert!(pane.holds.of(&Slot::Agent(terminal)).is_some(), "held");
+        w.ctx.lost.insert(machine);
+        pane.tick(&env(&w, ready + HOLD));
+        assert!(pane.take().is_empty(), "sent to a computer that went away");
+        assert!(pane.holds.held.is_empty());
+    }
+
+    /// A reply is not typed into a terminal another client typed in since the reply was held
+    /// (the daemon's `typed_by`), and the words are kept as a draft.
+    #[test]
+    fn a_reply_waits_for_a_line_another_client_began() {
+        let mut w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        let slot = Slot::Agent(4);
+        pane.select(slot.clone());
+        press(&mut pane, &w, ready, b"r");
+        press(&mut pane, &w, ready, b"use xheron\r");
+        w.rows
+            .iter_mut()
+            .find(|r| r.terminal == 4)
+            .expect("row")
+            .typed_by = Some(qoop_runtime::control::TypedBy {
+            kind: "phone".into(),
+            at: w.now_unix - 1,
+        });
+        pane.tick(&env(&w, ready + HOLD));
+        assert!(
+            pane.take().typed.is_empty(),
+            "typed over another client's line"
+        );
+        let shown = pane.view(&env(&w, ready + HOLD), 80, 400).plain.join("\n");
+        assert!(shown.contains("draft: use xheron"), "{shown}");
+        // Typed there before the reply was held: nothing in the way.
+        let (mut pane, ready) = armed(&w, Instant::now() + Duration::from_secs(5));
+        w.rows
+            .iter_mut()
+            .find(|r| r.terminal == 4)
+            .expect("row")
+            .typed_by = Some(qoop_runtime::control::TypedBy {
+            kind: "phone".into(),
+            at: w.now_unix - 60,
+        });
+        pane.select(slot);
+        press(&mut pane, &w, ready, b"r");
+        press(&mut pane, &w, ready, b"use xheron\r");
+        pane.tick(&env(&w, ready + HOLD));
+        assert_eq!(pane.take().typed.len(), 2);
+    }
+
+    /// When the selected card leaves the list the selection falls to the first, and a digit
+    /// typed then answers nothing: a key that moves the selection comes first. Enter sends only
+    /// the selected card's own hold, never another card's early.
+    #[test]
+    fn a_digit_after_the_selection_fell_answers_nothing_until_a_move() {
+        let mut w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        // The first card has an answer held (so Enter would send it now); the person is on t:4 (a
+        // reply), which then moves on and leaves the list: the selection falls to the first.
+        let first = pane.inbox(&env(&w, ready)).items[0].clone();
+        pane.select(first.slot.clone());
+        press(&mut pane, &w, ready, b"1");
+        let label = |pane: &Pane| pane.holds.of(&first.slot).map(|h| h.label.clone());
+        let before = label(&pane).expect("held");
+        pane.select(Slot::Agent(4));
+        let row = w.rows.iter_mut().find(|r| r.terminal == 4).expect("row");
+        row.state = "working".into();
+        row.status = Some("working".into());
+        pane.rows_changed(&env(&w, ready));
+        press(&mut pane, &w, ready, b"2");
+        assert_eq!(
+            label(&pane),
+            Some(before.clone()),
+            "a digit answered for another agent"
+        );
+        // Enter is refused the same way: it would send that card's answer before its time.
+        press(&mut pane, &w, ready, b"\r");
+        assert_eq!(label(&pane), Some(before.clone()), "Enter sent it early");
+        assert!(pane.take().is_empty());
+        // A move key, and digits work again.
+        press(&mut pane, &w, ready, b"j");
+        press(&mut pane, &w, ready, b"k");
+        press(&mut pane, &w, ready, b"2");
+        assert_ne!(label(&pane), Some(before), "after a move the digit answers");
+    }
+
+    #[test]
+    fn enter_sends_only_the_selected_cards_own_hold() {
+        let w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        pane.select(menu_slot());
+        press(&mut pane, &w, ready, b"1");
+        assert!(pane.holds.of(&menu_slot()).is_some());
+        // Another card is selected: Enter is not Send now for the first one.
+        pane.select(Slot::Agent(4));
+        press(&mut pane, &w, ready, b"\r");
+        assert!(
+            pane.holds.of(&menu_slot()).is_some(),
+            "sent another card's hold early"
+        );
+        assert!(pane.take().is_empty());
+        // Selected again, it is.
+        pane.select(menu_slot());
+        press(&mut pane, &w, ready, b"\r");
+        assert!(pane.holds.of(&menu_slot()).is_none());
+        assert!(!pane.take().requests.is_empty());
+    }
+
+    /// An opening bracket cut after `ESC [ 2`, `ESC [ 20` or `ESC [ 200`, with 500 ms before the
+    /// rest comes (the report filter's wait has run out): the piece is kept with no timer and
+    /// joined to the next read, so the paste stays text for the box and never becomes keys.
+    #[test]
+    fn a_cut_opening_bracket_is_kept_until_the_next_read() {
+        let w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        pane.select(Slot::Agent(4));
+        press(&mut pane, &w, ready, b"r");
+        for cut in 3..PASTE_ON.len() {
+            pane.text.clear();
+            let first = [&b"x"[..], &PASTE_ON[..cut]].concat();
+            assert!(matches!(press(&mut pane, &w, ready, &first), Out::Stay));
+            let rest = [&PASTE_ON[cut..], &b"2\rxh\x1b[201~"[..]].concat();
+            let later = ready + Duration::from_millis(500);
+            assert!(matches!(press(&mut pane, &w, later, &rest), Out::Stay));
+            assert!(
+                pane.typing(),
+                "cut at {cut}: a pasted byte submitted or closed"
+            );
+            assert!(pane.holds.held.is_empty(), "cut at {cut}");
+            assert_eq!(pane.text, "x2 xh", "cut at {cut}");
+        }
+    }
+
+    /// A paste whose closing bracket never comes ends after a second with no byte, or at a
+    /// mouse report, and the prefix and Esc work again. Before that its bytes are still paste.
+    #[test]
+    fn a_paste_with_no_closing_bracket_ends_and_the_prefix_and_esc_work_again() {
+        let w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        pane.select(menu_slot());
+        press(&mut pane, &w, ready, b"\x1b[200~ab");
+        assert!(
+            matches!(
+                press(&mut pane, &w, ready + Duration::from_millis(500), &[PREFIX]),
+                Out::Stay
+            ),
+            "still inside the paste"
+        );
+        // A second with no byte: the paste is over, and the prefix goes back to the ordinary path.
+        let later = ready + Duration::from_secs(3);
+        assert_eq!(
+            press(&mut pane, &w, later, &[PREFIX]),
+            Out::Pass(vec![PREFIX])
+        );
+        // And Esc closes the Inbox again.
+        press(&mut pane, &w, later, b"\x1b[200~ab");
+        assert_eq!(
+            press(&mut pane, &w, later + Duration::from_secs(2), b"\x1b"),
+            Out::Closed
+        );
+        // A mouse report ends it at once.
+        pane.open();
+        press(&mut pane, &w, ready, b"\x1b[200~ab");
+        assert_eq!(
+            press(&mut pane, &w, ready, b"\x1b[<0;3;4M"),
+            Out::Pass(b"\x1b[<0;3;4M".to_vec())
+        );
+        pane.select(menu_slot());
+        press(&mut pane, &w, ready, b"1");
+        assert!(
+            pane.holds.of(&menu_slot()).is_some(),
+            "typed keys work again"
+        );
+    }
+
+    /// The parts of a read after a command are kept: the prefix, a jump or a box that opens are
+    /// followed by a paste in the same read, and none of it is lost or turned into keys.
+    #[test]
+    fn what_follows_a_command_in_the_same_read_is_kept() {
+        let w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        let pasted = b"\x1b[200~2\rxh\x1b[201~".to_vec();
+        // The prefix, then a paste: the prefix is the ordinary path's, and the paste with it.
+        let read = [&[PREFIX][..], &pasted].concat();
+        assert_eq!(press(&mut pane, &w, ready, &read), Out::Pass(vec![PREFIX]));
+        assert!(pane.has_rest());
+        assert_eq!(pane.take_rest(), pasted);
+        assert!(!pane.has_rest());
+        // `g`, then a paste, left open at the end of the read: the brackets put back as they came.
+        pane.select(menu_slot());
+        let read = [&b"g"[..], &b"\x1b[200~2\rxh"[..]].concat();
+        assert_eq!(press(&mut pane, &w, ready, &read), Out::Jump(2));
+        assert_eq!(pane.take_rest(), b"\x1b[200~2\rxh".to_vec());
+        // `n`, then a paste: the box that opens takes it up through resume.
+        let read = [&b"n"[..], &pasted[..]].concat();
+        assert_eq!(press(&mut pane, &w, ready, &read), Out::NewAgent);
+        assert!(pane.has_rest());
+        assert_eq!(pane.resume(PREFIX, &env(&w, ready)), Out::Stay);
+        assert!(!pane.has_rest());
+        assert!(
+            pane.holds.held.is_empty(),
+            "a pasted byte answered something"
+        );
+    }
+
+    /// A pick for a machine whose link dropped is held until its agents are listed again, and a
+    /// reply for it is kept as a draft, not typed.
+    #[test]
+    fn a_pick_for_an_unlisted_machine_waits_for_its_list() {
+        let w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        let (terminal, machine) = (2197815297u32, 3usize);
+        pane.select(Slot::Agent(terminal));
+        press(&mut pane, &w, ready, b"1");
+        assert!(pane.holds.of(&Slot::Agent(terminal)).is_some(), "held");
+        pane.unlisted.insert(machine);
+        pane.tick(&env(&w, ready + HOLD));
+        assert!(
+            pane.take().is_empty(),
+            "sent against a list from before the drop"
+        );
+        assert!(
+            pane.holds.of(&Slot::Agent(terminal)).is_some(),
+            "still held"
+        );
+        press(&mut pane, &w, ready + HOLD, b"\r");
+        assert!(pane.take().is_empty(), "Send now too");
+        pane.unlisted.clear();
+        pane.tick(&env(&w, ready + HOLD));
+        assert!(!pane.take().requests.is_empty(), "sent once listed again");
     }
 
     #[test]

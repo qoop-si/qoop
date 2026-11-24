@@ -1686,13 +1686,13 @@ fn priority_rows(c: &Column) -> Vec<Row> {
         // Said, rather than left as a void: an empty list under a title reads as broken, one
         // that says what would go in it reads as waiting for one.
         let said = if query.is_empty() {
-            "no agents yet  ctrl-a space starts one"
+            crate::keys::named("no agents yet  ctrl-a space starts one")
         } else {
-            NO_MATCH.trim_start()
+            NO_MATCH.trim_start().to_string()
         };
         // Wrapped whole under a blank, the way every other word of the list is.
         out.extend(
-            crate::asks::wrap_whole(said, c.width.saturating_sub(2))
+            crate::asks::wrap_whole(&said, c.width.saturating_sub(2))
                 .into_iter()
                 .map(|words| {
                     (
@@ -7463,6 +7463,27 @@ mod tests {
             .unwrap();
         let col = |t: &str| t.chars().position(|c| c != ' ').unwrap();
         assert_eq!(col(&fold.0.text), col(&title.0.text));
+    }
+
+    /// The empty list names the prefix the person chose.
+    #[test]
+    fn the_empty_list_names_the_chosen_prefix() {
+        crate::keys::TEST_PREFIX.with(|c| c.set(Some(0x02)));
+        let none: Vec<AgentRow> = Vec::new();
+        let first = vec![space(1, "default")];
+        let rows = rows_folded(&column_for(&first, &none), 30, None);
+        crate::keys::TEST_PREFIX.with(|c| c.set(None));
+        let said: Vec<&str> = rows
+            .iter()
+            .map(|(l, _)| l.text.trim())
+            .skip_while(|t| !t.starts_with("no agents yet"))
+            .take_while(|t| !t.is_empty())
+            .collect();
+        assert_eq!(
+            said.join(" "),
+            "no agents yet ctrl-b space starts one",
+            "{said:?}"
+        );
     }
 
     /// A first run lists This Mac and nothing else on the computers line; a machine joins it

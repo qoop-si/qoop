@@ -98,6 +98,16 @@ activity since 3.1. So a key in an interface takes the size, under these limits:
   the mouse, so a wheel there takes the size too, as tmux counts the mouse as activity.
 - Asking for ownership (`GrantOwnership`, G2.14) is unchanged: a silent owner keeps it.
 
+### Known exception 2026-11-24: a reply in the person's own words
+
+An agent that stopped and waits for words (no menu to pick from) is answered from the Inbox of
+the TUI or the desktop by a reply the person types. It is sent on the interface connection as a
+paste and an Enter, so it counts as the person's typing and that interface takes the size, even
+when the Inbox covers the terminal. An answer picked on a menu (`AnswerMenu`, `AnswerMenuText`)
+and a hand to qass still never move the size. The owner accepted this exception for now; the fix
+is a reply path on the control channel that does not count as typing, a daemon and protocol
+change kept for stage B of the redesign (plans/2026-11-23-redesign-v3-build.md, D1).
+
 ## Consequences
 - A small client sees a cropped view rather than a reflowed one. This is the correct
   trade: reflowing someone else's working shell is destructive, cropping is not.

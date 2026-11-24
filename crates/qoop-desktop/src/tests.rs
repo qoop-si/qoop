@@ -9,17 +9,6 @@ use crate::app::{Desk, Page};
 use crate::link::{Down, Latest, Up};
 use crate::state::tests::fixture;
 
-/// The window reads (and the shared hand rules may make) the hand id file under the data home:
-/// every test gets a folder of its own for it, never the owner's.
-fn isolate_data_home() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let dir = Box::leak(Box::new(tempfile::tempdir().expect("a data home")));
-        // Before any window of this run reads it: every test goes through here first.
-        unsafe { std::env::set_var("XDG_DATA_HOME", dir.path()) };
-    });
-}
-
 fn open(cx: &mut TestAppContext) -> (Entity<Desk>, VisualTestContext, UnboundedReceiver<Up>) {
     // Every setting its default (prefix ctrl-a), never the person's own file.
     open_with(cx, std::path::Path::new("/nonexistent/config.toml"))
@@ -29,7 +18,6 @@ fn open_with(
     cx: &mut TestAppContext,
     config: &std::path::Path,
 ) -> (Entity<Desk>, VisualTestContext, UnboundedReceiver<Up>) {
-    isolate_data_home();
     let (up, rx) = tokio::sync::mpsc::unbounded_channel();
     let config = qoop_tui::config::read_from(config);
     let window = cx.add_window(|window, cx| Desk::new(up, Latest::default(), &config, window, cx));
@@ -45,6 +33,7 @@ fn open_with(
             d.model = fixture();
             d.note_hand();
             d.listed = true;
+            d.fresh = true;
             d.now = 2000;
             cx.notify();
         })
@@ -1270,7 +1259,7 @@ fn a_pick_on_the_card_gives_the_keys_to_the_terminal(cx: &mut TestAppContext) {
 
 /// A remote agent's question handed from here goes for This Mac's qass, named by this Mac's
 /// hand id; a far qoop that answers it as one for its own qass is too old for it, says so,
-/// and is not offered "Let qass handle it" again.
+/// and is not offered "Hand to qass" again.
 #[gpui::test]
 fn a_remote_hand_goes_for_this_macs_qass(cx: &mut TestAppContext) {
     let (desk, mut vcx, mut rx) = open(cx);
@@ -1297,7 +1286,7 @@ fn a_remote_hand_goes_for_this_macs_qass(cx: &mut TestAppContext) {
             assert_eq!(d.qass_reason(&row), None, "offered for a remote agent");
             let qass = crate::state::Offer {
                 digit: None,
-                label: "Let qass handle it".into(),
+                label: "Hand to qass".into(),
                 detail: None,
                 pick: crate::state::Pick::Qass,
             };
@@ -2448,7 +2437,7 @@ fn key_hints_name_the_configured_prefix(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("ctrl-b c");
     assert!(
         desk.read_with(&vcx, |d, _| d.sheet.is_some()),
-        "ctrl-b c opens New work"
+        "ctrl-b c opens the New agent sheet"
     );
 }
 
@@ -3716,7 +3705,8 @@ fn a_reply_is_not_typed_over_a_line_the_person_began_and_is_kept(cx: &mut TestAp
     assert_eq!(text.as_deref(), Some("go on, ship it"));
 }
 
-/// A reply waits while its machine cannot be reached: nothing is typed, the words are kept.
+/// A reply waits while its machine cannot be reached: nothing is typed, the reply stays held,
+/// and leaving keeps the words.
 #[gpui::test]
 fn a_reply_is_kept_while_the_daemon_is_away(cx: &mut TestAppContext) {
     let (desk, mut vcx, mut rx) = open(cx);
@@ -3734,6 +3724,20 @@ fn a_reply_is_kept_while_the_daemon_is_away(cx: &mut TestAppContext) {
             .iter()
             .any(|u| matches!(u, Up::Paste(..) | Up::Input(..))),
         "nothing typed while the daemon is away"
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.holds.held.len()),
+        1,
+        "the reply stays held until a fresh list has come"
+    );
+    // Leaving with it still held: never typed by a number that may be another agent's, so the
+    // words are kept as the card's draft.
+    vcx.update(|_, cx| desk.update(cx, |d, _| d.flush_holds()));
+    assert!(
+        !sent(&mut rx)
+            .iter()
+            .any(|u| matches!(u, Up::Paste(..) | Up::Input(..))),
+        "nothing typed on the way out"
     );
     assert_eq!(
         desk.read_with(&vcx, |d, _| d
@@ -3939,6 +3943,304 @@ fn answered_today_lists_all_or_opens_the_rest_and_put_away_is_no_answer(cx: &mut
         desk.read_with(&vcx, |d, _| d.own_answers.len()),
         before,
         "a card put away is not an answer"
+    );
+}
+
+/// A pick that falls due while the link is down, or after it came back but before a fresh
+/// agent list, is held: the terminal numbers may be another agent's after a restart. Once the
+/// list has come and been checked, it is sent. And an answer still "Sending" when the link
+/// drops says so instead of sending for good.
+#[gpui::test]
+fn a_pick_due_after_a_drop_waits_for_a_fresh_list(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let agents = |seal: u64| {
+        let mut rows = crate::state::tests::fixture().rows;
+        rows[1].menu = Some(crate::state::tests::edit_menu(seal));
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        }
+    };
+    answer(&desk, &mut vcx, agents(77));
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(2), window, cx)));
+    vcx.run_until_parked();
+    std::thread::sleep(qoop_tui::answers::ARMING);
+    vcx.simulate_keystrokes("1");
+    assert!(desk.read_with(&vcx, |d, _| {
+        d.holds.of(&crate::state::Slot::Agent(2)).is_some()
+    }));
+    let due = |vcx: &mut VisualTestContext| {
+        vcx.update(|_, cx| {
+            desk.update(cx, |d, _| {
+                for hold in &mut d.holds.held {
+                    hold.until = std::time::Instant::now();
+                }
+                d.fire();
+            })
+        })
+    };
+    sent(&mut rx);
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(Down::Disconnected("gone".into()), window, cx);
+            d.apply(Down::Connected, window, cx);
+        })
+    });
+    due(&mut vcx);
+    assert!(
+        request_of(&sent(&mut rx), |r| matches!(
+            r,
+            ControlRequest::AnswerMenu { .. }
+        ))
+        .is_none(),
+        "sent against rows from before the drop"
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.holds.held.len()),
+        1,
+        "still held"
+    );
+    // The fresh list has come: the same menu, so the pick stands and goes.
+    answer(&desk, &mut vcx, agents(77));
+    due(&mut vcx);
+    assert!(
+        request_of(&sent(&mut rx), |r| matches!(
+            r,
+            ControlRequest::AnswerMenu { terminal: 2, .. }
+        ))
+        .is_some(),
+        "sent once the list was fresh"
+    );
+    // Sending when the link drops: the card says it was not confirmed.
+    let said = desk.read_with(&vcx, |d, _| {
+        d.said.get(&crate::state::Slot::Agent(2)).cloned()
+    });
+    assert!(
+        matches!(said, Some(crate::question::Said::Sending { .. })),
+        "{said:?}"
+    );
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(Down::Disconnected("gone".into()), window, cx)
+        })
+    });
+    let said = desk.read_with(&vcx, |d, _| {
+        d.said.get(&crate::state::Slot::Agent(2)).cloned()
+    });
+    assert!(
+        matches!(said, Some(crate::question::Said::Refused(_))),
+        "Sending stayed after the drop: {said:?}"
+    );
+}
+
+/// A put away held on a card is dropped once the card is no longer open, on the read that says
+/// so and before it is sent: the store would close a card whose answer the phone queued.
+#[gpui::test]
+fn a_put_away_is_dropped_once_its_card_leaves_open(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let card = |status: &str| -> qoop_runtime::control::AskInfo {
+        serde_json::from_value(serde_json::json!({
+            "card": "E41", "agent": "staging/T3", "status": status, "opened_at": 1000,
+            "body": {
+                "handle": "soak", "urgency": "later", "doing": "running the soak test",
+                "why": "the migration touches billing", "asks": "Run the migration?",
+                "options": [{"key": "a", "label": "Run it", "reason": "ok", "words": "run it"}],
+            },
+        }))
+        .expect("card")
+    };
+    let slot = crate::state::Slot::Card("E41".into());
+    let hold = || qoop_tui::answers::Hold {
+        slot: crate::state::Slot::Card("E41".into()),
+        generation: None,
+        menu_seal: None,
+        seal: 0,
+        pick: qoop_tui::answers::Pick::PutAway { card: "E41".into() },
+        label: "Put away".into(),
+        until: std::time::Instant::now(),
+    };
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, _| {
+            d.asks = vec![card("open")];
+            d.holds.start(hold());
+            // The phone answered it before the hold ran out: it is queued now.
+            d.asks = vec![card("queued")];
+            d.fire();
+        })
+    });
+    assert!(
+        request_of(&sent(&mut rx), |r| matches!(
+            r,
+            ControlRequest::AskWrite { .. }
+        ))
+        .is_none(),
+        "dismissed a card that was no longer open"
+    );
+    assert!(desk.read_with(&vcx, |d, _| d.holds.held.is_empty()));
+    assert!(desk.read_with(&vcx, |d, _| matches!(
+        d.said.get(&slot),
+        Some(crate::question::Said::Refused(_))
+    )));
+    // Still open: put away as before.
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, _| {
+            d.asks = vec![card("open")];
+            d.holds.start(hold());
+            d.fire();
+        })
+    });
+    assert!(
+        request_of(&sent(&mut rx), |r| matches!(
+            r,
+            ControlRequest::AskWrite { .. }
+        ))
+        .is_some(),
+        "an open card is put away"
+    );
+}
+
+/// A long tab title wraps whole in its tab, which grows to hold it: never cut to an ellipsis.
+#[gpui::test]
+fn a_long_tab_title_wraps_whole_in_its_tab(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let long = "refactor the whole billing pipeline so that every invoice is rendered by one \
+                template and the old per customer overrides are gone for good";
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            let row = d
+                .model
+                .rows
+                .iter_mut()
+                .find(|r| r.terminal == 1)
+                .expect("row");
+            row.name = Some(long.into());
+            row.agent_title = Some(long.into());
+            d.open(Page::Session(1), window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    let tab = vcx.debug_bounds("tab-title-1").expect("the tab");
+    assert!(
+        tab.size.height > gpui::px(40.),
+        "the title stayed on one line: {:?}",
+        tab.size
+    );
+}
+
+/// `u` is Undo on the Inbox, and on an agent's page, the terminal focused, only while a pick for
+/// that agent is held and the menu it was made on is still up (a card's: while it is open). Digit
+/// then `u` undoes and sends nothing to the agent; with no pick held for the page, on another
+/// agent's page, or once the menu is gone, `u` reaches the terminal and the pick stays held.
+#[gpui::test]
+fn u_is_undo_only_while_a_pick_for_this_page_is_held_on_a_menu_still_up(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let menu = |seal: u64| {
+        let mut rows = crate::state::tests::fixture().rows;
+        rows[1].menu = Some(crate::state::tests::edit_menu(seal));
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        }
+    };
+    answer(&desk, &mut vcx, menu(77));
+    let hold = |slot: crate::state::Slot, seal, pick| qoop_tui::answers::Hold {
+        slot,
+        generation: None,
+        menu_seal: None,
+        seal,
+        pick,
+        label: "Yes".into(),
+        until: std::time::Instant::now() + qoop_tui::answers::HOLD,
+    };
+    let agent = || {
+        hold(
+            crate::state::Slot::Agent(2),
+            77,
+            qoop_tui::answers::Pick::Key("1".into()),
+        )
+    };
+    let typed = |rx: &mut UnboundedReceiver<Up>, terminal: u32| {
+        sent(rx)
+            .iter()
+            .any(|u| matches!(u, Up::Input(t, b) if *t == terminal && b == b"u"))
+    };
+    // No pick held for the page: a letter for the terminal.
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(2), window, cx)));
+    vcx.run_until_parked();
+    sent(&mut rx);
+    vcx.simulate_keystrokes("u");
+    assert!(
+        typed(&mut rx, 2),
+        "nothing held: the letter went to the terminal"
+    );
+    // Another agent's page with agent 2's pick held: still a letter, and the pick stays.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.holds.start(agent());
+            d.open(Page::Session(3), window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    sent(&mut rx);
+    vcx.simulate_keystrokes("u");
+    assert!(typed(&mut rx, 3), "another agent's page");
+    assert_eq!(desk.read_with(&vcx, |d, _| d.holds.held.len()), 1, "kept");
+    // The held agent's page with its terminal focused and its menu up: Undo, nothing typed.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open(Page::Session(2), window, cx);
+            window.focus(&d.term_focus, cx);
+        })
+    });
+    vcx.run_until_parked();
+    sent(&mut rx);
+    vcx.simulate_keystrokes("u");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.holds.held.is_empty()),
+        "undone"
+    );
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Input(..))),
+        "typed"
+    );
+    // The menu it was made on is gone (the hold is still there): a letter again.
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, _| {
+            d.holds.start(agent());
+            d.model.rows[1].menu = None;
+        })
+    });
+    vcx.simulate_keystrokes("u");
+    assert!(typed(&mut rx, 2), "the menu is gone");
+    assert_eq!(desk.read_with(&vcx, |d, _| d.holds.held.len()), 1, "kept");
+    // A pick held on one of this agent's open question cards is undone from the terminal too.
+    let card: qoop_runtime::control::AskInfo = serde_json::from_value(serde_json::json!({
+        "card": "E7", "agent": "T2", "terminal": 2, "status": "open", "opened_at": 1000,
+        "body": {
+            "handle": "soak", "urgency": "later", "doing": "d", "why": "w", "asks": "a?",
+            "options": [{"key": "a", "label": "Run it", "reason": "r", "words": "run it"}],
+        },
+    }))
+    .expect("card");
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, _| {
+            d.holds.held.clear();
+            d.asks = vec![card];
+            d.holds.start(hold(
+                crate::state::Slot::Card("E7".into()),
+                0,
+                qoop_tui::answers::Pick::PutAway { card: "E7".into() },
+            ));
+        })
+    });
+    vcx.simulate_keystrokes("u");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.holds.held.is_empty()),
+        "the card's pick undone"
     );
 }
 
