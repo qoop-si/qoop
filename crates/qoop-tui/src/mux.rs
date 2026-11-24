@@ -1565,7 +1565,13 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                         .await;
                 }
                 let (link, _) = workspace_in(workspace);
-                self.send_one(link, *request).await
+                // An item added to a space names it in the interface's numbers: the machine's
+                // own, or a space of another machine, which cannot be added to from here.
+                let request = match via_numbered(link, *request) {
+                    Ok(request) => request,
+                    Err(why) => return self.failed(id, why).await,
+                };
+                self.send_one(link, request).await
             }
             // A picture for a tab is kept where the tab runs, so a remote agent can read it.
             R::SaveUpload {
@@ -2260,6 +2266,10 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                         .and_then(|t| terminal_out(link, t))
                         .map(i64::from);
                 }
+                // A remote's board names its items' space and its agents' tabs in its own
+                // numbers, and its own agents "this Mac".
+                let name = self.link(link).map(|l| l.name.clone());
+                let items = items.map(|items| items_out(link, name.as_deref(), items));
                 let tasks = C::Tasks {
                     id,
                     tasks,
@@ -2286,17 +2296,65 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
     }
 }
 
+/// A remote's board in the interface's numbers: each item's space, each agent's tab (one that
+/// does not fit names none), and a machine's own agents under its name. Machine 0 is as it is.
+pub fn items_out(
+    link: usize,
+    name: Option<&str>,
+    mut items: Vec<qoop_runtime::control::ItemInfo>,
+) -> Vec<qoop_runtime::control::ItemInfo> {
+    if link == 0 {
+        return items;
+    }
+    for item in &mut items {
+        item.workspace = item.workspace.and_then(|w| workspace_out(link, w));
+        for agent in &mut item.agents {
+            agent.terminal = agent
+                .terminal
+                .and_then(|t| u32::try_from(t).ok())
+                .and_then(|t| terminal_out(link, t))
+                .map(i64::from);
+            if let Some(name) = name
+                && agent.machine == qoop_runtime::control::THIS_MACHINE
+            {
+                agent.machine = name.to_string();
+            }
+        }
+    }
+    items
+}
+
 /// What `Via` takes to another machine: a request that names no terminal and no space, so
 /// it means the same there. Extended as `Pet` lands, with its answer's numbers mapped in
 /// `answer`.
 fn via_carries(request: &ControlRequest) -> bool {
-    use qoop_runtime::control::ScheduleOp;
+    use qoop_runtime::control::{ScheduleOp, TaskOp};
     match request {
         ControlRequest::ScheduleRead { .. }
         | ControlRequest::ScheduleRuns { .. }
         | ControlRequest::SleepSettings { .. }
         | ControlRequest::QassWatch { .. }
         | ControlRequest::Pet { .. } => true,
+        // The whole board of a machine, not one item's card, and no terminal speaking.
+        ControlRequest::TaskRead {
+            board: true,
+            task: None,
+            terminal: None,
+            token: None,
+            before: None,
+            ..
+        } => true,
+        // An item added to a board, with no terminal and no token. The daemon takes such a
+        // write from anyone who reaches its socket (`tasks::speaker` only checks a terminal's
+        // token), as it does for a local interface: this adds no guard of its own. Start,
+        // Dismiss and Reopen are not carried, since nothing sends them, and nothing an agent or
+        // qass alone may write (a plan, an approval, a link) goes this way.
+        ControlRequest::TaskWrite {
+            terminal: None,
+            token: None,
+            action,
+            ..
+        } => matches!(action, TaskOp::Add { .. }),
         // A run's report names its tab: written by the run on its own machine, never sent
         // through an interface.
         ControlRequest::ScheduleWrite {
@@ -2306,6 +2364,43 @@ fn via_carries(request: &ControlRequest) -> bool {
             ..
         } => !matches!(**action, ScheduleOp::Report { .. }),
         _ => false,
+    }
+}
+
+/// A request `Via` carries, with the space an item is added to in the machine's own numbers.
+/// A space that is on another machine than the one the request goes to is refused.
+fn via_numbered(link: usize, request: ControlRequest) -> Result<ControlRequest, String> {
+    use qoop_runtime::control::TaskOp;
+    match request {
+        ControlRequest::TaskWrite {
+            id,
+            terminal,
+            token,
+            task,
+            action:
+                TaskOp::Add {
+                    workspace: Some(space),
+                    goal,
+                    description,
+                },
+        } => {
+            let (at, space) = workspace_in(space);
+            if at != link {
+                return Err("an item is added to a space of the machine it is sent to".into());
+            }
+            Ok(ControlRequest::TaskWrite {
+                id,
+                terminal,
+                token,
+                task,
+                action: TaskOp::Add {
+                    workspace: Some(space),
+                    goal,
+                    description,
+                },
+            })
+        }
+        other => Ok(other),
     }
 }
 
@@ -3292,6 +3387,266 @@ mod tests {
             [terminal_out(1, 5).map(i64::from), None, None],
             "in the interface's numbers"
         );
+    }
+
+    /// A board item as a remote daemon sends it: its space and its agents' tabs in its own
+    /// numbers, its own agents "this Mac".
+    fn remote_item(
+        key: &str,
+        workspace: Option<i64>,
+        tabs: &[i64],
+    ) -> qoop_runtime::control::ItemInfo {
+        let agents: Vec<serde_json::Value> = tabs
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "task": 1, "terminal": t, "name": "a", "machine": "this Mac",
+                    "stage": "x", "status": "working",
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": 7, "key": key, "workspace": workspace, "title": "t", "state": "doing",
+            "steps_done": 0, "steps_total": 0, "agents": agents, "updated_at": 1,
+        }))
+        .expect("an item")
+    }
+
+    fn board_read(id: &str) -> ControlRequest {
+        ControlRequest::TaskRead {
+            id: id.into(),
+            board: true,
+            task: None,
+            terminal: None,
+            token: None,
+            before: None,
+        }
+    }
+
+    fn tasks_answer(
+        id: &str,
+        items: Option<Vec<qoop_runtime::control::ItemInfo>>,
+    ) -> ControlResponse {
+        ControlResponse::Tasks {
+            id: id.into(),
+            tasks: vec![],
+            events: vec![],
+            more: false,
+            space: None,
+            items,
+            item: None,
+            loose: None,
+        }
+    }
+
+    /// A remote's board is read through `Via` as it is, and the items come back with their
+    /// space and their agents' tabs in the interface's numbers (one that does not fit names
+    /// none) and the remote's own agents under its name, never "this Mac".
+    #[tokio::test]
+    async fn a_remotes_board_is_read_through_via_and_comes_back_renumbered() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        mux.control(ControlRequest::Via {
+            id: "v1".into(),
+            workspace: workspace_out(1, 3).expect("fits"),
+            request: Box::new(board_read("board-read-1")),
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(
+            asked,
+            board_read("board-read-1"),
+            "the inner read, unchanged"
+        );
+
+        // A read of one item's card, or one that names a terminal, is not the board.
+        for not_board in [
+            ControlRequest::TaskRead {
+                id: "c".into(),
+                board: true,
+                task: Some(4),
+                terminal: None,
+                token: None,
+                before: None,
+            },
+            ControlRequest::TaskRead {
+                id: "c".into(),
+                board: true,
+                task: None,
+                terminal: Some(5),
+                token: None,
+                before: None,
+            },
+        ] {
+            mux.control(ControlRequest::Via {
+                id: "v2".into(),
+                workspace: workspace_out(1, 3).expect("fits"),
+                request: Box::new(not_board),
+            })
+            .await
+            .expect("answered");
+            assert!(remote_rx.try_recv().is_err(), "sent to the remote");
+            mux.down.clear();
+        }
+
+        mux.answer(
+            1,
+            tasks_answer(
+                "board-read-1",
+                Some(vec![
+                    remote_item("QOOP-1", Some(3), &[5, 1 << 30]),
+                    remote_item("QOOP-2", None, &[]),
+                ]),
+            ),
+        )
+        .await
+        .expect("answered");
+        let answered: ControlResponse = body_of(&mux.down);
+        let ControlResponse::Tasks {
+            id,
+            items: Some(items),
+            ..
+        } = answered
+        else {
+            panic!("{answered:?}");
+        };
+        assert_eq!(id, "board-read-1");
+        assert_eq!(
+            items[0].workspace,
+            workspace_out(1, 3),
+            "the space, renumbered"
+        );
+        let tabs: Vec<Option<i64>> = items[0].agents.iter().map(|a| a.terminal).collect();
+        assert_eq!(
+            tabs,
+            [terminal_out(1, 5).map(i64::from), None],
+            "the tabs, renumbered; one that does not fit names none"
+        );
+        assert!(
+            items[0].agents.iter().all(|a| a.machine == "devbox"),
+            "its own agents are on devbox"
+        );
+        assert_eq!(items[1].workspace, None);
+    }
+
+    /// An Add to a board goes to the remote with no terminal and no token, naming the remote's
+    /// space in the remote's own number. A write that names a terminal, a Start, Dismiss or
+    /// Reopen (nothing sends them), a write only qass or an agent makes, or an Add for a space
+    /// of another machine is refused under the outer id.
+    #[tokio::test]
+    async fn a_remotes_board_takes_only_a_persons_writes_through_via() {
+        use qoop_runtime::control::TaskOp;
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        let remote_space = workspace_out(1, 3).expect("fits");
+        let write = |id: &str, terminal: Option<u32>, token: Option<&str>, action: TaskOp| {
+            ControlRequest::TaskWrite {
+                id: id.into(),
+                terminal,
+                token: token.map(str::to_string),
+                task: Some(9),
+                action,
+            }
+        };
+        let add = |space: i64| TaskOp::Add {
+            workspace: Some(space),
+            goal: "ship it".into(),
+            description: None,
+        };
+        let via = |id: &str, request: ControlRequest| ControlRequest::Via {
+            id: id.into(),
+            workspace: remote_space,
+            request: Box::new(request),
+        };
+
+        // An Add reaches the remote, with its space in the remote's number.
+        mux.control(via("v", write("w", None, None, add(remote_space))))
+            .await
+            .expect("sent");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(asked, write("w", None, None, add(3)));
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+
+        // Refused, and sent nowhere.
+        let refused = [
+            write("w", Some(5), Some("tok"), add(remote_space)),
+            // Nothing sends these, so none is carried.
+            write("w", None, None, TaskOp::Start),
+            write("w", None, None, TaskOp::Reopen),
+            write("w", None, None, TaskOp::Dismiss { undo: false }),
+            write(
+                "w",
+                None,
+                None,
+                TaskOp::Approve {
+                    hash: "h".into(),
+                    owner: true,
+                },
+            ),
+            write(
+                "w",
+                None,
+                None,
+                TaskOp::Close {
+                    outcome: qoop_runtime::control::TaskOutcome::Verified,
+                    reason: "x".into(),
+                    actor: None,
+                },
+            ),
+            // A space of this machine, asked of the remote.
+            write("w", None, None, add(2)),
+        ];
+        for request in refused {
+            mux.control(via("v-refused", request))
+                .await
+                .expect("answered");
+            assert!(remote_rx.try_recv().is_err() && home_rx.try_recv().is_err());
+            let said: ControlResponse = body_of(&mux.down);
+            assert!(
+                matches!(&said, ControlResponse::Failed { id, .. } if id == "v-refused"),
+                "{said:?}"
+            );
+            mux.down.clear();
+        }
+    }
+
+    /// A remote from before the board answers a read with no `items` (or refuses `TaskRead`
+    /// as unknown): the answer reaches the interface as it is, and the board says which
+    /// computer is too old.
+    #[tokio::test]
+    async fn an_older_remote_reads_as_too_old_for_the_board() {
+        use crate::board::{Board, Read, too_old};
+        let (mut mux, _home_rx, mut remote_rx, _events) = two_links();
+        mux.control(ControlRequest::Via {
+            id: "v1".into(),
+            workspace: workspace_out(1, 3).expect("fits"),
+            request: Box::new(board_read("board-read-1")),
+        })
+        .await
+        .expect("sent");
+        let _asked: ControlRequest = body_of(&remote_rx.try_recv().expect("asked"));
+        mux.answer(1, tasks_answer("board-read-1", None))
+            .await
+            .expect("answered");
+        let answered: ControlResponse = body_of(&mux.down);
+        let mut board = Board {
+            stale: true,
+            ..Board::default()
+        };
+        assert!(board.request_via("board-read-1", Some(7)).is_some());
+        assert!(board.answered_to("board-read-1", &answered));
+        assert_eq!(board.read, Read::Old);
+        assert_eq!(too_old("devbox"), "qoop on devbox is too old for the board");
+
+        // One that predates the request itself refuses it as unknown.
+        mux.down.clear();
+        let refusal = ControlResponse::Failed {
+            id: "board-read-1".into(),
+            reason: "unknown variant `TaskRead`, expected one of".into(),
+        };
+        let mut again = Board::default();
+        assert!(again.answered_to("board-read-1", &refusal));
+        assert_eq!(again.read, Read::Old);
     }
 
     /// A picture for a remote tab is kept by that remote's daemon, under its own number for

@@ -308,8 +308,8 @@ fn new_work_by_keyboard_empty_enter_sends_nothing_then_starts(cx: &mut TestAppCo
         "qoop worktree new feat/giris-sayfasini-duzelt --space 1 -- claude 'giriş sayfasını düzelt' && exit\r"
     );
     assert!(
-        desk.read_with(&vcx, |d, _| d.sheet.is_none()),
-        "the sheet closes"
+        desk.read_with(&vcx, |d, _| d.sheet.as_ref().is_some_and(|s| s.started)),
+        "the sheet stays, waiting for the agent"
     );
 }
 
@@ -1349,6 +1349,16 @@ fn the_qass_page_drops_a_terminal_qass_left(cx: &mut TestAppContext) {
     let (desk, mut vcx, _rx) = open(cx);
     vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Qass, window, cx)));
     vcx.run_until_parked();
+    assert!(
+        desk.read_with(&vcx, |d, _| d.term.is_none()),
+        "the page is the ledger: no terminal until the drawer's Terminal tab"
+    );
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open_chat(crate::chat::ChatTab::Terminal, window, cx)
+        })
+    });
+    vcx.run_until_parked();
     assert_eq!(
         desk.read_with(&vcx, |d, _| d.term.as_ref().map(|t| t.terminal)),
         Some(9)
@@ -1507,8 +1517,14 @@ fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
         "the always option, no digit"
     );
     assert!(
-        vcx.debug_bounds("task-strip").is_some(),
-        "the task strip stays beside the question"
+        vcx.debug_bounds("task-strip").is_none(),
+        "the task strip is a drawer, closed until asked for"
+    );
+    let at = vcx.debug_bounds("task-toggle").expect("Task").center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    assert!(
+        vcx.debug_bounds("task-strip").is_some() && vcx.debug_bounds("card-2-1").is_some(),
+        "opened beside the terminal, the question card stays under it"
     );
     assert!(vcx.debug_bounds("card-2-6").is_none());
     sent(&mut rx);
@@ -1902,6 +1918,8 @@ fn the_qass_switches_send_their_requests(cx: &mut TestAppContext) {
             .center();
         vcx.simulate_click(at, gpui::Modifiers::none());
     };
+    // The switches sit behind "What it watches" under Rules.
+    click(&mut vcx, "rules-edit");
     click(&mut vcx, "watch-all-0");
     let asked = request_of(&sent(&mut rx), |r| {
         matches!(r, ControlRequest::QassWatch { .. })
@@ -2244,7 +2262,10 @@ fn a_one_offs_edit_sheet_says_its_own_date(cx: &mut TestAppContext) {
             let sheet = d.schedule_page.sheet.as_ref().expect("the sheet");
             (
                 d.sheet_first_line(sheet, cx),
-                format!("Next run: {}", crate::state::clock_at(at, d.now, d.zone)),
+                format!(
+                    "Next run: {}",
+                    qoop_tui::schedules::moment(at, d.now, d.zone)
+                ),
             )
         })
     });
@@ -3154,6 +3175,8 @@ fn the_session_page_lists_its_agents_cards(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("tab-questions").is_some(), "says it waits");
+    let at = vcx.debug_bounds("task-toggle").expect("Task").center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
     assert!(
         vcx.debug_bounds("task-progress").is_some(),
         "2 of 4 from the row"
@@ -4097,4 +4120,1420 @@ fn typed_words_are_the_hold_label_whole(cx: &mut TestAppContext) {
     hold_reply(&desk, &mut vcx, words);
     let label = desk.read_with(&vcx, |d, _| d.holds.held.last().map(|h| h.label.clone()));
     assert_eq!(label.as_deref(), Some(words));
+}
+
+// Desktop round 5: the agent page.
+
+/// `ctrl-a tab` opens the agent that has waited longest, and so does the header's Next
+/// waiting, which says how many other things wait; from the agent that waits there is nothing
+/// else, and the control says so.
+#[gpui::test]
+fn ctrl_a_tab_and_next_waiting_open_the_agent_that_waits(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("next-waiting").is_some(), "in the header");
+    vcx.simulate_keystrokes("ctrl-a tab");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.page),
+        Page::Session(2),
+        "the agent on a dialog"
+    );
+    // Back on a quiet agent, the header's control does the same.
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    let at = vcx.debug_bounds("next-waiting").expect("header").center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    assert_eq!(desk.read_with(&vcx, |d, _| d.page), Page::Session(2));
+    // On the agent that waits there is nothing else: the control is drawn, with no count, and
+    // pressing it goes nowhere.
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("next-waiting").is_some(),
+        "still in the header"
+    );
+    assert!(
+        vcx.debug_bounds("next-waiting-count").is_none(),
+        "no count when nothing else waits"
+    );
+    let at = vcx.debug_bounds("next-waiting").expect("header").center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.page),
+        Page::Session(2),
+        "nowhere to go"
+    );
+    // On a quiet agent it carries the count.
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("next-waiting-count").is_some());
+}
+
+/// The agent page keeps the question under the terminal with what is asked wrapped whole, the
+/// panel that used to sit beside it is gone, and the task strip is a drawer that opens and
+/// closes.
+#[gpui::test]
+fn the_agent_page_has_the_card_under_the_terminal_and_drawers_closed(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let long = "Edit file: crates/qoop-desktop/src/session.rs and every word of this line has to \
+        stay on screen whatever the width of the window is, wrapped onto the next line";
+    let mut rows = crate::state::tests::fixture().rows;
+    let mut menu = crate::state::tests::edit_menu(77);
+    menu.context = vec![long.to_string()];
+    rows[1].menu = Some(menu);
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(2), window, cx)));
+    vcx.run_until_parked();
+    let context = vcx.debug_bounds("question-context").expect("what is asked");
+    assert!(
+        context.size.height > gpui::px(30.),
+        "one long line wraps to more than one: {:?}",
+        context.size
+    );
+    let card = vcx.debug_bounds("question-card").expect("the card");
+    assert!(
+        card.contains(&context.origin),
+        "the context is inside the card, not in a panel beside it"
+    );
+    // A tall card scrolls inside its own room: it never runs past the window.
+    vcx.simulate_resize(gpui::size(gpui::px(1280.), gpui::px(700.)));
+    vcx.run_until_parked();
+    let below = vcx
+        .debug_bounds("agent-below")
+        .expect("the room under the terminal");
+    assert!(
+        below.bottom() <= gpui::px(700.) && below.size.height <= gpui::px(700. * 0.6 + 1.),
+        "{below:?}"
+    );
+    assert!(vcx.debug_bounds("question-side").is_none(), "no side panel");
+    assert!(vcx.debug_bounds("task-strip").is_none(), "closed at first");
+    let at = vcx.debug_bounds("task-toggle").expect("Task").center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    assert!(vcx.debug_bounds("task-strip").is_some(), "opened");
+    let at = vcx.debug_bounds("task-toggle").expect("Task").center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    assert!(vcx.debug_bounds("task-strip").is_none(), "closed again");
+}
+
+/// The words a person typed for an agent are never lost to it moving on: a reply held for a
+/// turn that ended, and an answer in their own words held for a menu that was replaced, both
+/// wait as the card's draft with the card saying so.
+#[gpui::test]
+fn words_held_for_an_agent_that_moved_on_are_kept(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let slot = crate::state::Slot::Agent(2);
+    let kept = |desk: &Entity<Desk>, vcx: &VisualTestContext| {
+        desk.read_with(vcx, |d, _| {
+            (d.drafts.get(&slot).cloned(), d.said.get(&slot).cloned())
+        })
+    };
+    let moved_on = Some(crate::question::Said::Refused(
+        "It moved on before your reply went; your words are kept.".into(),
+    ));
+
+    // A reply, held, and the agent ends another turn first.
+    answer(&desk, &mut vcx, waiting_reply("17.1"));
+    hold_reply(&desk, &mut vcx, "go on, ship it");
+    answer(&desk, &mut vcx, waiting_reply("17.2"));
+    assert_eq!(held_slot(&desk, &vcx), None, "not sent for the old turn");
+    assert_eq!(
+        kept(&desk, &vcx),
+        (Some("go on, ship it".into()), moved_on.clone())
+    );
+    desk.update(&mut vcx, |d, _| {
+        d.drafts.clear();
+        d.said.clear();
+    });
+
+    // Their own words for a menu, held, and another menu replaces it.
+    answer(&desk, &mut vcx, asking(&[(2, 77, 1, 100)]));
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open_own(2, None, window, cx)));
+    vcx.simulate_input("only the tests, please");
+    vcx.simulate_keystrokes("enter");
+    assert_eq!(held_slot(&desk, &vcx), Some(slot.clone()), "held");
+    answer(&desk, &mut vcx, asking(&[(2, 78, 2, 100)]));
+    assert_eq!(held_slot(&desk, &vcx), None, "not sent to the new menu");
+    assert_eq!(
+        kept(&desk, &vcx),
+        (Some("only the tests, please".into()), moved_on)
+    );
+}
+
+// Desktop round 5: New agent.
+
+fn agents_with(extra: Vec<qoop_runtime::control::AgentRow>) -> ControlResponse {
+    let mut rows = crate::state::tests::fixture().rows;
+    rows.extend(extra);
+    ControlResponse::Agents {
+        id: "agents".into(),
+        agents: rows,
+        splits: Vec::new(),
+        qass_checks: None,
+    }
+}
+
+/// New agent opens on the space of the page on screen: an agent's own space, a computer's first,
+/// else the first space; and a space whose computer is not reached gives way to This Mac's, with
+/// the words that say so.
+#[gpui::test]
+fn new_agent_opens_in_the_current_space(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let remote = 1i64 << 40 | 1;
+    let space_of = |desk: &Entity<Desk>, vcx: &VisualTestContext| {
+        desk.read_with(vcx, |d, _| {
+            d.sheet.as_ref().map(|s| (s.space, s.moved.clone()))
+        })
+    };
+    let close = |vcx: &mut VisualTestContext| vcx.simulate_keystrokes("escape");
+
+    // On an agent in the api space (2), not the first space.
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(5), window, cx)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a c");
+    assert_eq!(space_of(&desk, &vcx), Some((Some(2), None)));
+    close(&mut vcx);
+    desk.update(&mut vcx, |d, _| d.work_draft = None);
+
+    // On a remote agent.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| d.open(Page::Session(0x8100_0001), window, cx))
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a c");
+    assert_eq!(space_of(&desk, &vcx), Some((Some(remote), None)));
+    close(&mut vcx);
+    desk.update(&mut vcx, |d, _| d.work_draft = None);
+
+    // Its computer goes down: This Mac's first space is picked, and the sheet says why.
+    let mut spaces = fixture().spaces;
+    for w in &mut spaces {
+        if crate::state::machine_of(w.id) == 1 {
+            w.link = Some(LinkState::Down);
+        }
+    }
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Workspaces {
+            id: "mux".into(),
+            workspaces: spaces,
+        },
+    );
+    // Down for longer than a retry takes: not reached.
+    desk.update(&mut vcx, |d, _| d.now += 30);
+    vcx.simulate_keystrokes("ctrl-a c");
+    assert_eq!(
+        space_of(&desk, &vcx),
+        Some((
+            Some(1),
+            Some("staging is not reached; This Mac is picked instead.".into())
+        ))
+    );
+    assert!(vcx.debug_bounds("new-work-moved").is_some(), "drawn");
+    close(&mut vcx);
+    desk.update(&mut vcx, |d, _| d.work_draft = None);
+
+    // Off any agent: the first space.
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Inbox, window, cx)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a c");
+    assert_eq!(space_of(&desk, &vcx), Some((Some(1), None)));
+}
+
+/// Start types the shared line (the branch as typed) and the sheet then waits: an agent that
+/// appears in its space is where the person lands and the sheet closes; one in another space, or
+/// no new row, leaves the sheet saying it started.
+#[gpui::test]
+fn start_lands_on_the_agent_that_appears_in_its_space(cx: &mut TestAppContext) {
+    use crate::state::tests::row;
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(5), window, cx)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a c");
+    vcx.simulate_input("fix the flaky login test");
+    // The branch is editable: tab to its field and name it.
+    for _ in 0..4 {
+        vcx.simulate_keystrokes("tab");
+    }
+    vcx.simulate_input("feat/login-flake");
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    let asked = sent(&mut rx)
+        .into_iter()
+        .find_map(|u| match u {
+            Up::Request(r) => match *r {
+                ControlRequest::CreateTerminal { id, workspace, .. } => Some((id, workspace)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("a terminal asked for");
+    assert_eq!(asked.1, Some(2), "in the page's space");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(
+                Down::Answer(Box::new(ControlResponse::TerminalCreated {
+                    id: asked.0.clone(),
+                    terminal: 12,
+                })),
+                window,
+                cx,
+            )
+        })
+    });
+    let typed = sent(&mut rx)
+        .into_iter()
+        .find_map(|u| match u {
+            Up::Input(12, bytes) => Some(String::from_utf8(bytes).expect("utf8")),
+            _ => None,
+        })
+        .expect("the line typed");
+    assert_eq!(
+        typed,
+        "qoop worktree new feat/login-flake --space 2 -- claude 'fix the flaky login test' && exit\r"
+    );
+    let waiting = |desk: &Entity<Desk>, vcx: &VisualTestContext| {
+        desk.read_with(vcx, |d, _| {
+            (d.page, d.sheet.as_ref().is_some_and(|s| s.started))
+        })
+    };
+    assert_eq!(
+        waiting(&desk, &vcx),
+        (Page::Session(5), true),
+        "started in qoop"
+    );
+
+    // The same list, then an agent in another space: nothing lands.
+    answer(&desk, &mut vcx, agents_with(vec![]));
+    answer(
+        &desk,
+        &mut vcx,
+        agents_with(vec![row(30, 1, "working", "claude", "elsewhere")]),
+    );
+    assert_eq!(waiting(&desk, &vcx), (Page::Session(5), true));
+    // A second Start while it waits starts nothing.
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    assert!(!sent(&mut rx).iter().any(|u| matches!(u, Up::Request(_))));
+
+    // An agent of another program in that space (a schedule, qass, another client) is not it.
+    answer(
+        &desk,
+        &mut vcx,
+        agents_with(vec![
+            row(30, 1, "working", "claude", "elsewhere"),
+            row(29, 2, "working", "codex", "somebody else's"),
+        ]),
+    );
+    assert_eq!(
+        waiting(&desk, &vcx),
+        (Page::Session(5), true),
+        "not taken for it"
+    );
+    // Once started the sheet's chips and fields are gone: the space cannot be changed under it.
+    assert!(vcx.debug_bounds("space").is_none() && vcx.debug_bounds("machine").is_none());
+
+    // The new agent in the sheet's space: landed, the sheet gone.
+    answer(
+        &desk,
+        &mut vcx,
+        agents_with(vec![
+            row(30, 1, "working", "claude", "elsewhere"),
+            row(31, 2, "working", "claude", "fix the flaky login test"),
+        ]),
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| (d.page, d.sheet.is_none())),
+        (Page::Session(31), true)
+    );
+}
+
+// Desktop round 5: the qass page, its chat drawer and the Board.
+
+fn qass_running(watch: Option<bool>) -> impl Fn(&mut Desk, &mut gpui::Context<Desk>) {
+    move |d, cx| {
+        d.model.qass_watch = watch;
+        cx.notify();
+    }
+}
+
+/// The qass page's one control: Pause while it runs and its switch has answered, Resume while it
+/// is paused, nothing where the daemon has no switch, and Start (never Pause) once it has
+/// stopped; its ask bar says it is stopped.
+#[gpui::test]
+fn a_stopped_qass_shows_start_and_a_running_one_pause(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Qass, window, cx)));
+    let drawn = |vcx: &mut VisualTestContext| {
+        ["qass-pause", "qass-resume", "start-qass", "wake-qass"]
+            .into_iter()
+            .filter(|s| vcx.debug_bounds(s).is_some())
+            .collect::<Vec<_>>()
+    };
+    vcx.run_until_parked();
+    assert_eq!(
+        drawn(&mut vcx),
+        Vec::<&str>::new(),
+        "watching, its switch not answered"
+    );
+    desk.update(&mut vcx, |d, cx| qass_running(Some(true))(d, cx));
+    vcx.run_until_parked();
+    assert_eq!(drawn(&mut vcx), ["qass-pause"]);
+    desk.update(&mut vcx, |d, cx| qass_running(Some(false))(d, cx));
+    vcx.run_until_parked();
+    assert_eq!(drawn(&mut vcx), ["qass-resume"]);
+
+    // qass's agent exits: its space is still there, nothing runs.
+    let mut rows = crate::state::tests::fixture().rows;
+    rows.retain(|r| r.terminal != 9);
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    desk.update(&mut vcx, |d, cx| qass_running(Some(true))(d, cx));
+    vcx.run_until_parked();
+    assert_eq!(drawn(&mut vcx), ["start-qass"], "Start, never Pause");
+    assert!(vcx.debug_bounds("ask-send").is_none(), "nothing to ask");
+    assert!(
+        vcx.debug_bounds("ask-off").is_some(),
+        "the bar says it is stopped"
+    );
+    let said = desk.read_with(&vcx, |d, _| {
+        let stand = crate::state::qass_stand(&d.model, &Default::default());
+        crate::state::qass_said(&stand, Some("17:02"), &[])
+    });
+    assert!(
+        said.starts_with("stopped, last seen running at 17:02. What it held is back in your Inbox"),
+        "{said}"
+    );
+}
+
+/// What the qass page lists is what the daemon recorded and what lessons.md counts: acts newest
+/// first with the time and the agent as the window names it, no reason; rules by what they do.
+#[gpui::test]
+fn the_qass_page_lists_what_it_did_and_its_rules_as_recorded(cx: &mut TestAppContext) {
+    use crate::state::{Did, Lessons};
+    let (desk, mut vcx, _rx) = open(cx);
+    let act = |at: i64,
+               kind: &str,
+               terminal: Option<u32>,
+               text: &str|
+     -> qoop_runtime::control::QassAct {
+        serde_json::from_value(serde_json::json!({
+            "at": at, "kind": kind, "terminal": terminal, "text": text
+        }))
+        .expect("act")
+    };
+    let acts = vec![
+        act(3_600, "wrote", Some(3), "wrote to T3"),
+        act(1_800, "closed", None, "closed E3"),
+    ];
+    let did = desk.read_with(&vcx, |d, _| {
+        crate::state::did_today(&d.model, &acts, crate::state::tests::utc())
+    });
+    assert_eq!(
+        did,
+        vec![
+            Did {
+                at: "01:00".into(),
+                words: "Wrote to acme-web/Coupon.ts test suggestion".into()
+            },
+            Did {
+                at: "00:30".into(),
+                words: "Closed E3".into()
+            },
+        ]
+    );
+    assert_eq!(
+        crate::state::rules_lines(Some(Lessons {
+            yours: 1,
+            alone: 2,
+            all: 3
+        })),
+        (
+            3,
+            vec![
+                ("Answers alone".to_string(), "2 rules say do it".to_string()),
+                (
+                    "Always asks you".to_string(),
+                    "1 rule leave it to you".to_string()
+                ),
+            ]
+        )
+    );
+    assert_eq!(crate::state::rules_lines(Some(Lessons::default())).0, 0);
+    assert_eq!(
+        crate::state::rules_lines(Some(Lessons::default())).1[0].0,
+        "None written yet"
+    );
+    assert_eq!(
+        crate::state::rules_lines(None).1[0].0,
+        "lessons.md could not be read"
+    );
+    // A file that is not there is none written yet; one that cannot be read is said so.
+    let dir = tempfile::tempdir().expect("dir");
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, _| {
+            d.lessons_path = dir.path().join("lessons.md");
+            d.read_lessons();
+        })
+    });
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.lessons),
+        Some(Lessons::default()),
+        "missing: none written yet"
+    );
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, _| {
+            d.lessons_path = dir.path().to_path_buf();
+            d.read_lessons();
+        })
+    });
+    assert_eq!(desk.read_with(&vcx, |d, _| d.lessons), None, "unreadable");
+
+    // On the page: each act a row, the rules under Rules.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.acts = acts;
+            d.lessons = Some(Lessons {
+                yours: 1,
+                alone: 2,
+                all: 3,
+            });
+            d.open(Page::Qass, window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("did-0").is_some() && vcx.debug_bounds("did-1").is_some());
+    assert!(vcx.debug_bounds("did-2").is_none());
+}
+
+/// The chat drawer reads qass's chat as `Messages` for its terminal when it opens, shows the
+/// person's words and qass's, reads again when the daemon says that chat changed (and only
+/// that chat), says in words why it cannot, and its Terminal tab brings qass's terminal on.
+#[gpui::test]
+fn the_chat_drawer_reads_messages_and_reads_again_when_they_change(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Qass, window, cx)));
+    vcx.run_until_parked();
+    sent(&mut rx);
+    let click = |vcx: &mut VisualTestContext, what: &'static str| {
+        let at = vcx
+            .debug_bounds(what)
+            .unwrap_or_else(|| panic!("{what}"))
+            .center();
+        vcx.simulate_click(at, gpui::Modifiers::none());
+    };
+    let reads = |rx: &mut UnboundedReceiver<Up>| {
+        sent(rx)
+            .into_iter()
+            .filter_map(|u| match u {
+                Up::Request(r) => match *r {
+                    ControlRequest::Messages { id, terminal, .. } => Some((id, terminal)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    click(&mut vcx, "open-chat");
+    let asked = reads(&mut rx);
+    assert_eq!(asked.len(), 1, "read once as it opens");
+    assert_eq!(asked[0].1, 9, "qass's own terminal");
+    let page = |id: &str, items: serde_json::Value| -> ControlResponse {
+        serde_json::from_value(serde_json::json!({
+            "op": "Messages", "id": id, "revision": 1, "reset": false, "first_seq": 0,
+            "has_older": false, "items": items, "warnings": 0,
+        }))
+        .expect("a page")
+    };
+    answer(
+        &desk,
+        &mut vcx,
+        page(
+            &asked[0].0,
+            serde_json::json!([
+                {"type": "user", "seq": 1, "ts": null, "text": "Do not answer xheron for an hour.", "attachments": []},
+                {"type": "agent", "seq": 0, "ts": null, "text": "Done.\nIt is in Rules.", "model": null},
+            ]),
+        ),
+    );
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("chat-bubble-0").is_some() && vcx.debug_bounds("chat-bubble-1").is_some()
+    );
+    // News of another terminal's chat reads nothing; qass's reads again.
+    desk.update(&mut vcx, |d, _| {
+        d.chat_changed(4);
+    });
+    assert!(reads(&mut rx).is_empty(), "not qass's chat");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(
+                Down::Event(qoop_runtime::control::EventMessage::MessagesChanged {
+                    terminal: 9,
+                    revision: 2,
+                }),
+                window,
+                cx,
+            )
+        })
+    });
+    let again = reads(&mut rx);
+    assert_eq!(again.len(), 1, "read again on the news");
+    // An old daemon says so, in words.
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Failed {
+            id: again[0].0.clone(),
+            reason: "unknown variant `Messages`, expected one of".into(),
+        },
+    );
+    assert!(
+        desk.read_with(&vcx, |d, _| d.chat.note.clone())
+            .is_some_and(|n| n.contains("too old to show the chat")),
+    );
+    // The Terminal tab: qass's terminal is on screen, and the chat is not read meanwhile.
+    click(&mut vcx, "terminal-tab");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.term.as_ref().map(|t| t.terminal)),
+        Some(9)
+    );
+    desk.update(&mut vcx, |d, _| d.chat_changed(9));
+    assert!(reads(&mut rx).is_empty(), "the Terminal tab reads no chat");
+    // Close: the terminal goes again.
+    click(&mut vcx, "chat-close");
+    assert!(desk.read_with(&vcx, |d, _| !d.chat.open && d.term.is_none()));
+}
+
+/// A board as a daemon sends it: two items wait on the person, one is doing, one todo, one done.
+fn board_items() -> serde_json::Value {
+    let item = |id: i64, key: &str, state: &str, extra: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "id": id, "key": key, "workspace": 1, "title": format!("title of {key}"),
+            "state": state, "steps_done": 0, "steps_total": 0, "agents": [], "updated_at": id,
+        });
+        for (k, val) in extra.as_object().cloned().unwrap_or_default() {
+            v[k] = val;
+        }
+        v
+    };
+    serde_json::json!([
+        item(1, "QOOP-66", "done", serde_json::json!({"closed_at": 5})),
+        item(2, "QOOP-68", "doing", serde_json::json!({"open_asks": 1})),
+        item(3, "QOOP-71", "doing", serde_json::json!({})),
+        item(4, "QOOP-72", "todo", serde_json::json!({})),
+        item(5, "QOOP-73", "todo", serde_json::json!({"plan": "asked"})),
+    ])
+}
+
+fn board_answer(id: &str, items: Option<serde_json::Value>) -> ControlResponse {
+    serde_json::from_value(serde_json::json!({
+        "op": "Tasks", "id": id, "tasks": [], "events": [], "more": false,
+        "items": items,
+    }))
+    .expect("tasks")
+}
+
+/// The Board is the Inbox's second view: read as it opens, in four bands (Waiting on you holds
+/// what Needs you holds), four columns from a page 920 wide and two below it, narrowed by the search.
+#[gpui::test]
+fn the_board_lists_four_bands_in_four_columns_or_two(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    sent(&mut rx);
+    let at = vcx
+        .debug_bounds("view-board")
+        .expect("the segment")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    let read = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::TaskRead { board: true, .. })
+    })
+    .expect("the board is read as it opens");
+    assert!(
+        matches!(
+            &read,
+            ControlRequest::TaskRead {
+                task: None,
+                terminal: None,
+                ..
+            }
+        ),
+        "no Via for This Mac: {read:?}"
+    );
+    answer(
+        &desk,
+        &mut vcx,
+        board_answer(read.request_id(), Some(board_items())),
+    );
+    vcx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(900.)));
+    vcx.run_until_parked();
+    for band in ["band-wait", "band-doing", "band-todo", "band-done"] {
+        assert!(vcx.debug_bounds(band).is_some(), "{band}");
+    }
+    assert!(
+        vcx.debug_bounds("board-columns-4").is_some(),
+        "four columns on a page 1320 wide"
+    );
+    // The waiting band is before the others, and its items are the ones that wait.
+    assert!(
+        vcx.debug_bounds("item-QOOP-68").is_some() && vcx.debug_bounds("item-QOOP-73").is_some()
+    );
+    let wait = vcx.debug_bounds("band-wait").expect("wait");
+    let doing = vcx.debug_bounds("band-doing").expect("doing");
+    assert!(wait.origin.x < doing.origin.x, "side by side in order");
+    assert!(
+        wait.contains(&vcx.debug_bounds("item-QOOP-68").expect("item").origin),
+        "QOOP-68 (a question open) is in Waiting on you"
+    );
+    // A 1280 window leaves a page 1000 wide (the sidebar's 280 is taken): four columns.
+    vcx.simulate_resize(gpui::size(gpui::px(1280.), gpui::px(800.)));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("board-columns-4").is_some(),
+        "four columns at 1280"
+    );
+    // The sidebar counts: dragged to its widest it leaves 1280 - 420 = 860, under 920.
+    desk.update(&mut vcx, |d, cx| {
+        d.side_w = crate::shell::SIDE_MAX;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("board-columns-2").is_some(),
+        "two columns on a page 860 wide"
+    );
+    desk.update(&mut vcx, |d, cx| {
+        d.side_w = crate::shell::SIDE_DEFAULT;
+        cx.notify();
+    });
+    vcx.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(800.)));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("board-columns-2").is_some(),
+        "two columns at 1100"
+    );
+    let (wait, todo) = (
+        vcx.debug_bounds("band-wait").expect("wait"),
+        vcx.debug_bounds("band-todo").expect("todo"),
+    );
+    assert!(
+        todo.origin.y > wait.origin.y,
+        "the second pair is under the first"
+    );
+    // The search narrows the items.
+    desk.update(&mut vcx, |d, cx| {
+        d.board.find.update(cx, |f, cx| {
+            f.set_text("QOOP-71");
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("item-QOOP-71").is_some() && vcx.debug_bounds("item-QOOP-68").is_none()
+    );
+}
+
+/// Another computer's board is read through `Via` under its own id, an older qoop there (no
+/// `items`) is told by name, and an item added there goes through `Via` with no terminal.
+#[gpui::test]
+fn another_computers_board_is_read_and_added_to_through_via(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote = 1i64 << 40 | 1;
+    vcx.update(|_, cx| desk.update(cx, |d, cx| d.show_board(true, cx)));
+    sent(&mut rx);
+    let at = vcx
+        .debug_bounds("board-machine-1")
+        .expect("staging")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    let via = via_sent(&mut rx, remote);
+    let read = via
+        .iter()
+        .find(|r| matches!(r, ControlRequest::TaskRead { board: true, .. }))
+        .expect("read through Via")
+        .clone();
+    assert_eq!(read.request_id(), "board-read-1");
+    // A qoop from before the board answers with no items.
+    answer(&desk, &mut vcx, board_answer("board-read-1", None));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("board-old").is_some(),
+        "the old qoop is told"
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.board.read_of(1)),
+        qoop_tui::board::Read::Old
+    );
+    assert_eq!(
+        qoop_tui::board::too_old("staging"),
+        "qoop on staging is too old for the board"
+    );
+    // The board, once it answers: add an item to it.
+    answer(
+        &desk,
+        &mut vcx,
+        board_answer("board-read-1", Some(serde_json::json!([]))),
+    );
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("board-empty").is_some());
+    let at = vcx.debug_bounds("board-add").expect("Add item").center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    vcx.simulate_input("check the soak");
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    let writes = via_sent(&mut rx, remote);
+    assert!(
+        writes.iter().any(|r| matches!(
+            r,
+            ControlRequest::TaskWrite {
+                terminal: None,
+                token: None,
+                action: qoop_runtime::control::TaskOp::Add { workspace: Some(w), goal, .. },
+                ..
+            } if *w == remote && goal == "check the soak"
+        )),
+        "{writes:?}"
+    );
+}
+
+/// The tell-qass line says words to qass as the ask bar does: pasted and sent while qass is at
+/// rest, kept (and the line says why) while it works.
+#[gpui::test]
+fn the_tell_line_reaches_qass_only_while_it_is_at_rest(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|_, cx| desk.update(cx, |d, cx| d.show_board(true, cx)));
+    vcx.run_until_parked();
+    let tell = |vcx: &mut VisualTestContext, desk: &Entity<Desk>, words: &str| {
+        desk.update(vcx, |d, cx| {
+            d.board.tell.update(cx, |f, _| f.set_text(words))
+        });
+        let at = vcx
+            .debug_bounds("board-tell-send")
+            .expect("Tell qass")
+            .center();
+        vcx.simulate_click(at, gpui::Modifiers::none());
+    };
+    // Working: kept.
+    sent(&mut rx);
+    tell(&mut vcx, &desk, "work on QOOP-73 next");
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Paste(..))),
+        "not while it works"
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, cx| d.board.tell.read(cx).text.clone()),
+        "work on QOOP-73 next",
+        "the words stay in the line"
+    );
+    // At rest: sent, the line emptied.
+    let mut rows = crate::state::tests::fixture().rows;
+    for r in rows.iter_mut().filter(|r| r.terminal == 9) {
+        r.state = "idle".into();
+        r.status = Some("idle".into());
+        r.readiness = "ready".into();
+    }
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    vcx.run_until_parked();
+    sent(&mut rx);
+    let at = vcx
+        .debug_bounds("board-tell-send")
+        .expect("Tell qass")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    let ups = sent(&mut rx);
+    assert!(
+        ups.iter()
+            .any(|u| matches!(u, Up::Paste(9, b) if b == b"work on QOOP-73 next")),
+        "{ups:?}"
+    );
+    assert!(
+        ups.iter()
+            .any(|u| matches!(u, Up::Input(9, b) if b == b"\r"))
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, cx| d.board.tell.read(cx).text.clone()),
+        ""
+    );
+}
+
+// Review round 1 of desktop round 5.
+
+/// A card under the terminal never changes the agent's size: each terminal is told the height it
+/// has without the card, so a menu card coming and going sends no new size (ADR-007). `split` is
+/// the tab's tree of panes, none for a tab of one.
+fn card_never_resizes(cx: &mut TestAppContext, split: Option<qoop_runtime::control::Pane>) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let tabs = split.clone().map_or(vec![1], |p| p.leaves());
+    // The agent lists keep the tab's split.
+    let with_split = |mut list: ControlResponse| {
+        if let ControlResponse::Agents { splits, .. } = &mut list {
+            *splits = split.clone().into_iter().collect();
+        }
+        list
+    };
+    desk.update(&mut vcx, |d, _| {
+        d.model.splits = split.clone().into_iter().collect()
+    });
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    let first = sent(&mut rx);
+    for t in &tabs {
+        assert!(
+            first
+                .iter()
+                .any(|u| matches!(u, Up::Resize(n, ..) if n == t)),
+            "terminal {t} was sized when it came on"
+        );
+    }
+    assert!(vcx.debug_bounds("question-card").is_none());
+    // With no card each terminal is told what its pane draws: the rows of the area it paints in.
+    let drawn: Vec<(u32, u16)> = desk.read_with(&vcx, |d, _| {
+        d.term
+            .iter()
+            .chain(&d.others)
+            .map(|t| {
+                let area = t.area.get();
+                (
+                    t.terminal,
+                    d.cells.fit((area.size.width, area.size.height)).1,
+                )
+            })
+            .collect()
+    });
+    assert_eq!(drawn.len(), tabs.len());
+    for (terminal, rows) in drawn {
+        let told = first
+            .iter()
+            .rev()
+            .find_map(|u| match u {
+                Up::Resize(t, _, rows) if *t == terminal => Some(*rows),
+                _ => None,
+            })
+            .expect("sized");
+        assert_eq!(told, rows, "terminal {terminal} is told the rows it draws");
+    }
+    answer(&desk, &mut vcx, with_split(asking(&[(1, 77, 1, 100)])));
+    vcx.run_until_parked();
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("question-card").is_some(),
+        "the card is drawn"
+    );
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Resize(..))),
+        "a card appearing sent a size"
+    );
+    answer(&desk, &mut vcx, with_split(answer_gone()));
+    vcx.run_until_parked();
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("question-card").is_none());
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Resize(..))),
+        "a card going sent a size"
+    );
+}
+
+#[gpui::test]
+fn a_card_under_the_terminal_never_resizes_the_agent(cx: &mut TestAppContext) {
+    card_never_resizes(cx, None);
+}
+
+/// The same for panes side by side and for panes one above the other.
+#[gpui::test]
+fn a_card_never_resizes_side_by_side_panes(cx: &mut TestAppContext) {
+    card_never_resizes(cx, Some(crate::state::tests::split(1, 3)));
+}
+
+#[gpui::test]
+fn a_card_never_resizes_stacked_panes(cx: &mut TestAppContext) {
+    use qoop_runtime::control::{Pane, SplitDir};
+    card_never_resizes(
+        cx,
+        Some(Pane::Split {
+            dir: SplitDir::H,
+            permille: 600,
+            questions: 0,
+            first: Box::new(Pane::Leaf { terminal: 1 }),
+            second: Box::new(Pane::Leaf { terminal: 3 }),
+        }),
+    );
+}
+
+/// The agent list with nobody asking.
+fn answer_gone() -> ControlResponse {
+    ControlResponse::Agents {
+        id: "agents".into(),
+        agents: crate::state::tests::fixture().rows,
+        splits: Vec::new(),
+        qass_checks: None,
+    }
+}
+
+/// Once Start has typed its line the shell it ran in stays reachable: a refused `qoop worktree
+/// new` (the branch exists) shows its error there, so the sheet offers to open it.
+#[gpui::test]
+fn a_started_sheet_offers_the_shell_that_ran_the_line(cx: &mut TestAppContext) {
+    use crate::state::tests::row;
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(5), window, cx)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a c");
+    vcx.simulate_input("fix it");
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    let id = desk
+        .read_with(&vcx, |d, _| d.pending.clone().map(|p| p.0))
+        .expect("asked");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(
+                Down::Answer(Box::new(ControlResponse::TerminalCreated {
+                    id,
+                    terminal: 12,
+                })),
+                window,
+                cx,
+            )
+        })
+    });
+    assert!(
+        vcx.debug_bounds("open-shell").is_none(),
+        "the shell is not listed yet"
+    );
+    let mut shell = row(12, 2, "idle", "zsh", "zsh");
+    shell.agent = false;
+    answer(&desk, &mut vcx, agents_with(vec![shell]));
+    vcx.run_until_parked();
+    let at = vcx
+        .debug_bounds("open-shell")
+        .expect("Open its terminal")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| (d.page, d.sheet.is_none())),
+        (Page::Session(12), true)
+    );
+}
+
+/// An add the mux refuses (under the outer `Via` id) says why instead of leaving "Adding.", an
+/// add that is written does not pull the person off the computer they moved to, and one nobody
+/// answers is given up with a word.
+#[gpui::test]
+fn board_writes_are_answered_under_either_id_and_never_move_the_person(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote = 1i64 << 40 | 1;
+    vcx.update(|_, cx| desk.update(cx, |d, cx| d.show_board(true, cx)));
+    let click = |vcx: &mut VisualTestContext, what: &'static str| {
+        let at = vcx
+            .debug_bounds(what)
+            .unwrap_or_else(|| panic!("{what}"))
+            .center();
+        vcx.simulate_click(at, gpui::Modifiers::none());
+    };
+    click(&mut vcx, "board-machine-1");
+    answer(
+        &desk,
+        &mut vcx,
+        board_answer("board-read-1", Some(serde_json::json!([]))),
+    );
+    vcx.run_until_parked();
+    let add = |vcx: &mut VisualTestContext, rx: &mut UnboundedReceiver<Up>, words: &str| {
+        click(vcx, "board-add");
+        vcx.simulate_input(words);
+        sent(rx);
+        vcx.simulate_keystrokes("enter");
+        sent(rx)
+            .into_iter()
+            .find_map(|u| match u {
+                Up::Request(r) => match *r {
+                    ControlRequest::Via { id, request, .. } => {
+                        Some((id, request.request_id().to_string()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("carried by Via")
+    };
+    let said = |desk: &Entity<Desk>, vcx: &VisualTestContext| {
+        desk.read_with(vcx, |d, _| d.board.said.clone())
+    };
+
+    // The mux refuses under the outer id.
+    let (outer, _inner) = add(&mut vcx, &mut rx, "one");
+    assert_eq!(said(&desk, &vcx).as_deref(), Some("Adding."));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Failed {
+            id: outer,
+            reason: "staging went offline".into(),
+        },
+    );
+    assert_eq!(said(&desk, &vcx).as_deref(), Some("staging went offline"));
+
+    // Written while the person has gone to This Mac: they stay there.
+    let (_outer, inner) = add(&mut vcx, &mut rx, "two");
+    click(&mut vcx, "board-machine-0");
+    answer(
+        &desk,
+        &mut vcx,
+        serde_json::from_value(serde_json::json!({
+            "op": "TaskWritten", "id": inner, "task": 9, "key": "QOOP-9",
+        }))
+        .expect("written"),
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.board.machine),
+        0,
+        "still on This Mac"
+    );
+    assert_eq!(said(&desk, &vcx).as_deref(), Some("Added QOOP-9."));
+    let reads = via_sent(&mut rx, remote);
+    assert!(
+        reads
+            .iter()
+            .any(|r| matches!(r, ControlRequest::TaskRead { board: true, .. })),
+        "the computer written to is read again"
+    );
+
+    // Nobody answers: given up after a while, with a word.
+    click(&mut vcx, "board-machine-1");
+    let _ = add(&mut vcx, &mut rx, "three");
+    desk.update(&mut vcx, |d, _| {
+        let at = crate::app::unix_now() + 60;
+        d.board_tick(at);
+    });
+    assert_eq!(
+        said(&desk, &vcx).as_deref(),
+        Some("The item was not confirmed: look at the board.")
+    );
+}
+
+/// An item that waits on the person leads somewhere: its agent's page (the terminal as the mux
+/// numbers it), else the Inbox on the card about it; by click, and by Tab and Enter.
+#[gpui::test]
+fn a_waiting_item_opens_its_agent_or_its_card(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    desk.update(&mut vcx, |d, cx| {
+        d.asks = vec![{
+            let mut card = tab_card("Q7", 1, "open");
+            card.item = serde_json::from_value(serde_json::json!({"id": 2, "key": "QOOP-68"})).ok();
+            card
+        }];
+        cx.notify();
+    });
+    vcx.update(|_, cx| desk.update(cx, |d, cx| d.show_board(true, cx)));
+    sent(&mut rx);
+    let items = serde_json::json!([
+        {"id": 2, "key": "QOOP-68", "workspace": 1, "title": "Rust toolchain bump", "state": "doing",
+         "steps_done": 0, "steps_total": 0, "agents": [], "updated_at": 2, "open_asks": 1},
+        {"id": 3, "key": "QOOP-74", "workspace": 1, "title": "Linear token refresh", "state": "doing",
+         "steps_done": 0, "steps_total": 0, "updated_at": 3,
+         "agents": [{"task": 1, "terminal": 2, "name": "a", "machine": "this Mac", "stage": "x", "status": "waits"}]},
+    ]);
+    answer(&desk, &mut vcx, board_answer("board-read", Some(items)));
+    vcx.run_until_parked();
+    // By click: the agent.
+    let at = vcx.debug_bounds("item-QOOP-74").expect("item").center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    assert_eq!(desk.read_with(&vcx, |d, _| d.page), Page::Session(2));
+    // The one with a question open: the Inbox, the ring on its card.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open(Page::Inbox, window, cx);
+            d.show_board(true, cx);
+        })
+    });
+    vcx.run_until_parked();
+    let at = vcx.debug_bounds("item-QOOP-68").expect("item").center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| (d.page, d.board.open, d.inbox_cursor.clone())),
+        (
+            Page::Inbox,
+            false,
+            Some(crate::state::Slot::Card("Q7".into()))
+        )
+    );
+    // By keyboard: the item is a Tab stop, and Enter opens it.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open(Page::Inbox, window, cx);
+            d.show_board(true, cx);
+            window.focus(&d.focus, cx);
+        })
+    });
+    vcx.run_until_parked();
+    let handle = desk
+        .read_with(&vcx, |d, _| {
+            d.board.item_focus.borrow().get(&(0, 3)).cloned()
+        })
+        .expect("the item keeps a focus handle");
+    let mut reached = false;
+    for _ in 0..200 {
+        vcx.simulate_keystrokes("tab");
+        if vcx.update(|window, _| handle.is_focused(window)) {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "Tab reaches the item");
+    vcx.simulate_keystrokes("enter");
+    vcx.update(|window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse("enter").expect("enter"),
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(desk.read_with(&vcx, |d, _| d.page), Page::Session(2));
+}
+
+/// The drawer's Terminal tab takes the page's width (qass is not squeezed to a few dozen
+/// columns); the Chat tab stays a 400 px column.
+#[gpui::test]
+fn the_terminal_tab_takes_the_pages_width_and_chat_stays_narrow(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.simulate_resize(gpui::size(gpui::px(1280.), gpui::px(800.)));
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Qass, window, cx)));
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open_chat(crate::chat::ChatTab::Chat, window, cx)
+        })
+    });
+    vcx.run_until_parked();
+    let chat = vcx.debug_bounds("chat-drawer").expect("the drawer");
+    assert_eq!(chat.size.width, gpui::px(400.));
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open_chat(crate::chat::ChatTab::Terminal, window, cx)
+        })
+    });
+    vcx.run_until_parked();
+    let (drawer, page) = (
+        vcx.debug_bounds("chat-drawer").expect("the drawer"),
+        vcx.debug_bounds("qass-page").expect("the page"),
+    );
+    assert_eq!(drawer.size.width, page.size.width, "the page's width");
+    assert!(drawer.size.width > gpui::px(800.));
+}
+
+/// The chat list follows the newest message while the person is at its foot, holds still once
+/// they scroll up to read, and follows again when they are back at the foot.
+#[gpui::test]
+fn the_chat_holds_still_when_scrolled_up_and_follows_at_the_foot(cx: &mut TestAppContext) {
+    use qoop_tui::chat_view::{Bubble, Who};
+    let (desk, mut vcx, _rx) = open(cx);
+    let many = |n: usize| -> Vec<Bubble> {
+        (0..n)
+            .map(|i| Bubble::Said {
+                by: if i % 2 == 0 { Who::You } else { Who::Agent },
+                text: format!("message number {i} with a few words in it"),
+            })
+            .collect()
+    };
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Qass, window, cx)));
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open_chat(crate::chat::ChatTab::Chat, window, cx)
+        })
+    });
+    let set = |desk: &Entity<Desk>, vcx: &mut VisualTestContext, n: usize| {
+        desk.update(vcx, |d, cx| {
+            d.chat.bubbles = Some(many(n));
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        vcx.run_until_parked();
+    };
+    let state = |desk: &Entity<Desk>, vcx: &VisualTestContext| {
+        desk.read_with(vcx, |d, _| {
+            (
+                (f32::from(d.chat.scroll.offset().y) + f32::from(d.chat.scroll.max_offset().y))
+                    .abs()
+                    < 1.,
+                f32::from(d.chat.scroll.offset().y),
+                f32::from(d.chat.scroll.max_offset().y),
+            )
+        })
+    };
+    set(&desk, &mut vcx, 40);
+    let (follow, y, max) = state(&desk, &vcx);
+    assert!(max > 100., "the list is taller than its room: {max}");
+    assert!(
+        follow && (y + max).abs() < 1.,
+        "at the newest: {y} of {max}"
+    );
+
+    // Scrolled up: a new message moves nothing.
+    desk.update(&mut vcx, |d, cx| {
+        d.chat
+            .scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(-(max - 120.))));
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let (follow, held, _) = state(&desk, &vcx);
+    assert!(!follow, "scrolled away from the foot");
+    set(&desk, &mut vcx, 41);
+    let (follow, y, _) = state(&desk, &vcx);
+    assert!(!follow && (y - held).abs() < 1., "held at {held}, now {y}");
+
+    // Back at the foot: following again.
+    let (_, _, max) = state(&desk, &vcx);
+    desk.update(&mut vcx, |d, cx| {
+        d.chat
+            .scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(-max)));
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    set(&desk, &mut vcx, 42);
+    let (follow, y, max) = state(&desk, &vcx);
+    assert!(
+        follow && (y + max).abs() < 1.,
+        "followed to the new foot: {y} of {max}"
+    );
+
+    // Scrolled up, closed and opened again: it starts at the newest message.
+    desk.update(&mut vcx, |d, cx| {
+        d.chat
+            .scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(-100.)));
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(!state(&desk, &vcx).0, "scrolled up again");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.close_chat(window, cx);
+            d.open_chat(crate::chat::ChatTab::Chat, window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    vcx.run_until_parked();
+    assert!(state(&desk, &vcx).0, "opened at the newest");
+}
+
+/// News while a chat read is out sends no second read: it is kept, and one read follows the
+/// answer.
+#[gpui::test]
+fn news_while_a_chat_read_is_out_waits_for_its_answer(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Qass, window, cx)));
+    sent(&mut rx);
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open_chat(crate::chat::ChatTab::Chat, window, cx)
+        })
+    });
+    let reads = |rx: &mut UnboundedReceiver<Up>| {
+        sent(rx)
+            .into_iter()
+            .filter_map(|u| match u {
+                Up::Request(r) => match *r {
+                    ControlRequest::Messages { id, .. } => Some(id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = reads(&mut rx);
+    assert_eq!(first.len(), 1);
+    for _ in 0..5 {
+        desk.update(&mut vcx, |d, _| d.chat_changed(9));
+    }
+    assert!(reads(&mut rx).is_empty(), "no read while one is out");
+    answer(
+        &desk,
+        &mut vcx,
+        serde_json::from_value(serde_json::json!({
+            "op": "Messages", "id": first[0], "revision": 1, "reset": false, "first_seq": 0,
+            "has_older": false, "items": [], "warnings": 0,
+        }))
+        .expect("a page"),
+    );
+    assert_eq!(
+        reads(&mut rx).len(),
+        1,
+        "one more read, for the news that came meanwhile"
+    );
+}
+
+/// Escape closes the chat drawer unless the terminal has the keys (an Escape there belongs to
+/// qass), no `esc` hint is drawn while it does, and the Chat button has the focus back after.
+#[gpui::test]
+fn escape_closes_the_drawer_unless_the_terminal_has_the_keys(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Qass, window, cx)));
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open_chat(crate::chat::ChatTab::Chat, window, cx)
+        })
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("chat-close-esc").is_some(),
+        "the hint on the Chat tab"
+    );
+    // The Terminal tab: the terminal has the keys, Escape is its own, and no hint says otherwise.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open_chat(crate::chat::ChatTab::Terminal, window, cx)
+        })
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("chat-close-esc").is_none(),
+        "no esc hint while the terminal has the keys"
+    );
+    vcx.simulate_keystrokes("escape");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.chat.open),
+        "Escape went to the terminal"
+    );
+    // Keys off the terminal (ctrl-a a): Escape closes, and the button that opened it has the focus.
+    vcx.simulate_keystrokes("ctrl-a a");
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("chat-close-esc").is_some(),
+        "the hint is back"
+    );
+    vcx.simulate_keystrokes("escape");
+    assert!(desk.read_with(&vcx, |d, _| !d.chat.open));
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| desk.read(cx).chat.button.is_focused(window)),
+        "the Chat button has the focus"
+    );
 }

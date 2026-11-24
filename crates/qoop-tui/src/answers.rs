@@ -604,7 +604,9 @@ pub fn branch_problem(branch: &str) -> Option<&'static str> {
     }
 }
 
-fn program_of(command: &str) -> &str {
+/// The program a launcher's command starts: its first word that is not `NAME=value` or `env`,
+/// without its folder.
+pub fn program_of(command: &str) -> &str {
     // Past any `NAME=value` in front, as the TUI's schedule form reads a launcher.
     let first = command
         .split_whitespace()

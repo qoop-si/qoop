@@ -131,7 +131,7 @@ impl Desk {
         by_slot.or_else(|| (!items.is_empty()).then(|| self.cursor_at.min(items.len() - 1)))
     }
 
-    fn set_cursor(&mut self, slot: Slot, at: usize) {
+    pub(crate) fn set_cursor(&mut self, slot: Slot, at: usize) {
         self.inbox_cursor = Some(slot);
         self.cursor_at = at;
     }
@@ -302,7 +302,7 @@ impl Desk {
     }
 
     /// The Inbox's own header: its title and count, and the keys that answer.
-    fn inbox_header(&self, count: usize, t: &Theme) -> impl IntoElement {
+    fn inbox_header(&self, count: usize, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("title")
             .role(Role::Heading)
@@ -323,19 +323,34 @@ impl Desk {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("Inbox"),
             )
+            // Needs you and the Board: the Inbox's two views.
             .child(
                 div()
-                    .id("inbox-count")
-                    .text_size(px(13.))
-                    .text_color(c(t.t2))
-                    .child(match count {
-                        0 => "nothing needs you".to_string(),
-                        1 => "1 needs you".to_string(),
-                        n => format!("{n} need you"),
-                    }),
+                    .id("inbox-views")
+                    .role(Role::RadioGroup)
+                    .aria_label("Inbox view")
+                    .flex()
+                    .gap(px(4.))
+                    .child(
+                        ui::chip(
+                            "view-needs",
+                            "Needs you",
+                            Some(count),
+                            None,
+                            !self.board.open,
+                            t,
+                        )
+                        .debug_selector(|| "view-needs".to_string())
+                        .on_click(cx.listener(|this, _, _, cx| this.show_board(false, cx))),
+                    )
+                    .child(
+                        ui::chip("view-board", "Board", None, None, self.board.open, t)
+                            .debug_selector(|| "view-board".to_string())
+                            .on_click(cx.listener(|this, _, _, cx| this.show_board(true, cx))),
+                    ),
             )
             .child(div().flex_1())
-            .when(count > 0, |d| {
+            .when(count > 0 && !self.board.open, |d| {
                 d.child(
                     div()
                         .text_size(px(12.))
@@ -383,13 +398,24 @@ impl Desk {
             .retain(|slot, _| items.iter().any(|i| &i.slot == slot));
         let cursor = self.cursor_in(&items);
         let first_run = self.listed && self.model.agents().is_empty();
+        if self.board.open {
+            return div()
+                .id("inbox-page")
+                .debug_selector(|| "inbox-page".to_string())
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(self.inbox_header(list.count, t, cx))
+                .child(self.board_page(list, t, cx))
+                .into_any_element();
+        }
         div()
             .id("inbox-page")
             .debug_selector(|| "inbox-page".to_string())
             .size_full()
             .flex()
             .flex_col()
-            .child(self.inbox_header(list.count, t))
+            .child(self.inbox_header(list.count, t, cx))
             .when(list.count > 0 || self.inbox_filter != Filter::All, |d| {
                 d.child(self.inbox_chips(list, t, cx))
             })

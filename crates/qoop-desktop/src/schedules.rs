@@ -1272,7 +1272,7 @@ impl Desk {
                 let on = !s.paused;
                 let next = match (s.paused, s.next_at) {
                     (true, _) => "paused".to_string(),
-                    (false, Some(at)) => state::clock_at(at, self.now, self.zone),
+                    (false, Some(at)) => qoop_tui::schedules::moment(at, self.now, self.zone),
                     (false, None) => String::new(),
                 };
                 div()
@@ -1568,13 +1568,9 @@ impl Desk {
                             .gap(px(10.))
                             .py(px(3.))
                             .text_size(px(12.5))
-                            .child(
-                                div()
-                                    .w(px(96.))
-                                    .flex_none()
-                                    .font_family(MONO_FONT)
-                                    .child(state::clock_at(r.started_at, self.now, self.zone)),
-                            )
+                            .child(div().w(px(96.)).flex_none().font_family(MONO_FONT).child(
+                                qoop_tui::schedules::moment(r.started_at, self.now, self.zone),
+                            ))
                             .child(
                                 div()
                                     .w(px(130.))
@@ -1639,7 +1635,7 @@ impl Desk {
             (true, _) => "Not run yet. It is paused.".to_string(),
             (false, Some(at)) => format!(
                 "Not run yet. Runs at {}.",
-                state::clock_at(at, self.now, self.zone)
+                qoop_tui::schedules::moment(at, self.now, self.zone)
             ),
             (false, None) => "Not run yet.".to_string(),
         };
@@ -1843,7 +1839,7 @@ impl Desk {
                 } else {
                     "First run"
                 },
-                state::clock_at(at, self.now, self.zone)
+                qoop_tui::schedules::moment(at, self.now, self.zone)
             ),
             Ok(None) => "A watch: its first check notes what is there, then new lines start a run."
                 .to_string(),

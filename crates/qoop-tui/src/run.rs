@@ -1530,6 +1530,10 @@ impl Modes {
 #[derive(Default)]
 struct BesideState {
     board: crate::board::Board,
+    /// The boards of other computers, read when the Board shows one (`m` turns to it).
+    boards: std::collections::BTreeMap<usize, crate::board::Board>,
+    /// The computer last asked for its board, and when, so it is read again on a 30 s tick.
+    board_asked: Option<(usize, std::time::Instant)>,
     /// What qass did today; `None` until read.
     acts: Option<Vec<qoop_runtime::control::QassAct>>,
     /// The acts are owed a new read.
@@ -1554,6 +1558,20 @@ struct BesideState {
     blocking: Option<tokio::sync::mpsc::UnboundedSender<Blocked>>,
 }
 
+impl BesideState {
+    /// The board of `computer` as read so far (This Mac's is the one the ledger reads too).
+    fn board_for(&self, computer: usize) -> &crate::board::Board {
+        static UNREAD: std::sync::OnceLock<crate::board::Board> = std::sync::OnceLock::new();
+        match computer {
+            0 => &self.board,
+            m => self
+                .boards
+                .get(&m)
+                .unwrap_or_else(|| UNREAD.get_or_init(crate::board::Board::default)),
+        }
+    }
+}
+
 /// The Inbox's view of the client: the rows, the cards, what is known about qass and the
 /// clocks, borrowed field by field so the pane itself can be borrowed mutably beside them.
 macro_rules! ibx_env {
@@ -1568,7 +1586,15 @@ macro_rules! ibx_env {
             now_unix: sidebar::now_unix(),
             typed: &$s.typed_at,
             beside: &crate::places::Beside {
-                board: &$s.beside.board,
+                // The board the Inbox shows: another computer's while the Board is turned to
+                // it, This Mac's for everything else (the ledger reads it too).
+                board: $s.beside.board_for(
+                    if $s.ibx.open && $s.ibx.board && $s.ibx.place.is_none() {
+                        $s.ibx.computer
+                    } else {
+                        0
+                    },
+                ),
                 acts: $s.beside.acts.as_deref(),
                 acts_failed: $s
                     .beside
@@ -10467,6 +10493,11 @@ where
                                 if state.beside.board.answered(&response) {
                                     dirty = true;
                                 }
+                                for (m, remote) in &mut state.beside.boards {
+                                    if remote.answered_to(&crate::board::read_id(*m), &response) {
+                                        dirty = true;
+                                    }
+                                }
                                 drain_inbox(&mut state, &mut seqs, &mut control_seq, &mut wr).await?;
                                 if state.asks.answered(&response) {
                                     dirty = true;
@@ -13400,6 +13431,32 @@ async fn drain_beside(
     if board && let Some(read) = state.beside.board.request() {
         wr.write_all(&client::encode_control_seq(&read, control_seq)?)
             .await?;
+    }
+    // The Board turned to another computer: its board is read through `Via`, and again on a
+    // 30 s tick while it shows.
+    let computer = state.ibx.computer;
+    if shown
+        && state.ibx.board
+        && state.ibx.place.is_none()
+        && computer != 0
+        && let Some(via) = crate::places::space_on(&state.spaces, computer)
+    {
+        let due = state
+            .beside
+            .board_asked
+            .is_none_or(|(m, at)| m != computer || at.elapsed() >= ACTS_EVERY);
+        let remote = state.beside.boards.entry(computer).or_default();
+        if due {
+            if remote.read == crate::board::Read::Reading {
+                remote.read = crate::board::Read::Unread;
+            }
+            remote.stale = true;
+        }
+        if let Some(read) = remote.request_via(&crate::board::read_id(computer), Some(via)) {
+            state.beside.board_asked = Some((computer, std::time::Instant::now()));
+            wr.write_all(&client::encode_control_seq(&read, control_seq)?)
+                .await?;
+        }
     }
     // Read again on a 30 s tick while the ledger shows, as the board page was.
     if ledger

@@ -8,7 +8,6 @@
 //! daemon says it typed it.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::time::Instant;
 
 use gpui::{AnyElement, Context, Entity, FontWeight, Role, Window, div, prelude::*, px};
@@ -25,6 +24,9 @@ use crate::ui::{self, Icon};
 
 /// The label of a hand qass took: its card then reads "With qass, handed 17:59".
 const HANDED: &str = "Handed to qass";
+
+/// What a card says when words held for an agent could not go because it moved on.
+pub(crate) const MOVED_ON: &str = "It moved on before your reply went; your words are kept.";
 
 /// What became of a pick after its hold, as the card says it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -579,6 +581,14 @@ impl Desk {
     pub(crate) fn menus_changed(&mut self, cx: &Context<Self>) {
         let dropped = self.holds.menus(&self.model.rows, Instant::now());
         for hold in dropped {
+            // The person's own words are never lost to an agent that moved on: they wait as the
+            // card's draft, and the card says so.
+            if let Pick::Text { text: words, .. } | Pick::Reply { text: words, .. } = &hold.pick {
+                self.drafts.insert(hold.slot.clone(), words.clone());
+                self.said
+                    .insert(hold.slot.clone(), Said::Refused(MOVED_ON.into()));
+                continue;
+            }
             let by = hold
                 .terminal()
                 .and_then(|t| self.model.row(t))
@@ -1093,11 +1103,31 @@ impl Desk {
                         .child(menu.question.clone()),
                 )
             })
+            // What is asked, whole: each line wraps, none is cut.
+            .when(!menu.context.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id("question-context")
+                        .debug_selector(|| "question-context".to_string())
+                        .p(px(8.))
+                        .rounded(px(8.))
+                        .bg(c(crate::theme::TERMINAL_BG))
+                        .font_family(MONO_FONT)
+                        .text_size(px(11.5))
+                        .text_color(c(crate::theme::DARK.t1))
+                        .children(
+                            menu.context
+                                .iter()
+                                .map(|l| div().whitespace_normal().min_h(px(14.)).child(l.clone())),
+                        ),
+                )
+            })
             .when(offers.is_empty(), |d| {
                 d.child(
                     div()
                         .text_size(px(12.5))
                         .text_color(c(t.t2))
+                        .whitespace_normal()
                         .child("Several boxes to tick: answer it in the terminal."),
                 )
             })
@@ -1135,115 +1165,54 @@ impl Desk {
                         })),
                 ),
             })
+            // What qass made of this one, and where else it is open.
+            .when_some(self.qass_view(row), |d, line| {
+                d.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(c(t.t2))
+                        .whitespace_normal()
+                        .child(line),
+                )
+            })
+            .when(row.clients.iter().any(|c| c == "phone"), |d| {
+                d.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(c(t.t2))
+                        .whitespace_normal()
+                        .child(
+                            "Also open on your iPhone. The first answer wins; the other closes \
+                             as Answered on the Mac.",
+                        ),
+                )
+            })
             .when_some(self.said_line(&Slot::Agent(terminal), t, cx), |d, line| {
                 d.child(line)
             })
             .into_any_element()
     }
 
-    /// The panel beside the card: what is asked, qass on this one, after a pick, elsewhere.
-    pub(crate) fn question_side(&self, row: &AgentRow, t: &Theme) -> AnyElement {
-        let menu = row.menu.as_ref();
+    /// qass's own look at this question, when it wrote a card for it: why it asks, and which
+    /// option it would pick.
+    fn qass_view(&self, row: &AgentRow) -> Option<String> {
         let card = self
             .asks
             .iter()
-            .find(|a| a.terminal == Some(row.terminal) && a.status == "open");
-        let file = menu.and_then(|m| self.named_file(row, &m.context));
-        let section = |title: &str| {
-            div()
-                .pt(px(6.))
-                .text_size(px(11.5))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(c(t.t2))
-                .child(title.to_string())
-        };
-        let text = |s: String| div().text_size(px(12.5)).text_color(c(t.t1)).child(s);
-        div()
-            .id("question-side")
-            .role(Role::Complementary)
-            .aria_label("About this question")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p(px(14.))
-            .flex()
-            .flex_col()
-            .gap(px(6.))
-            .rounded(px(14.))
-            .bg(c(t.card))
-            .border_1()
-            .border_color(ca(t.hair))
-            .child(section("What is asked"))
-            .child(
-                div()
-                    .p(px(8.))
-                    .rounded(px(8.))
-                    .bg(c(crate::theme::TERMINAL_BG))
-                    .font_family(MONO_FONT)
-                    .text_size(px(11.5))
-                    .text_color(c(crate::theme::DARK.t1))
-                    .children(
-                        menu.map(|m| m.context.clone())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|l| div().whitespace_nowrap().overflow_hidden().child(l)),
-                    ),
-            )
-            .when_some(file, |d, name| {
-                d.child(text(format!("{name}: Open in your editor from Changes.")))
-            })
-            .child(section("qass on this one"))
-            .child(match card {
-                Some(card) => {
-                    let pick = card.body.pick.as_ref().map(|p| {
-                        let n = card
-                            .body
-                            .options
-                            .iter()
-                            .position(|o| o.key == p.key)
-                            .map_or_else(|| p.key.clone(), |i| (i + 1).to_string());
-                        format!("qass would pick {n}: {}", p.reason)
-                    });
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.))
-                        .child(text(card.body.why.clone()))
-                        .when_some(pick, |d, p| d.child(text(p)))
-                        .into_any_element()
-                }
-                None => text(
-                    "qass has not looked at this one. Let qass handle it: it answers if its rules \
-                     allow, otherwise it comes back here."
-                        .into(),
-                )
-                .into_any_element(),
-            })
-            .child(section("After a pick"))
-            .child(text("It sends in 3 s; Undo u.".into()))
-            .when(row.clients.iter().any(|c| c == "phone"), |d| {
-                d.child(section("Elsewhere")).child(text(
-                    "Also on your iPhone. The first answer wins; the other closes as Answered \
-                     on the Mac."
-                        .into(),
-                ))
-            })
-            .into_any_element()
-    }
-
-    /// The first file the question names that is in the agent's checkout on this Mac.
-    fn named_file(&self, row: &AgentRow, context: &[String]) -> Option<String> {
-        let cwd = row
-            .cwd
-            .as_ref()
-            .filter(|_| state::machine_of(row.workspace) == 0)?;
-        context
-            .iter()
-            .flat_map(|l| l.split_whitespace())
-            .map(|w| w.trim_matches(|c: char| !(c.is_alphanumeric() || "./_-".contains(c))))
-            .filter(|w| w.contains('.') && !w.starts_with('.') && !w.contains(".."))
-            .find(|w| Path::new(cwd).join(w).is_file())
-            .map(str::to_string)
+            .find(|a| a.terminal == Some(row.terminal) && a.status == "open")?;
+        let pick = card.body.pick.as_ref().map(|p| {
+            let n = card
+                .body
+                .options
+                .iter()
+                .position(|o| o.key == p.key)
+                .map_or_else(|| p.key.clone(), |i| (i + 1).to_string());
+            format!("qass would pick {n}: {}", p.reason)
+        });
+        Some(match pick {
+            Some(pick) => format!("{} {pick}", card.body.why),
+            None => card.body.why.clone(),
+        })
     }
 }
 

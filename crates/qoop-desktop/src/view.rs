@@ -239,6 +239,7 @@ impl Spike {
                 selection: None,
                 area: None,
                 lift: px(0.),
+                gauge: None,
             })
     }
 

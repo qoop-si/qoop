@@ -45,8 +45,112 @@ impl Cells {
     }
 }
 
+/// What the agent page measures of its column, so a card under the terminal never changes the
+/// agent's size: the whole column's height (the same with a card or without one, written while
+/// the frame is prepared, before the terminals are) and the tab's tree of panes (set when the
+/// page is drawn). A pane is told the height it has plus what the card takes from it: its
+/// height in the whole column less its height in the room left, the tree laid out at each as
+/// `Desk::layout` lays it out.
+#[derive(Default)]
+pub struct Gauge {
+    pub column: Cell<Pixels>,
+    /// The height of the room the terminals have: the column's, less a card under them.
+    pub slot: Cell<Pixels>,
+    pub tree: std::cell::RefCell<Option<qoop_runtime::control::Pane>>,
+}
+
+/// The gap `Desk::layout` leaves between two panes.
+pub const PANE_GAP: f32 = 8.;
+
+/// The share of a split the first pane has, from its permille, kept within what `Desk::layout`
+/// and [`pane_heights`] both draw.
+pub fn share(permille: u16) -> f32 {
+    (f32::from(permille) / 1000.).clamp(0.05, 0.95)
+}
+
+impl Gauge {
+    /// The height the card under the terminals takes from `terminal`'s pane: the pane's height in
+    /// the whole column less its height in the room left. `None` before both are measured or
+    /// when the terminal is not in the tree.
+    pub fn reserve_of(&self, terminal: TerminalStream) -> Option<Pixels> {
+        let (column, slot) = (self.column.get(), self.slot.get());
+        if column <= px(0.) || slot <= px(0.) {
+            return None;
+        }
+        let tree = self.tree.borrow();
+        let tree = tree.as_ref()?;
+        let at = |total: Pixels| {
+            pane_heights(tree, f32::from(total))
+                .into_iter()
+                .find(|(t, _)| *t == terminal)
+                .map(|(_, h)| h)
+        };
+        Some(px((at(column)? - at(slot)?).max(0.)))
+    }
+}
+
+/// Each pane's height in a tree laid out `total` tall: a pane beside another has all of it; a
+/// pane above another has its share of it, and the one under it what is left after the gap.
+pub fn pane_heights(tree: &qoop_runtime::control::Pane, total: f32) -> Vec<(TerminalStream, f32)> {
+    use qoop_runtime::control::{Pane, SplitDir};
+    match tree {
+        Pane::Leaf { terminal } => vec![(*terminal, total)],
+        Pane::Split {
+            dir,
+            permille,
+            first,
+            second,
+            ..
+        } => {
+            let (a, b) = if *dir == SplitDir::V {
+                (total, total)
+            } else {
+                let first_h = total * share(*permille);
+                (first_h, total - first_h - PANE_GAP)
+            };
+            let mut out = pane_heights(first, a);
+            out.extend(pane_heights(second, b));
+            out
+        }
+    }
+}
+
 /// A width and a height in pixels.
 pub type Size2 = (Pixels, Pixels);
+
+/// The window of a grid to show in `cols` by `rows` cells. While room under the terminal is
+/// `reserved` (a card covers the grid's last rows) it starts at the grid's bottom rows, where
+/// the cursor and a menu sit, and a hidden cursor leaves it there; otherwise it follows the
+/// cursor from where it was (ADR-007).
+pub fn view_for(
+    snap: &SnapshotWire,
+    previous: Option<Viewport>,
+    cols: u16,
+    rows: u16,
+    reserved: bool,
+) -> Viewport {
+    if !reserved {
+        return viewport_for(snap, previous, cols, rows);
+    }
+    let grid = qoop_domain::PtySize {
+        cols: snap.cols as u16,
+        rows: snap.rows as u16,
+    };
+    // A window of another height is not the one kept for this room: start from the bottom.
+    let start = previous
+        .filter(|v| v.rows == rows.min(grid.rows))
+        .unwrap_or(Viewport {
+            col: 0,
+            row: u16::MAX,
+            cols,
+            rows,
+        });
+    let base = Viewport::new(grid, start.col, start.row, cols, rows);
+    if !snap.modes.cursor_visible {
+        return Viewport::new(grid, base.col, u16::MAX, cols, rows);
+    }
+    base.follow(grid, snap.cursor.1 as u16, snap.cursor.0 as u16)
+}
 
 /// The cell size of the terminal font: the advance of `m` across, 1.2 em down, both in
 /// whole pixels so rows and columns never fall between device pixels.
@@ -95,6 +199,10 @@ pub struct TerminalElement<V: 'static> {
     /// How far up the grid is drawn, under a row high: a page of scrollback moved part of a
     /// row carries the row above as its first, drawn partly under the pane's top edge.
     pub lift: Pixels,
+    /// The agent page's measure of its column: the size told to the daemon is the one the pane
+    /// has without the card under it, and the part the card covers is drawn through the window
+    /// that follows the cursor (ADR-007).
+    pub gauge: Option<Rc<Gauge>>,
 }
 
 impl<V: EntityInputHandler> IntoElement for TerminalElement<V> {
@@ -162,6 +270,16 @@ impl<V: EntityInputHandler> Element for TerminalElement<V> {
         let scale = window.scale_factor();
         let bounds = on_device_pixels(bounds, scale);
         let fit = self.cells.fit((bounds.size.width, bounds.size.height));
+        // The height told to the daemon is the pane's without the card under the terminal; the
+        // part the card covers is drawn through the window that follows the cursor.
+        let reserve = self
+            .terminal
+            .zip(self.gauge.as_ref())
+            .and_then(|(t, g)| g.reserve_of(t))
+            .unwrap_or_default();
+        let whole = bounds.size.height + reserve;
+        let told = self.cells.fit((bounds.size.width, whole));
+        let reserved = told.1 > fit.1;
         // Lifted by whole device pixels, so the glyphs stay on them. The mouse is read against
         // the same origin, so a cell under it is a row of what is drawn.
         let lift = (self.lift * scale).round() / scale;
@@ -170,10 +288,10 @@ impl<V: EntityInputHandler> Element for TerminalElement<V> {
             area.set(bounds);
         }
         if let Some(terminal) = self.terminal
-            && fit != self.sent.get()
+            && told != self.sent.get()
         {
-            self.sent.set(fit);
-            (self.resize)(terminal, fit.0, fit.1);
+            self.sent.set(told);
+            (self.resize)(terminal, told.0, told.1);
         }
         let mut painted = Painted {
             origin: bounds.origin,
@@ -187,7 +305,7 @@ impl<V: EntityInputHandler> Element for TerminalElement<V> {
             // A grid bigger than the pane (another client owns its size) is shown through a
             // window that follows the cursor, never wrapped: ADR-007.
             let rows = fit.1 + u16::from(lift > px(0.));
-            let view = viewport_for(&screen, self.viewport.get(), fit.0, rows);
+            let view = view_for(&screen, self.viewport.get(), fit.0, rows, reserved);
             self.viewport.set(Some(view));
             layout(&screen, view, &self.cells, &mut painted, window);
         }
@@ -710,6 +828,7 @@ mod tests {
             selection: None,
             area: None,
             lift: px(0.),
+            gauge: None,
         }
     }
 
@@ -783,5 +902,96 @@ mod tests {
             10 * 2 + 3,
             "r0 to r9, and r10 below them"
         );
+    }
+
+    /// A grid taller than its room, with the cursor shown or hidden.
+    fn tall(cursor: (usize, usize), shown: bool) -> Rc<SnapshotWire> {
+        let lines: Vec<String> = (0..40).map(|_| String::new()).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut screen = screen(&lines, cursor, 80, 40);
+        Rc::get_mut(&mut screen)
+            .expect("one owner")
+            .modes
+            .cursor_visible = shown;
+        screen
+    }
+
+    /// With room reserved under the terminal the window starts at the grid's bottom rows and then
+    /// follows the cursor; a hidden cursor leaves it there; with none reserved it is as before.
+    #[test]
+    fn room_reserved_keeps_the_bottom_rows_in_view() {
+        // 40 rows, 30 shown, the cursor on the last row: the window starts at row 10.
+        let at_bottom = view_for(&tall((39, 0), true), None, 80, 30, true);
+        assert_eq!(at_bottom.row, 10);
+        // A cursor in the middle of the grid does not pull the first window up to the top.
+        assert_eq!(view_for(&tall((20, 0), true), None, 80, 30, true).row, 10);
+        assert_eq!(view_for(&tall((20, 0), true), None, 80, 30, false).row, 0);
+        // A cursor hidden at row 0 (a full screen program) keeps the bottom rows.
+        assert_eq!(view_for(&tall((0, 0), false), None, 80, 30, true).row, 10);
+        let held = view_for(&tall((0, 0), false), Some(at_bottom), 80, 30, true);
+        assert_eq!(held.row, 10, "and holds them");
+        // Nothing reserved: the cursor at row 0 pulls the window to the top, as it did.
+        assert_eq!(
+            view_for(&tall((0, 0), false), Some(at_bottom), 80, 30, false).row,
+            0
+        );
+        // A window kept for another height (the room was 40 rows) is not this room's: it starts at
+        // the bottom, not where the old one was.
+        let old = Viewport {
+            col: 0,
+            row: 0,
+            cols: 80,
+            rows: 40,
+        };
+        assert_eq!(
+            view_for(&tall((20, 0), true), Some(old), 80, 30, true).row,
+            10
+        );
+        // A cursor above the window moves it up to the cursor.
+        assert_eq!(
+            view_for(&tall((3, 0), true), Some(at_bottom), 80, 30, true).row,
+            3
+        );
+    }
+
+    /// The tree laid out as the page lays it out: side by side every pane has the whole height; a
+    /// pane above another has its share, the one below it what is left after the gap.
+    #[test]
+    fn panes_are_told_the_height_they_have_without_the_card() {
+        use qoop_runtime::control::{Pane, SplitDir};
+        let leaf = |terminal| Box::new(Pane::Leaf { terminal });
+        let split = |dir, first, second| Pane::Split {
+            dir,
+            permille: 600,
+            questions: 0,
+            first,
+            second,
+        };
+        assert_eq!(
+            pane_heights(&Pane::Leaf { terminal: 1 }, 600.),
+            vec![(1, 600.)]
+        );
+        assert_eq!(
+            pane_heights(&split(SplitDir::V, leaf(1), leaf(3)), 600.),
+            vec![(1, 600.), (3, 600.)]
+        );
+        assert_eq!(
+            pane_heights(&split(SplitDir::H, leaf(1), leaf(3)), 600.),
+            vec![(1, 360.), (3, 232.)]
+        );
+        // What a card takes from each pane: its height in the column less its height in the room.
+        let gauge = Gauge::default();
+        *gauge.tree.borrow_mut() = Some(Pane::Leaf { terminal: 1 });
+        assert_eq!(gauge.reserve_of(1), None, "not measured yet");
+        gauge.column.set(px(640.));
+        gauge.slot.set(px(640.));
+        assert_eq!(gauge.reserve_of(1), Some(px(0.)), "no card, nothing taken");
+        gauge.slot.set(px(300.));
+        assert_eq!(gauge.reserve_of(1), Some(px(340.)));
+        assert_eq!(gauge.reserve_of(9), None, "not in the tree");
+        *gauge.tree.borrow_mut() = Some(split(SplitDir::H, leaf(1), leaf(3)));
+        // 640 tall: 384 and 248; 300 tall: 180 and 112.
+        assert_eq!(gauge.reserve_of(1), Some(px(204.)));
+        assert_eq!(gauge.reserve_of(3), Some(px(136.)));
     }
 }

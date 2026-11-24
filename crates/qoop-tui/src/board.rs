@@ -17,6 +17,14 @@ use crate::theme::Role;
 /// The request id the board is read under.
 pub const READ_ID: &str = "board-read";
 
+/// The id a computer's board is read under: This Mac's is [`READ_ID`], another's names it.
+pub fn read_id(machine: usize) -> String {
+    match machine {
+        0 => READ_ID.to_string(),
+        m => format!("{READ_ID}-{m}"),
+    }
+}
+
 /// What the words under "Waiting on you" say about the records.
 pub const WAIT_NOTE: &str = "also in Needs you, the same records";
 
@@ -47,6 +55,12 @@ pub struct Board {
 impl Board {
     /// The read to send, when one is owed and none is out.
     pub fn request(&mut self) -> Option<ControlRequest> {
+        self.request_via(READ_ID, None)
+    }
+
+    /// The same read under `id`, carried to another computer through one of its spaces
+    /// (`via`): its answer comes back under `id`, with the numbers in the interface's.
+    pub fn request_via(&mut self, id: &str, via: Option<i64>) -> Option<ControlRequest> {
         if !self.stale || self.read == Read::Reading {
             return None;
         }
@@ -54,27 +68,40 @@ impl Board {
         if !matches!(self.read, Read::Items(_)) {
             self.read = Read::Reading;
         }
-        Some(ControlRequest::TaskRead {
-            id: READ_ID.to_string(),
+        let read = ControlRequest::TaskRead {
+            id: id.to_string(),
             board: true,
             task: None,
             terminal: None,
             token: None,
             before: None,
+        };
+        Some(match via {
+            Some(workspace) => ControlRequest::Via {
+                id: format!("via-{id}"),
+                workspace,
+                request: Box::new(read),
+            },
+            None => read,
         })
     }
 
     /// The daemon's answer to the read. True when the screen changed.
     pub fn answered(&mut self, response: &ControlResponse) -> bool {
+        self.answered_to(READ_ID, response)
+    }
+
+    /// The answer to the read sent under `read_id`.
+    pub fn answered_to(&mut self, read_id: &str, response: &ControlResponse) -> bool {
         match response {
-            ControlResponse::Tasks { id, items, .. } if id == READ_ID => {
+            ControlResponse::Tasks { id, items, .. } if id == read_id => {
                 self.read = match items {
                     Some(items) => Read::Items(items.clone()),
                     None => Read::Old,
                 };
                 true
             }
-            ControlResponse::Failed { id, reason } if id == READ_ID => {
+            ControlResponse::Failed { id, reason } if id == read_id => {
                 self.read = if qoop_runtime::control::too_old_for(reason, Some("TaskRead")) {
                     Read::Old
                 } else {
@@ -85,6 +112,12 @@ impl Board {
             _ => false,
         }
     }
+}
+
+/// What a computer too old for the board is told in: "qoop on staging is too old for the
+/// board". `machine` is its name, "This Mac" for this one.
+pub fn too_old(machine: &str) -> String {
+    format!("qoop on {machine} is too old for the board")
 }
 
 /// The four bands.
@@ -286,19 +319,24 @@ pub fn why(i: &ItemInfo, band: Band) -> String {
 
 /// The board's rows in `cols` columns, every word whole: each band's title with its count,
 /// then its items as `KEY title` and under it the reason.
+#[cfg(test)]
 pub(crate) fn rows(board: &Board, handed: &BTreeSet<u32>, cols: usize) -> Vec<Row> {
+    rows_of(board, "This Mac", handed, cols)
+}
+
+/// [`rows`] for the board of the computer called `machine`, which a too old qoop there names.
+pub(crate) fn rows_of(
+    board: &Board,
+    machine: &str,
+    handed: &BTreeSet<u32>,
+    cols: usize,
+) -> Vec<Row> {
     use crate::inbox_pane::wrapped;
     let plain = |text: &str| vec![Row::plain(Role::FaintText, format!(" {text}"))];
     match &board.read {
         Read::Unread | Read::Reading => return plain("reading the board"),
         Read::Old => {
-            return wrapped(
-                "qoop on This Mac is too old for the board",
-                1,
-                cols,
-                Role::FaintText,
-                false,
-            );
+            return wrapped(&too_old(machine), 1, cols, Role::FaintText, false);
         }
         Read::Failed(why) => {
             return wrapped(
