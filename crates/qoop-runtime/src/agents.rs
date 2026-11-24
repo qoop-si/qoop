@@ -2824,13 +2824,13 @@ mod tests {
             let running = r.hooked_subagents_of(1);
             assert_eq!(running, 1, "{card}: its sub-agent runs");
             assert!(
-                !crate::asks::turn_asks_him(Some(label), running),
+                !crate::asks::turn_asks_him(Some(label), None, running),
                 "{card}: a question to its own sub-agent is not his"
             );
             r.note_subagents(1, Ended(sub.into()));
             let running = r.hooked_subagents_of(1);
             assert!(
-                crate::asks::turn_asks_him(Some(label), running),
+                crate::asks::turn_asks_him(Some(label), None, running),
                 "{card}: the same question with nothing of its own at work is his"
             );
         }
@@ -2845,7 +2845,11 @@ mod tests {
         );
         let running = r.hooked_subagents_of(1);
         assert_eq!(running, 0);
-        assert!(crate::asks::turn_asks_him(Some("Merge it now?"), running));
+        assert!(crate::asks::turn_asks_him(
+            Some("Merge it now?"),
+            None,
+            running
+        ));
     }
 
     /// Sub-agents a hook names are counted by id beside the agent, with what its screen lists

@@ -87,7 +87,8 @@ refused if the plan changed since: card again) and the `approved, build` line; h
 worker as the change ("change it: ..."), and its next `plan clean` is read again; B closes the item:
 `qoop task close <KEY> --dropped '<his words>'`. Then close the card.
 
-A plan that waited 30 minutes with no card on its item: qoop drafts one for him by itself. Read it
+A plan that waited 30 minutes with no card on its item: qoop drafts one for him by itself, its
+question ending in `(hash <8 characters>)` and its options your two, A approve and B drop. Read it
 like any draft and act on his answer the same way.
 
 ## His words

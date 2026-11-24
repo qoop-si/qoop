@@ -122,8 +122,9 @@ Notes:
 - a question dialog (`elicitation_dialog` or `elicitation_url_dialog`) is the
   one `blocked` report that carries a label: its type. When it is still the
   agent's newest event 120 seconds later (qass often answers first), the daemon
-  drafts a `W<n>` inbox card for it, "a question on its screen", with no
-  options, whether or not the agent has an open task; never for a permission
+  drafts a `W<n>` inbox card for it, "a question on its screen", with two
+  options for qass ("Answer it as you judge best", "Close it without
+  answering"), whether or not the agent has an open task; never for a permission
   menu, a quota notice or qass's own tab. His words for it go through qass,
   since a blocked agent takes none, typed as the draft's handle (the agent's
   name word, then its task number, or `-t` and its terminal without a task)

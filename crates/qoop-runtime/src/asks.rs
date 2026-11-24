@@ -25,7 +25,7 @@ use qoop_domain::ClientId;
 use qoop_store::{Added, AskError, AskRow};
 
 use crate::agents::AgentRegistry;
-use crate::control::{AskCard, AskInfo, AskOp, AskResult, ControlResponse};
+use crate::control::{AskCard, AskInfo, AskOp, AskOption, AskResult, ControlResponse};
 use crate::daemon::{ClientCommand, ConnectionRegistry, TerminalRegistry};
 use crate::store::{HandleError, StoreHandle, now};
 
@@ -297,15 +297,12 @@ pub(crate) fn is_dialog(label: &str) -> bool {
 }
 
 /// Words that offer the owner an action and wait for his go, in the forms agents end a turn
-/// with: "istersen ... yaparım", "'tamam' dersen ...", "shall I". The quoted answer closed
-/// by "de" or "deyin" is [`quoted_answer`]. Cut boilerplate stays out ("let me know if",
-/// "if you want"): those close nearly every report. Lowercase, ASCII spellings too, since
-/// agents often write Turkish without its letters, and the dotted capital I lowercased.
+/// with: "istersen ... yaparım", "shall I". Cut boilerplate stays out ("let me know if", "if you
+/// want"): those close nearly every report. Lowercase, ASCII spellings too, since agents often
+/// write Turkish without its letters, and the dotted capital I lowercased.
 const OFFERS: &[&str] = &[
     "istersen",
     "i̇stersen",
-    "dersen",
-    "demen yeter",
     "istiyorsan söyle",
     "i̇stiyorsan söyle",
     "istiyorsan soyle",
@@ -316,29 +313,108 @@ const OFFERS: &[&str] = &[
     "would you like",
 ];
 
-/// Whether the line tells him a word to answer with: a quote (`"`, `”` or a backtick), a space,
-/// then `de` or `deyin` and a mark or the end ("`sil` de."). "deyince", a report's "de çıkıyor"
-/// and a quote followed by more words do not count.
-fn quoted_answer(lower: &str) -> bool {
-    let lower = lower.trim_end();
-    lower.match_indices(['"', '”', '`']).any(|(at, quote)| {
-        lower[at + quote.len()..]
-            .strip_prefix(' ')
-            .is_some_and(|rest| {
-                ["deyin", "de"].iter().any(|word| {
-                    rest.strip_prefix(word).is_some_and(|after| {
-                        after.chars().next().is_none_or(|c| ".,;:)!".contains(c))
-                    })
-                })
-            })
+/// Words that tell him what to say for his go ("'tamam' dersen ...", "demen yeter"); the quoted
+/// answer closed by "de" or "deyin" is [`quoted`].
+const SAY: &[&str] = &["dersen", "demen yeter"];
+
+/// Words that leave an offer to a time he picks: "devam etmek istediğinde ... demen yeterli",
+/// "ne zaman istersen oradan devam ederiz". Such a sentence tells him how to resume; it asks
+/// nothing now. Lowercase, whole words, ASCII spellings and the dotted capital I lowercased too.
+const LATER: &[&str] = &[
+    "istediğinde",
+    "i̇stediğinde",
+    "istediginde",
+    "istediğin zaman",
+    "istedigin zaman",
+    "ne zaman istersen",
+    "hazır olduğunda",
+    "hazir oldugunda",
+    "when you want",
+    "whenever",
+    "when you're ready",
+    "when you are ready",
+];
+
+/// A day that leaves what he is told to say to later (`yarın "devam et" demen yeterli`),
+/// though not an offer to act then ("istersen yarın sabah deploy ederim").
+const TOMORROW: &[&str] = &["yarın", "yarin", "tomorrow"];
+
+/// Whether one of `words` stands in `lower` as whole words: no letter or digit right before or
+/// after.
+fn has_words(lower: &str, words: &[&str]) -> bool {
+    words.iter().any(|word| {
+        lower.match_indices(word).any(|(at, _)| {
+            !lower[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+                && !lower[at + word.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric)
+        })
     })
 }
 
-/// Whether the last paragraph of an agent's turn asks the owner something: a sentence in it
-/// ends in "?", it offers him an action (see [`OFFERS`], [`quoted_answer`]), or it closes on
-/// the Turkish question word without its mark ("hazırlayayım mı"). The one rule the daemon
-/// reads a turn's end by; the hook only sends the paragraph.
-pub(crate) fn asks_owner(line: &str) -> bool {
+/// The sentences of a paragraph: cut after a ".", "!" or "?" that a space follows, so a "2.6"
+/// or a link's "?q=" stays inside its sentence.
+fn sentences(text: &str) -> Vec<&str> {
+    let (mut out, mut from) = (Vec::new(), 0);
+    for (at, c) in text.char_indices() {
+        if matches!(c, '.' | '!' | '?') && text[at + 1..].starts_with(char::is_whitespace) {
+            out.push(&text[from..=at]);
+            from = at + 1;
+        }
+    }
+    out.push(&text[from..]);
+    out.retain(|s| !s.trim().is_empty());
+    out
+}
+
+/// The words a line asks him to say: a quote (`"`, `“ ”` or code ticks) closed right before
+/// ` de` or ` deyin` and then a mark or the end ("`sil` de."), or, when `loose`, before ` dersen`
+/// or ` demen` (`"prod'a al" demen yeterli`). "deyince", a report's "de çıkıyor" and a quote
+/// followed by more words do not count. The last one in the line.
+fn quoted(text: &str, loose: bool) -> Option<&str> {
+    let text = text.trim_end();
+    let follows = |rest: &str, words: &[&str], ends: fn(char) -> bool| {
+        words.iter().any(|w| {
+            rest.strip_prefix(w)
+                .is_some_and(|after| after.chars().next().is_none_or(ends))
+        })
+    };
+    text.rmatch_indices(['"', '”', '`'])
+        .find_map(|(at, quote)| {
+            let rest = text[at + quote.len()..].strip_prefix(' ')?.to_lowercase();
+            let said = follows(&rest, &["deyin", "de"], |c| ".,;:)!".contains(c))
+                || (loose && follows(&rest, &["dersen", "demen"], |c| !c.is_alphanumeric()));
+            if !said {
+                return None;
+            }
+            let open = if quote == "”" {
+                '“'
+            } else {
+                quote.chars().next()?
+            };
+            let start = text[..at].rfind(open)? + open.len_utf8();
+            Some(text[start..at].trim()).filter(|w| !w.is_empty())
+        })
+}
+
+/// Whether a sentence of the paragraph offers him an action and asks for his go ([`OFFERS`],
+/// [`SAY`], [`quoted`]) with nothing in it that leaves it to later ([`LATER`], [`TOMORROW`]).
+fn offers(line: &str) -> bool {
+    sentences(line).into_iter().any(|sentence| {
+        let lower = format!(" {} ", sentence.trim().to_lowercase());
+        let has = |words: &[&str]| words.iter().any(|w| lower.contains(&format!(" {w}")));
+        let say = has(SAY) || quoted(&lower, false).is_some();
+        !has_words(&lower, LATER) && (has(OFFERS) || (say && !has_words(&lower, TOMORROW)))
+    })
+}
+
+/// Whether a paragraph asks by a question's mark: a sentence in it ends in "?", or it closes on
+/// the Turkish question word without its mark ("hazırlayayım mı").
+fn asks_by_mark(line: &str) -> bool {
     let line = line
         .trim()
         .trim_end_matches(['.', '!', ' ', '*', '_', '`', '"', ')']);
@@ -358,23 +434,42 @@ pub(crate) fn asks_owner(line: &str) -> bool {
     {
         return true;
     }
-    let lower = format!(" {} ", line.to_lowercase());
-    if OFFERS.iter().any(|w| lower.contains(&format!(" {w}"))) || quoted_answer(&lower) {
-        return true;
-    }
     matches!(
         line.rsplit(char::is_whitespace).next(),
         Some("mı" | "mi" | "mu" | "mü")
     )
 }
 
-/// Whether the end of a turn waits on the owner: its last paragraph asks him something
-/// ([`asks_owner`]) and none of the agent's sub-agents still runs. One that ends with its
-/// sub-agents at work is woken by them, so a question there was put to them (a reviewer it
-/// briefed), not to him; a question for him is still there at the turn that ends once they are
-/// done. Shells do not count: a dev server never ends, and would keep him from ever being asked.
-pub(crate) fn turn_asks_him(label: Option<&str>, subagents_running: usize) -> bool {
-    subagents_running == 0 && label.is_some_and(asks_owner)
+/// Whether the end of a turn waits on the owner: its last paragraph asks him something, by its
+/// mark ([`asks_by_mark`]) or by an offer ([`offers`]), and none of the agent's sub-agents still
+/// runs. The one rule the daemon reads a turn's end by. One that ends with its sub-agents at
+/// work is woken by them, so a question there was put to them (a reviewer it briefed), not to
+/// him; a question for him is still there at the turn that ends once they are done. Shells do
+/// not count: a dev server never ends, and would keep him from ever being asked.
+///
+/// The paragraph is read whole from `said` (the hook's closing words) when it came: the label
+/// keeps only both ends of a long one, and a "?" or a "yarın" in its middle counts. The label
+/// still offers when the whole paragraph leaves nothing to later, since it keeps the code ticks
+/// of a quoted answer that `said` drops; with an older hook, or a paragraph past the hook's own
+/// cap (it ends in "…"), the label alone decides.
+pub(crate) fn turn_asks_him(
+    label: Option<&str>,
+    said: Option<&str>,
+    subagents_running: usize,
+) -> bool {
+    let Some(label) = label else {
+        return false;
+    };
+    let text = said
+        .map(|s| s.rsplit_once("\n\n").map_or(s, |(_, last)| last).trim())
+        .filter(|w| !w.is_empty() && !w.ends_with('\u{2026}'))
+        .unwrap_or(label);
+    let later = |text: &str| {
+        let lower = text.to_lowercase();
+        has_words(&lower, LATER) || has_words(&lower, TOMORROW)
+    };
+    subagents_running == 0
+        && (asks_by_mark(text) || offers(text) || (offers(label) && !later(text)))
 }
 
 /// Whether a prompt is one nobody typed: the harness's notice that the agent's own background
@@ -438,6 +533,241 @@ fn question_value(text: &str) -> String {
         .filter(|&at| at > max / 2)
         .unwrap_or(head.len());
     format!("{}\u{2026}", head[..cut].trim_end())
+}
+
+/// One option the daemon writes: its label, why it is offered, and the words the pick sends.
+type Fixed<'a> = (&'a str, &'a str, &'a str);
+
+/// Yes to a question that waits on yes or no.
+const YES: Fixed<'static> = ("Yes", "yes to its question", "Yes, go ahead.");
+
+/// No to it.
+const NO: Fixed<'static> = ("No", "no to its question", "No, leave it.");
+
+/// For an open question the daemon cannot read choices from: the agent decides by its own
+/// recommendation, or leaves it.
+const OPEN_OPTIONS: [Fixed<'static>; 2] = [
+    (
+        "Go with your recommendation",
+        "it decides by what it recommends",
+        "Go with what you recommend. If you have no recommendation, or it needs something only I can do, say so.",
+    ),
+    (
+        "Leave it for now",
+        "nothing more on it for now",
+        "Leave this for now and do nothing more on it.",
+    ),
+];
+
+/// A plan that waits for qass: qass's own two, approve it or drop the item
+/// (`skills/qass/plans.md`).
+const PLAN_OPTIONS: [Fixed<'static>; 2] = [
+    (
+        "Approve the plan",
+        "the plan as written",
+        "Approve the plan as written.",
+    ),
+    (
+        "Drop the plan",
+        "the item closes unbuilt",
+        "Drop this item: close it unbuilt.",
+    ),
+];
+
+/// A question dialog on an agent's screen, which qass answers.
+const DIALOG_OPTIONS: [Fixed<'static>; 2] = [
+    (
+        "Answer it as you judge best",
+        "qass answers it by your rules",
+        "Answer the question on its screen as you judge best by my rules; if it needs my decision, ask me.",
+    ),
+    (
+        "Close it without answering",
+        "the question goes unanswered",
+        "Close the question on its screen without answering it.",
+    ),
+];
+
+/// qass not watching: start its watcher again, or leave it off.
+const UNWATCHED_OPTIONS: [Fixed<'static>; 2] = [
+    (
+        "Start watching again",
+        "qass watches your agents again",
+        "Start your watcher again.",
+    ),
+    (
+        "Leave it off",
+        "nobody watches until you say",
+        "Leave your watcher off for now.",
+    ),
+];
+
+/// Options keyed `a` on, each value one card line.
+fn keyed(options: &[Fixed]) -> Vec<AskOption> {
+    options
+        .iter()
+        .zip(["a", "b", "c", "d"])
+        .map(|(&(label, reason, words), key)| AskOption {
+            key: key.to_string(),
+            label: card_value(label),
+            reason: card_value(reason),
+            words: card_value(words),
+        })
+        .collect()
+}
+
+/// A card as its body is filed, or none when it breaks the card format (two to four options
+/// among the rules): the one door every draft goes through, so none reaches his inbox without
+/// options again. A refusal is a bug, said in the log.
+fn draft_body(card: &AskCard) -> Option<String> {
+    let problems = card.problems();
+    if !problems.is_empty() {
+        crate::say!("qoopd: a draft card was not filed: {}", problems.join("; "));
+        return None;
+    }
+    serde_json::to_string(card).ok()
+}
+
+/// Two to four options for the question a turn ended on, from its own words where it names
+/// them: the ways an either-or question offers ([`either_or`]), the words it asked him to say
+/// ([`quoted`], read from `label` too, which keeps code ticks the whole question lost), else
+/// its recommendation or leaving it for an open question ([`open_question`]), else yes or no.
+fn draft_options(question: &str, label: &str) -> Vec<AskOption> {
+    let ways = either_or(question);
+    if !ways.is_empty() {
+        let named: Vec<Fixed> = ways
+            .iter()
+            .map(|w| (w.as_str(), "one of the ways it named", w.as_str()))
+            .collect();
+        return keyed(&named);
+    }
+    if let Some(word) = quoted(question, true).or_else(|| quoted(label, true)) {
+        return keyed(&[(word, "the answer it asked for", word), NO]);
+    }
+    if open_question(question) {
+        return keyed(&OPEN_OPTIONS);
+    }
+    keyed(&[YES, NO])
+}
+
+/// The question of a paragraph: its last sentence that ends in "?", without the mark, when at
+/// most one sentence follows it (as [`asks_by_mark`] reads a question near the end).
+fn last_question(text: &str) -> Option<&str> {
+    let all = sentences(text);
+    fn bare(s: &str) -> &str {
+        s.trim().trim_end_matches(['*', '_', '`', '"', ')'])
+    }
+    let at = all.iter().rposition(|s| bare(s).ends_with('?'))?;
+    (all.len() - at <= 2).then(|| {
+        bare(all[at])
+            .trim_end_matches('?')
+            .trim_start_matches(['*', '_'])
+            .trim()
+    })
+}
+
+/// `text` cut at `sep` where it stands outside parentheses, quotes and code.
+fn split_top<'a>(text: &'a str, sep: &str) -> Vec<&'a str> {
+    let (mut depth, mut quoted, mut pieces, mut from) = (0i32, false, Vec::new(), 0);
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' | '“' => depth += 1,
+            ')' | '”' => depth -= 1,
+            '"' | '`' => quoted = !quoted,
+            _ => {}
+        }
+        if at >= from && depth == 0 && !quoted && text[at..].starts_with(sep) {
+            pieces.push(&text[from..at]);
+            from = at + sep.len();
+        }
+    }
+    pieces.push(&text[from..]);
+    pieces
+}
+
+/// The Turkish question word a piece of an either-or question ends on ("şimdi mi").
+const PARTICLES: [&str; 4] = [" mı", " mi", " mu", " mü"];
+
+/// The ways an either-or question names ([`last_question`]), split once on " yoksa ", or on
+/// " or " when both sides are short ("Merge now or deploy first?"), outside parentheses, quotes
+/// and code. The left side loses an intro up to its last ": ", and splits on ", " when every
+/// piece ends on the question word ("A mı, B mi, yoksa C mi?"); each way loses that word. None
+/// unless there are two to four ways, none empty and none a bare "no".
+fn either_or(question: &str) -> Vec<String> {
+    let Some(sentence) = last_question(question) else {
+        return Vec::new();
+    };
+    let short = |s: &str| s.split_whitespace().count() <= 6;
+    let (left, right) = match (
+        split_top(sentence, " yoksa ").as_slice(),
+        split_top(sentence, " or ").as_slice(),
+    ) {
+        ([left, right], [_]) => (*left, *right),
+        ([_], [left, right]) if short(left) && short(right) => (*left, *right),
+        _ => return Vec::new(),
+    };
+    let left = split_top(left, ": ").pop().unwrap_or(left);
+    let left = left.trim().trim_end_matches(',').trim();
+    let commas = split_top(left, ", ");
+    let asking = |p: &&str| PARTICLES.iter().any(|q| p.trim_end().ends_with(q));
+    let lefts = if commas.len() > 1 && commas.iter().all(asking) {
+        commas
+    } else {
+        vec![left]
+    };
+    let ways: Vec<String> = lefts
+        .into_iter()
+        .chain([right])
+        .map(|p| {
+            let p = p.trim().trim_matches(['*', '_']).trim();
+            let p = PARTICLES
+                .iter()
+                .find_map(|q| p.strip_suffix(q))
+                .unwrap_or(p);
+            p.trim().to_string()
+        })
+        .collect();
+    let bare = |w: &String| {
+        matches!(
+            w.to_lowercase().as_str(),
+            "" | "no" | "not" | "değil" | "degil"
+        )
+    };
+    if (2..=4).contains(&ways.len()) && !ways.iter().any(bare) {
+        ways
+    } else {
+        Vec::new()
+    }
+}
+
+/// Words that open a question with no yes or no answer ("ne gösterilsin?", "which one?").
+/// Whole words; "hangi" also as the start of one ("hangisi").
+const OPEN_WORDS: &[&str] = &[
+    "ne", "neyi", "neye", "neden", "niye", "nerede", "nereye", "nasıl", "nasil", "kaç", "kac",
+    "kim", "what", "which", "how", "where", "who", "why",
+];
+
+/// Whether a question is open: its question ([`last_question`]) holds an open word
+/// ([`OPEN_WORDS`]), or, with no "?" at all, one of its sentences starts with one ("Hangi
+/// numarayı istediğini yaz").
+fn open_question(question: &str) -> bool {
+    let open = |word: &str| {
+        let word = word.to_lowercase();
+        OPEN_WORDS.contains(&word.as_str()) || word.starts_with("hangi")
+    };
+    fn words(s: &str) -> impl Iterator<Item = &str> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+    }
+    match last_question(question) {
+        Some(sentence) => words(sentence).any(open),
+        // A "?" far from the end is a write-up that asked itself ("Why? Because ..."), no
+        // question to him.
+        None if question.contains('?') => false,
+        None => question
+            .split(['.', '!', ':'])
+            .any(|s| words(s).next().is_some_and(open)),
+    }
 }
 
 /// How often the daemon looks for a plan that waited too long for qass.
@@ -539,9 +869,11 @@ pub(crate) async fn stale_plans_once(
             told = file_waiting(
                 terminal,
                 None,
+                // The first 8 characters of its hash: what qass approves it by.
                 Some(format!(
-                    "{} plan waits for qass: approve it, or say what to change",
-                    plan.key
+                    "{} plan waits for qass: approve it, or say what to change (hash {})",
+                    plan.key,
+                    plan.hash.chars().take(8).collect::<String>()
                 )),
                 None,
                 true,
@@ -564,16 +896,16 @@ pub(crate) async fn stale_plans_once(
     }
 }
 
-/// The agent in `terminal` ended its turn waiting on the owner (its task in `waiting-human`):
-/// a draft card, so his inbox shows it even when qass wrote nothing. Only on a Mac with qass's
-/// space (the inbox lives there), never over a live card, once a waiting spell. No options:
-/// he answers in his own words, which the worker route types to the agent. Never in the way of
-/// the report that called it: a failure is dropped.
+/// The agent in `terminal` ended its turn asking the owner, its task in `waiting-human`: a
+/// draft card, so his inbox shows it even when qass wrote nothing. Only on a Mac with qass's
+/// space (the inbox lives there), never over a live card, once a waiting spell. Its options
+/// come from the question ([`draft_options`]); his own words still go to the agent by the
+/// worker route. No question, no card: a turn that only says where it stands asks him nothing,
+/// whatever stage it set. Never in the way of the report that called it: a failure is dropped.
 ///
 /// The card carries the agent's own words, never the owner's: a task qoop opened when the
 /// agent changed files has his cut prompt for a goal, so that goal is neither the question nor
-/// the "doing" line. With no question, a prompt that reached the agent since its wait began
-/// means it works again (the stage lagged behind), so there is nothing to ask.
+/// the "doing" line.
 pub(crate) async fn draft_waiting(
     terminal: u32,
     name: Option<String>,
@@ -585,7 +917,7 @@ pub(crate) async fn draft_waiting(
 }
 
 /// [`draft_waiting`], for a plan that waits for qass when `plan`: the agent goes on with its
-/// item, so its work does not end the card.
+/// item, so its work does not end the card, and the options are qass's two for a plan.
 async fn file_waiting(
     terminal: u32,
     name: Option<String>,
@@ -594,22 +926,12 @@ async fn file_waiting(
     plan: bool,
     (agents, connections, store): (&AgentRegistry, &Arc<ConnectionRegistry>, &StoreHandle),
 ) -> bool {
-    let question = question.filter(|q| !q.trim().is_empty());
+    let Some(question) = question.filter(|q| !q.trim().is_empty()) else {
+        return false;
+    };
     // The turn's own words belong to the card of the turn that ended: a plan's card says its
     // own line, never whatever the agent last asked.
-    let said = (!plan)
-        .then(|| question.as_ref().and_then(|_| agents.said(terminal)))
-        .flatten();
-    let prompts: Vec<i64> = if question.is_none() {
-        agents
-            .focus_events(terminal)
-            .iter()
-            .filter(|e| e.kind == "user" && !not_his(&e.label))
-            .map(|e| e.at_unix)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let said = (!plan).then(|| agents.said(terminal)).flatten();
     let made = store
         .run(move |s| {
             let Some(task) = s.open_task_of(i64::from(terminal))? else {
@@ -617,12 +939,6 @@ async fn file_waiting(
             };
             if task.stage != "waiting-human"
                 || !s.workspaces()?.iter().any(|w| w.name == QASS_SPACE)
-            {
-                return Ok(None);
-            }
-            // No stage event at all: nothing says when the wait began, so no prompt is later.
-            if let Some(waiting) = s.task_waiting_since(task.id)?
-                && prompts.iter().any(|&at| at > waiting)
             {
                 return Ok(None);
             }
@@ -634,16 +950,12 @@ async fn file_waiting(
                 Some((before, last)) => (before.clone(), Some(last.clone())),
                 None => (None, None),
             };
-            let asks = whole.or(question).unwrap_or_else(|| {
-                if owner_words {
-                    format!("{name} waits on you")
-                } else {
-                    format!("{name} waits on you: {}", task.goal)
-                }
-            });
+            let asks = whole
+                .filter(|w| !w.trim().is_empty())
+                .unwrap_or_else(|| question.clone());
             // With no paragraph before the question, the goal is already "what he asked" (or
             // his own words, never shown): the task's number names the work.
-            let doing = match before {
+            let doing = match before.filter(|b| !b.trim().is_empty()) {
                 Some(before) => before,
                 None if owner_words || said.is_some() => format!("task #{}", task.id),
                 None => task.goal.clone(),
@@ -653,14 +965,20 @@ async fn file_waiting(
                 urgency: "now".to_string(),
                 // What he asked, in the agent's words once it rewrote the goal: never his own
                 // cut prompt shown back to him.
-                asked: (!owner_words).then(|| card_value(&task.goal)),
+                asked: (!owner_words)
+                    .then(|| card_value(&task.goal))
+                    .filter(|a| !a.trim().is_empty()),
                 doing: card_value(&doing),
                 why: DRAFT_WHY.to_string(),
                 asks: question_value(&asks),
-                options: Vec::new(),
+                options: if plan {
+                    keyed(&PLAN_OPTIONS)
+                } else {
+                    draft_options(&asks, &question)
+                },
                 pick: None,
             };
-            let Ok(body) = serde_json::to_string(&card) else {
+            let Some(body) = draft_body(&card) else {
                 return Ok(None);
             };
             let file = if plan {
@@ -688,8 +1006,8 @@ async fn file_waiting(
 
 /// The agent in `terminal` still shows the question dialog its blocked report of `since`
 /// opened: a draft card, "a question on its screen", task or not. Never for qass's own tab,
-/// only on a Mac with qass's space, and once a spell. No options: his words go to qass, since
-/// a blocked agent takes none, and qass answers the dialog. A failure is dropped.
+/// only on a Mac with qass's space, and once a spell. His answer goes to qass, since a blocked
+/// agent takes no words, and qass answers the dialog. A failure is dropped.
 pub(crate) async fn draft_dialog(
     terminal: u32,
     since: i64,
@@ -723,10 +1041,10 @@ pub(crate) async fn draft_dialog(
                 asks: card_value(&format!(
                     "{name} (T{terminal}) has a question on its screen"
                 )),
-                options: Vec::new(),
+                options: keyed(&DIALOG_OPTIONS),
                 pick: None,
             };
-            let Ok(body) = serde_json::to_string(&card) else {
+            let Some(body) = draft_body(&card) else {
                 return Ok(None);
             };
             s.add_dialog_draft(
@@ -1652,8 +1970,7 @@ async fn raise_unwatched(
     connections: &Arc<ConnectionRegistry>,
     store: &StoreHandle,
 ) -> bool {
-    let body = serde_json::to_string(&unwatched_card(since, crate::schedule::system_zone()));
-    let Ok(body) = body else {
+    let Some(body) = draft_body(&unwatched_card(since, crate::schedule::system_zone())) else {
         return false;
     };
     match store.run(move |s| s.add_notice(&body, now())).await {
@@ -1710,8 +2027,8 @@ pub(crate) async fn close_unwatched(
     }
 }
 
-/// "qass is not watching since 09:05", on the wall clock of `zone`. No options: his words go
-/// to qass, which is what can start its watcher.
+/// "qass is not watching since 09:05", on the wall clock of `zone`. His answer goes to qass,
+/// which is what can start its watcher.
 fn unwatched_card(since: i64, zone: crate::schedule::Zone) -> AskCard {
     AskCard {
         handle: UNWATCHED_HANDLE.to_string(),
@@ -1722,7 +2039,7 @@ fn unwatched_card(since: i64, zone: crate::schedule::Zone) -> AskCard {
             "{CARD_AFTER} tries in a row, 30 minutes apart, found no watcher or qass stuck mid-turn"
         ),
         asks: format!("qass is not watching since {}", (zone.local)(since).clock()),
-        options: Vec::new(),
+        options: keyed(&UNWATCHED_OPTIONS),
         pick: None,
     }
 }
@@ -2788,12 +3105,10 @@ mod tests {
         };
         let card = unwatched_card(9 * 3600 + 5 * 60, utc);
         assert_eq!(card.asks, "qass is not watching since 09:05");
-        // Like a draft it has no options; every other rule of the format holds.
-        let problems = card.problems();
-        assert!(
-            problems.iter().all(|p| p.contains("options")),
-            "{problems:?}"
-        );
+        // Every rule of the format holds, two options among them.
+        assert_eq!(card.problems(), Vec::<String>::new());
+        let labels: Vec<_> = card.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Start watching again", "Leave it off"]);
     }
 
     use super::*;
@@ -2802,7 +3117,8 @@ mod tests {
     /// a report, a cut courtesy and a word that only starts like an offer do not.
     #[test]
     fn a_turn_end_asks_him_by_its_mark_or_its_offer() {
-        for asks in [
+        let asks = |line: &str| turn_asks_him(Some(line), None, 0);
+        for line in [
             "Worktree acip PR olarak hazirlayayim mi?",
             "Logo PR'i icin \"commit et, PR ac, merge et\" dersen /commit ile commit atip push'layacagim.",
             "İstersen bunu ayrı bir iş olarak güncellerim.",
@@ -2824,8 +3140,15 @@ mod tests {
             "Hepsini kapatmak için \"10'u da\" deyin.",
             "Devam için `evet` de, sonra açarım.",
             "Onay için “tamam” de",
+            // Real drafts the owner answered (W1512, W1574).
+            "Testin başlaması için senin bir şey yapman gerekmiyor. Pixel'i daha erken başlatmak istersen telefonun Wi-Fi'ının açık olduğuna bakman yeter.",
+            "Bekleyen bir önerim de duruyor: main'de yeni push gelince eski, bitmemiş main koşusunun iptali. İstersen xheron-53'e ilk iş olarak bunu yaptırayım.",
+            "Yarın devam edelim mi?",
+            // An offer to act tomorrow still asks; only a word to say tomorrow waits.
+            "İstersen yarın sabah ilk iş deploy ederim.",
+            "Want me to schedule it for tomorrow.",
         ] {
-            assert!(asks_owner(asks), "{asks}");
+            assert!(asks(line), "{line}");
         }
         for not in [
             "",
@@ -2840,9 +3163,59 @@ mod tests {
             "Bulundu: kaynağında \"zaten ücretsiz\" de çıkıyor.",
             "Ron \"tamam\" deyince test eder.",
             "Düzelttim, şöyle yaptım.",
+            // Real drafts that only said how to resume later (W1578, W1545, W1471, W1472, W1509).
+            "Devam etmek istediğinde \"seo bloglara devam\" demen yeterli.",
+            "Bu oturum kapatılabilir. Ajanlar kapanınca kaybolur, ama handoff dosyaları kalır; yarın \"devam et\" demen yeterli.",
+            "eval'in de boşta olduğu doğrulandı, artık bütün session'lar park etti. Yarın \"devam et\" demen yeterli.",
+            "Yarın \"devam\" dersen sırayı şöyle öneriyorum: 1. Staging kurulumunu ve Stripe testini bitirmek. 2. Paralel olarak D3 konsol sayfasını yazmak: yerleşim B ve organizasyon bazlı grafikler, açık ve koyu tema. 3. Top-up'ta T3 incelemesi ve T4.",
+            "1. adımı yapıp 2. ve 3. adımları Friedrich'e tek bir mesajla sormayı öneriyorum. Ama \"bu konuya sonra bakalım\" demiştin; ne zaman istersen oradan devam ederiz.",
+            "Whenever you want to pick this up, \"go on\" de.",
         ] {
-            assert!(!asks_owner(not), "{not}");
+            assert!(!asks(not), "{not}");
         }
+    }
+
+    /// The label keeps 57 characters at each end of a long paragraph (the hook's `ends_kept`):
+    /// the whole paragraph in `said` decides, so a "yarın" or a "?" in the cut middle counts. A
+    /// paragraph the hook itself cut ("…") and an older hook leave the label to decide.
+    #[test]
+    fn a_turn_end_is_read_whole_not_by_its_cut_label() {
+        let cut = |whole: &str| {
+            let chars: Vec<char> = whole.chars().collect();
+            let head: String = chars[..57].iter().collect();
+            let tail: String = chars[chars.len() - 57..].iter().collect();
+            format!("{head} ... {tail}")
+        };
+        let later = "Build is green and the three fixes are merged into main now. Yarın sabah kalan iki PR'ı açıp review'a gönderirim; \"devam et\" dersen başlarım.";
+        let label = cut(later);
+        assert!(!label.contains("Yarın"), "{label}");
+        assert!(
+            turn_asks_him(Some(&label), None, 0),
+            "the label alone offers"
+        );
+        assert!(!turn_asks_him(
+            Some(&label),
+            Some(&format!("Done.\n\n{later}")),
+            0
+        ));
+        let asks = "Two ways forward here, both of them tested on staging today. Merge PR #12 first or ship the hotfix alone? Either way I keep the rollback for it ready on the build box.";
+        let label = cut(asks);
+        assert!(!label.contains('?'), "{label}");
+        assert!(!turn_asks_him(Some(&label), None, 0));
+        assert!(turn_asks_him(Some(&label), Some(asks), 0));
+        // Past the hook's own cap the label stands in; sub-agents at work still hold it back.
+        assert!(!turn_asks_him(
+            Some(&label),
+            Some("Merge PR #12 first or…"),
+            0
+        ));
+        assert!(!turn_asks_him(Some(&label), Some(asks), 1));
+        // Code ticks the whole paragraph lost still make a quoted answer through the label.
+        assert!(turn_asks_him(
+            Some("Devam için `evet` de."),
+            Some("Devam için evet de."),
+            0
+        ));
     }
 
     #[test]
@@ -3229,57 +3602,156 @@ mod tests {
     }
 
     /// The owner's own angry prompt is the goal of a task qoop opened when the agent changed
-    /// files: the draft shows neither as the question nor as what it does. The agent's last
-    /// question is the question; a goal somebody wrote stays the fallback.
+    /// files: the draft shows it neither as the question nor as what it does. With no question
+    /// there is no draft at all, whatever stage the agent set: a turn that only says where it
+    /// stands asks him nothing (the "gtm516 waits on you: <goal>" card the owner did not want).
     #[tokio::test]
     async fn a_draft_never_shows_the_owners_prompt_back_to_him() {
         let agents = AgentRegistry::new().expect("registry");
         let connections = Arc::new(ConnectionRegistry::default());
         let words = "this is not the average, you idiot, follow the real rate";
-        let hands = (&agents, &connections);
-        for question in [None, Some("Which rate table do I use?".to_string())] {
-            let store = waiting_stack(words, 100);
-            let made = draft_waiting(
-                7,
-                Some("gtm516".into()),
-                question.clone(),
-                None,
-                (hands.0, hands.1, &store),
-            )
-            .await;
-            assert!(made);
-            let body = live_cards(&store).await.remove(0).body;
-            assert!(!body.contains("idiot"), "{body}");
-            let card: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(
-                card["asks"].as_str().unwrap(),
-                question.as_deref().unwrap_or("gtm516 waits on you")
-            );
-        }
         let store = waiting_stack(words, 100);
-        store
-            .run(|s| {
-                let task = s.open_task_of(7)?.unwrap().id;
-                s.set_task_goal(task, "Use the live rate; done when tests pass", 101)
-                    .map(drop)
-            })
-            .await
-            .unwrap();
+        let question = "Which rate table do I use?".to_string();
+        let hands = (&agents, &connections, &store);
         assert!(
             draft_waiting(
                 7,
                 Some("gtm516".into()),
+                Some(question.clone()),
                 None,
-                None,
-                (&agents, &connections, &store)
+                hands
             )
             .await
         );
         let body = live_cards(&store).await.remove(0).body;
-        assert!(
-            body.contains("gtm516 waits on you: Use the live rate"),
-            "{body}"
-        );
+        assert!(!body.contains("idiot"), "{body}");
+        let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(card["asks"].as_str().unwrap(), question);
+
+        for goal in [words, "Use the live rate; done when tests pass"] {
+            let store = waiting_stack(goal, 100);
+            for question in [None, Some("  ".to_string())] {
+                let hands = (&agents, &connections, &store);
+                assert!(!draft_waiting(7, Some("gtm516".into()), question, None, hands).await);
+            }
+            assert!(live_cards(&store).await.is_empty(), "no question, no card");
+        }
+    }
+
+    /// Every draft a turn's question makes carries two to four options from its own words, on
+    /// the real questions agents left the owner: the ways an either-or question names (W1575,
+    /// W1500, W1409), the words it asked him to say (W1570, W1492, code ticks only the label
+    /// kept), its recommendation or leaving it for an open one (W1548), else yes or no (W1584,
+    /// W1574, W1567). Each card passes the format a card of qass's must.
+    #[tokio::test]
+    async fn a_draft_offers_options_from_its_questions_own_words() {
+        let agents = AgentRegistry::new().expect("registry");
+        let connections = Arc::new(ConnectionRegistry::default());
+        let yes_no = ["Yes", "No"];
+        let cases: &[(&str, Option<&str>, &[&str])] = &[
+            (
+                "Karar senin: 102 taslağı şimdi mi commit edeyim (cron'un rastgele seçmemesi için yayın bekleme listesine, PROMOTION_HOLD, ekleyerek), yoksa haftaya editör incelemesinden sonra mı?",
+                None,
+                &[
+                    "102 taslağı şimdi mi commit edeyim (cron'un rastgele seçmemesi için yayın bekleme listesine, PROMOTION_HOLD, ekleyerek)",
+                    "haftaya editör incelemesinden sonra",
+                ],
+            ),
+            (
+                "Önerim: kalanlardan önce 2.6'yı yapayım, çünkü production'daki gerçek yanlış seçimleri ancak o gösterir. Başlayayım mı, yoksa ENG-3269'u burada kapatalım mı?",
+                None,
+                &["Başlayayım", "ENG-3269'u burada kapatalım"],
+            ),
+            (
+                "Neyi netleştirmek istersin? Schedule sorusunu mu, DM taslaklarını mı, yoksa bugünkü 3 cevabın durumunu mu?",
+                None,
+                &[
+                    "Schedule sorusunu",
+                    "DM taslaklarını",
+                    "bugünkü 3 cevabın durumunu",
+                ],
+            ),
+            (
+                "Merge PR #513 now or deploy first?",
+                None,
+                &["Merge PR #513 now", "deploy first"],
+            ),
+            (
+                "Prod'a almak için \"prod'a al\" demen yeterli. Sırası şöyle olur: önce prod DB'ye migration, sonra Hetzner box'tan deploy-aws.sh deploy, ardından prod'da gerçek kullanıcı testi.",
+                None,
+                &["prod'a al", "No"],
+            ),
+            (
+                "Senin kararın: Soulseek'te olmayan şarkılar için 12 saniye bekleme kabul edilebilir mi? Daha hızlısını istersen bir yolu var: YouTube hemen çalmaya başlar, Soulseek arkada aramayı sürdürür, kayıpsız kayıt çıkarsa çalan dosya ona geçer. Bu küçük bir iş değil, ayrı bir PR olur. \"Yap\" dersen planını yazarım.",
+                None,
+                &["Yap", "No"],
+            ),
+            (
+                "Devam için evet de, sonra açarım.",
+                Some("Devam için `evet` de, sonra açarım."),
+                &["evet", "No"],
+            ),
+            (
+                "Library sayfası için 5 tasarım tarayıcında açık. Hangi numarayı istediğini yaz: benim önerim 1, karakter kalsın istersen 3.",
+                None,
+                &["Go with your recommendation", "Leave it for now"],
+            ),
+            (
+                "Q1412 (qoop): İlk açılışta ne gösterilsin?",
+                None,
+                &["Go with your recommendation", "Leave it for now"],
+            ),
+            (
+                "Senden beklenen tek karar şu: dosya paylaşan bir telefon, başkalarının Soulseek aramalarını yalnızca şarjdayken ve Wi-Fi'dayken mi alsın? \"Evet\" ya da \"hayır\" yazman yeterli.",
+                None,
+                &yes_no,
+            ),
+            (
+                "Bekleyen bir önerim de duruyor: main'de yeni push gelince eski, bitmemiş main koşusunun iptali. İstersen xheron-53'e ilk iş olarak bunu yaptırayım.",
+                None,
+                &yes_no,
+            ),
+            ("Yayınlayayım mı?", None, &yes_no),
+            (
+                "Should I keep the old cache (no open PR or review) for now?",
+                None,
+                &yes_no,
+            ),
+            ("Should I merge it or not?", None, &yes_no),
+            (
+                "A mı (not: hızlı), yoksa B mi?",
+                None,
+                &["A mı (not: hızlı)", "B"],
+            ),
+            (
+                "Merge now or wait? Logs: https://ci/run?id=4",
+                None,
+                &["Merge now", "wait"],
+            ),
+            (
+                "Why did it fail? Because the cache was stale. Fixed it. Want me to ship it.",
+                None,
+                &yes_no,
+            ),
+        ];
+        for &(question, label, want) in cases {
+            let store = waiting_stack("ship the login fix", 100);
+            agents.set_said(7, Some(&format!("Done.\n\n{question}")));
+            let label = label.unwrap_or(question).to_string();
+            let hands = (&agents, &connections, &store);
+            assert!(draft_waiting(7, Some("link".into()), Some(label), None, hands).await);
+            let card: AskCard =
+                serde_json::from_str(&live_cards(&store).await.remove(0).body).unwrap();
+            assert_eq!(card.problems(), Vec::<String>::new(), "{question}");
+            let labels: Vec<_> = card.options.iter().map(|o| o.label.as_str()).collect();
+            assert_eq!(labels, want, "{question}");
+            assert!(
+                card.options
+                    .iter()
+                    .all(|o| !o.words.is_empty() && !o.reason.is_empty())
+            );
+            assert_eq!(card.doing, "Done.");
+        }
     }
 
     /// The turn's closing words make the card: the whole question, what it did just before,
@@ -3347,47 +3819,18 @@ mod tests {
         assert!(!agents.said(7).unwrap().0.unwrap().contains("ghp_0123"));
     }
 
-    /// A prompt somebody typed reached the agent after its wait began, and its turn then ended
-    /// with no question: it works again, so no draft. A notice the harness typed is no prompt.
-    /// A tool or a prompt then closes a draft that stands.
+    /// A turn that ended with no question files nothing; the question it ended its turn with
+    /// files one, and a tool or a prompt then closes it.
     #[tokio::test]
     async fn an_agent_that_works_again_has_no_waiting_draft() {
         let agents = AgentRegistry::new().expect("registry");
         let connections = Arc::new(ConnectionRegistry::default());
-        let event = |label: &str, at| crate::control::FocusEvent {
-            kind: "user".into(),
-            label: label.into(),
-            at_unix: at,
-        };
         let store = waiting_stack("fix the rate", 100);
-        agents.push_focus_event(7, event("go on, use the live rate", 90));
-        agents.push_focus_event(
-            7,
-            event("<task-notification>build done</task-notification>", 120),
-        );
         let hands = (&agents, &connections, &store);
-        assert!(
-            draft_waiting(7, None, None, None, hands).await,
-            "a prompt from before the wait"
-        );
+        assert!(!draft_waiting(7, None, None, None, hands).await);
+        assert!(draft_waiting(7, None, Some("Merge it?".into()), None, hands).await);
         working_again(7, now() + 5, &connections, &store).await;
         assert!(live_cards(&store).await.is_empty(), "it works again");
-
-        let store = waiting_stack("fix the rate", 100);
-        agents.push_focus_event(7, event("keep going", 130));
-        assert!(!draft_waiting(7, None, None, None, (&agents, &connections, &store)).await);
-        assert!(live_cards(&store).await.is_empty());
-        // The question it ended its turn with is real whatever came before it.
-        assert!(
-            draft_waiting(
-                7,
-                None,
-                Some("Merge it?".into()),
-                None,
-                (&agents, &connections, &store)
-            )
-            .await
-        );
     }
 
     /// A plan that waited half an hour for qass: one draft card on the agent working on its item
@@ -3427,6 +3870,17 @@ mod tests {
             cards[0].body.contains("plan waits for qass") && !cards[0].body.contains("lockfile"),
             "{}",
             cards[0].body
+        );
+        // qass approves it by the first 8 characters of its hash, its options are qass's two.
+        let body: AskCard = serde_json::from_str(&cards[0].body).unwrap();
+        assert_eq!(body.problems(), Vec::<String>::new());
+        let labels: Vec<_> = body.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Approve the plan", "Drop the plan"]);
+        let hash = qoop_store::plan::plan_hash(b"v1");
+        assert!(
+            body.asks.ends_with(&format!("(hash {})", &hash[..8])),
+            "{}",
+            body.asks
         );
         assert_eq!(stage, "waiting-human");
         // Answered and gone, the worker back at work: only the mark keeps a second card away.

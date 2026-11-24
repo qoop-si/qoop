@@ -5804,7 +5804,11 @@ async fn handle_control(
                         // question never reaches the card or the phone.
                         let label = if kind == "done" {
                             let running = agents.hooked_subagents_of(terminal);
-                            let asks = crate::asks::turn_asks_him(label.as_deref(), running);
+                            let asks = crate::asks::turn_asks_him(
+                                label.as_deref(),
+                                said.as_deref(),
+                                running,
+                            );
                             // The verdict and nothing of the text, for finding a turn the
                             // reader got wrong without keeping what the agent said.
                             crate::say!(

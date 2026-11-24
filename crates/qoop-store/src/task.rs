@@ -526,15 +526,6 @@ impl Store {
         )?)
     }
 
-    /// When the task was last put to `waiting-human`, `None` when it never was.
-    pub fn task_waiting_since(&self, task: i64) -> Result<Option<i64>, StoreError> {
-        Ok(self.conn.query_row(
-            &format!("SELECT {} FROM task WHERE id = ?1", waiting_at("task")),
-            params![task],
-            |r| r.get(0),
-        )?)
-    }
-
     /// [`Store::begin_task`], its `opened` event saying who opened it (`by`).
     pub(crate) fn begin(
         &self,
