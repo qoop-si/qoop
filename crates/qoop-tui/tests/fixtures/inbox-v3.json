@@ -1,0 +1,3542 @@
+{
+ "about": "Golden records for the Inbox (design v3): the rows and cards as the daemon sends them, what the window passes in around them (hand, context, own answers, the clock for note_qass), and the list, count and sections every client must build. Items are keyed t:<terminal> or c:<card>. Order: oldest first by last_active_at_unix for a row (no stamp lists first) and opened_at for a card; a tie goes to the agent row before the card, then by slot (terminal number, card id as text). Times are unix seconds, 2026-11-23 UTC.",
+ "states": {
+  "normal": {
+   "now": 1795453800,
+   "rows": [
+    {
+     "terminal": 9,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "failed",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-9",
+     "agent_title": "Linear token refresh",
+     "generation": 1,
+     "last_active_at_unix": 1795451700,
+     "status": "failed",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "activity": "exited 1"
+    },
+    {
+     "terminal": 4,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-4",
+     "agent_title": "Which org should own the repos",
+     "generation": 1,
+     "last_active_at_unix": 1795451820,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "stop": "1795451820.1",
+     "task": {
+      "id": 41,
+      "goal": "Create the repos",
+      "stage": "waiting-human"
+     }
+    },
+    {
+     "terminal": 13,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-13",
+     "agent_title": "Rust 1.100 toolchain bump",
+     "generation": 1,
+     "last_active_at_unix": 1795451400,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 2,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2",
+     "agent_title": "Microphone permission",
+     "generation": 1,
+     "last_active_at_unix": 1795452060,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Allow the microphone for this app?",
+      "seal": 21,
+      "options": [
+       {
+        "key": "1",
+        "label": "Allow"
+       },
+       {
+        "key": "2",
+        "label": "Deny"
+       }
+      ]
+     },
+     "menu_seal": 21
+    },
+    {
+     "terminal": 6,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-6",
+     "agent_title": "WebOS status",
+     "generation": 1,
+     "last_active_at_unix": 1795452600,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 14,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "working",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-14",
+     "agent_title": "Schedules inside the qass tab",
+     "generation": 1,
+     "last_active_at_unix": 1795452720,
+     "status": "working",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 15,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-15",
+     "agent_title": "Staging migration",
+     "generation": 1,
+     "last_active_at_unix": 1795452900,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 1,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-1",
+     "agent_title": "Release PR",
+     "generation": 1,
+     "last_active_at_unix": 1795453260,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Merge pull request #754?",
+      "seal": 11,
+      "options": [
+       {
+        "key": "1",
+        "label": "Merge"
+       },
+       {
+        "key": "2",
+        "label": "Wait"
+       },
+       {
+        "key": "3",
+        "label": "Close"
+       }
+      ]
+     },
+     "menu_seal": 11
+    },
+    {
+     "terminal": 5,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-5",
+     "agent_title": "Credit rows",
+     "generation": 1,
+     "last_active_at_unix": 1795450980,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Keep both conflicting credit rows, or drop the older one?",
+      "seal": 51,
+      "options": [
+       {
+        "key": "1",
+        "label": "Keep both"
+       },
+       {
+        "key": "2",
+        "label": "Drop the older one"
+       }
+      ]
+     },
+     "menu_seal": 51,
+     "with_qass": true
+    },
+    {
+     "terminal": 16,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-16",
+     "agent_title": "Left alone by qass",
+     "generation": 1,
+     "last_active_at_unix": 1795452300,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Delete the build cache?",
+      "seal": 161,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 161,
+     "qass_skip": true
+    },
+    {
+     "terminal": 17,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-17",
+     "agent_title": "Pick the checks",
+     "generation": 1,
+     "last_active_at_unix": 1795452420,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Which checks should run?",
+      "seal": 171,
+      "options": [
+       {
+        "key": "1",
+        "label": "fmt"
+       },
+       {
+        "key": "2",
+        "label": "clippy"
+       },
+       {
+        "key": "3",
+        "label": "test"
+       }
+      ],
+      "multi": true
+     },
+     "menu_seal": 171
+    },
+    {
+     "terminal": 18,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-18",
+     "agent_title": "Login dialog",
+     "generation": 1,
+     "last_active_at_unix": 1795452660,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 19,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-19",
+     "agent_title": "Docs rewrite",
+     "generation": 1,
+     "last_active_at_unix": 1795452720,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "task": {
+      "id": 55,
+      "goal": "Rewrite the docs",
+      "stage": "waiting-human"
+     }
+    },
+    {
+     "terminal": 20,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-20",
+     "agent_title": "Back after a restart",
+     "generation": 1,
+     "last_active_at_unix": null,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Continue the migration?",
+      "seal": 201,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 201
+    },
+    {
+     "terminal": 7,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "done",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-7",
+     "agent_title": "crw.md nightly task",
+     "generation": 1,
+     "last_active_at_unix": 1795450320,
+     "status": "done",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 8,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "done",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-8",
+     "agent_title": "workflow-runtime",
+     "generation": 1,
+     "last_active_at_unix": 1795450800,
+     "status": "done",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 3,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "working",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-3",
+     "agent_title": "Bun test suite",
+     "generation": 1,
+     "last_active_at_unix": 1795453320,
+     "status": "working",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "activity": "Bash bun test"
+    },
+    {
+     "terminal": 10,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-10",
+     "agent_title": "Coupon.ts suggestion",
+     "generation": 1,
+     "last_active_at_unix": 1795446000,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 11,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "sleeping",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-11",
+     "agent_title": "Old session",
+     "generation": 1,
+     "last_active_at_unix": 1795428000,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "slept_at_unix": 1795431600
+    },
+    {
+     "terminal": 12,
+     "workspace": 1,
+     "name": null,
+     "program": "zsh",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": false,
+     "agent_session": "s-12",
+     "agent_title": "zsh",
+     "generation": 1,
+     "last_active_at_unix": 1795453200,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 8000,
+     "workspace": 3,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-8000",
+     "agent_title": "qass",
+     "generation": 1,
+     "last_active_at_unix": 1795449600,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Allow qass to run a command?",
+      "seal": 801,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 801
+    },
+    {
+     "terminal": 2164260865,
+     "workspace": 1099511627777,
+     "name": null,
+     "program": "codex",
+     "behind": null,
+     "state": "working",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2164260865",
+     "agent_title": "Classifier comparison",
+     "generation": 1,
+     "last_active_at_unix": 1795453080,
+     "status": "working",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 2164260866,
+     "workspace": 1099511627777,
+     "name": null,
+     "program": "codex",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2164260866",
+     "agent_title": "Nightly benchmark",
+     "generation": 1,
+     "last_active_at_unix": 1795453080,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 2164260867,
+     "workspace": 1099511627777,
+     "name": null,
+     "program": "codex",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2164260867",
+     "agent_title": "Soak seed",
+     "generation": 1,
+     "last_active_at_unix": 1795451400,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Pick the seed for the next soak run",
+      "seal": 62,
+      "options": [
+       {
+        "key": "1",
+        "label": "7"
+       },
+       {
+        "key": "2",
+        "label": "42"
+       }
+      ]
+     },
+     "menu_seal": 62,
+     "with_qass": true,
+     "qass_away": {
+      "at": 5000,
+      "by": "testmac"
+     }
+    },
+    {
+     "terminal": 2181038081,
+     "workspace": 2199023255553,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2181038081",
+     "agent_title": "Build on ubox",
+     "generation": 1,
+     "last_active_at_unix": 1795452960,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 2197815297,
+     "workspace": 3298534883329,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2197815297",
+     "agent_title": "NAS backup",
+     "generation": 1,
+     "last_active_at_unix": 1795453020,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Overwrite the snapshot?",
+      "seal": 71,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 71
+    }
+   ],
+   "cards": [
+    {
+     "card": "E13",
+     "agent": "T13",
+     "terminal": 13,
+     "status": "open",
+     "opened_at": 1795452000,
+     "body": {
+      "handle": "rust",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Merge #754 and #761, then release?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Merge and release",
+        "reason": "because merge and release",
+        "words": "Merge and release"
+       },
+       {
+        "key": "b",
+        "label": "Merge only",
+        "reason": "because merge only",
+        "words": "Merge only"
+       }
+      ]
+     }
+    },
+    {
+     "card": "E14",
+     "agent": "T14",
+     "terminal": 14,
+     "status": "open",
+     "opened_at": 1795453080,
+     "body": {
+      "handle": "plan",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Approve the plan for QOOP-73, Schedules inside the qass tab?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Approve",
+        "reason": "because approve",
+        "words": "Approve"
+       },
+       {
+        "key": "b",
+        "label": "Open plan",
+        "reason": "because open plan",
+        "words": "Open plan"
+       },
+       {
+        "key": "c",
+        "label": "Change it",
+        "reason": "because change it",
+        "words": "Change it"
+       },
+       {
+        "key": "d",
+        "label": "Stop",
+        "reason": "because stop",
+        "words": "Stop"
+       }
+      ]
+     },
+     "item": {
+      "id": 73,
+      "key": "QOOP-73",
+      "plan": "written"
+     }
+    },
+    {
+     "card": "Q15",
+     "agent": "T15",
+     "terminal": 15,
+     "status": "open",
+     "opened_at": 1795452900,
+     "body": {
+      "handle": "migrate",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Run the migration on staging?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       },
+       {
+        "key": "b",
+        "label": "No",
+        "reason": "because no",
+        "words": "No"
+       }
+      ]
+     }
+    },
+    {
+     "card": "E41",
+     "agent": "T1",
+     "terminal": 1,
+     "status": "open",
+     "opened_at": 1795453380,
+     "body": {
+      "handle": "release",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Also bump the version?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       },
+       {
+        "key": "b",
+        "label": "No",
+        "reason": "because no",
+        "words": "No"
+       }
+      ]
+     }
+    },
+    {
+     "card": "W31",
+     "agent": "T18",
+     "terminal": 18,
+     "status": "open",
+     "opened_at": 1795452720,
+     "body": {
+      "handle": "login",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "A question waits on its screen",
+      "options": [
+       {
+        "key": "a",
+        "label": "Open it",
+        "reason": "because open it",
+        "words": "Open it"
+       }
+      ]
+     }
+    },
+    {
+     "card": "W32",
+     "agent": "T19",
+     "terminal": 19,
+     "status": "open",
+     "opened_at": 1795452780,
+     "body": {
+      "handle": "docs",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "It stopped and waits for your answer",
+      "options": []
+     },
+     "task": 55
+    },
+    {
+     "card": "W33",
+     "agent": null,
+     "terminal": null,
+     "status": "open",
+     "opened_at": 1795451580,
+     "body": {
+      "handle": "qass",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "qass stopped watching: start it?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Start qass",
+        "reason": "because start qass",
+        "words": "Start qass"
+       }
+      ]
+     }
+    },
+    {
+     "card": "E9",
+     "agent": "T20",
+     "terminal": 20,
+     "status": "answered",
+     "opened_at": 1795449600,
+     "body": {
+      "handle": "seo",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Run the SEO plan?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       },
+       {
+        "key": "b",
+        "label": "No",
+        "reason": "because no",
+        "words": "No"
+       }
+      ]
+     },
+     "closed_at": 1795452060,
+     "answer": "a",
+     "option": "a"
+    },
+    {
+     "card": "E10",
+     "agent": "T21",
+     "terminal": 21,
+     "status": "answered",
+     "opened_at": 1795449600,
+     "body": {
+      "handle": "docs",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Ship the page?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Merge",
+        "reason": "because merge",
+        "words": "Merge"
+       },
+       {
+        "key": "b",
+        "label": "Wait",
+        "reason": "because wait",
+        "words": "Wait"
+       }
+      ]
+     },
+     "closed_at": 1795451400,
+     "answer": "b",
+     "option": "b"
+    },
+    {
+     "card": "E8",
+     "agent": "T22",
+     "terminal": 22,
+     "status": "closed",
+     "opened_at": 1795449000,
+     "body": {
+      "handle": "superset",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Which seed?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Use 7",
+        "reason": "because use 7",
+        "words": "Use 7"
+       },
+       {
+        "key": "b",
+        "label": "Use 9",
+        "reason": "because use 9",
+        "words": "Use 9"
+       }
+      ]
+     },
+     "closed_at": 1795450800,
+     "answer": "Wait for the pick"
+    },
+    {
+     "card": "E11",
+     "agent": "T23",
+     "terminal": 23,
+     "status": "queued",
+     "opened_at": 1795453200,
+     "body": {
+      "handle": "ci",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Allow the deploy?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Allow",
+        "reason": "because allow",
+        "words": "Allow"
+       },
+       {
+        "key": "b",
+        "label": "Deny",
+        "reason": "because deny",
+        "words": "Deny"
+       }
+      ]
+     },
+     "closed_at": 1795453440,
+     "answer": "a",
+     "option": "a"
+    },
+    {
+     "card": "E5",
+     "agent": "T24",
+     "terminal": 24,
+     "status": "closed",
+     "opened_at": 1795384800,
+     "body": {
+      "handle": "api",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Old question?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       }
+      ]
+     },
+     "closed_at": 1795388400,
+     "answer": "Yes"
+    },
+    {
+     "card": "E6",
+     "agent": "T25",
+     "terminal": 25,
+     "status": "closed",
+     "opened_at": 1795446000,
+     "body": {
+      "handle": "api",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Gone?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       }
+      ]
+     },
+     "closed_at": 1795447800,
+     "note": "agent closed"
+    }
+   ],
+   "hand": {
+    "qass": [
+     8000,
+     1
+    ],
+    "watching": true,
+    "hand_id": "testmac",
+    "machines": {
+     "1": "build-node",
+     "2": "ubox",
+     "3": "old-nas"
+    },
+    "no_hands": [
+     3
+    ],
+    "listed_machines": [
+     0,
+     1,
+     2,
+     3
+    ]
+   },
+   "context": {
+    "day_start": 1795392000,
+    "old": [
+     2
+    ],
+    "qass_spaces": [
+     3
+    ]
+   },
+   "own_answers": [
+    {
+     "at": 1795452060,
+     "label": "Yes",
+     "to": "seo",
+     "card": "E9"
+    },
+    {
+     "at": 1795453320,
+     "label": "Allow",
+     "to": "api",
+     "card": null
+    },
+    {
+     "at": 1795391400,
+     "label": "Old",
+     "to": "api",
+     "card": null
+    }
+   ],
+   "expect": {
+    "order": [
+     "t:20",
+     "c:W33",
+     "t:9",
+     "t:4",
+     "c:E13",
+     "t:2",
+     "t:16",
+     "t:17",
+     "t:6",
+     "c:W31",
+     "c:W32",
+     "c:Q15",
+     "t:2181038081",
+     "t:2197815297",
+     "c:E14",
+     "t:1",
+     "c:E41"
+    ],
+    "kinds": {
+     "t:20": "menu",
+     "c:W33": "qass",
+     "t:9": "failed",
+     "t:4": "reply",
+     "c:E13": "qass",
+     "t:2": "menu",
+     "t:16": "menu",
+     "t:17": "menu",
+     "t:6": "dialog",
+     "c:W31": "dialog",
+     "c:W32": "agent",
+     "c:Q15": "agent",
+     "t:2181038081": "open",
+     "t:2197815297": "menu",
+     "c:E14": "plan",
+     "t:1": "menu",
+     "c:E41": "qass"
+    },
+    "hand_to_qass": [
+     "t:20",
+     "t:2",
+     "c:W32",
+     "c:Q15",
+     "t:1"
+    ],
+    "lost": [],
+    "count": 17,
+    "with_qass": [
+     5,
+     2164260867
+    ],
+    "finished": [
+     7,
+     8
+    ],
+    "answered": [
+     [
+      1795453440,
+      "Allow",
+      "ci",
+      false
+     ],
+     [
+      1795453320,
+      "Allow",
+      "api",
+      true
+     ],
+     [
+      1795452060,
+      "Yes",
+      "seo",
+      true
+     ],
+     [
+      1795451400,
+      "Wait",
+      "docs",
+      false
+     ],
+     [
+      1795450800,
+      "Wait for the pick",
+      "superset",
+      false
+     ]
+    ]
+   }
+  },
+  "qass_stopped": {
+   "now": 1795453800,
+   "rows": [
+    {
+     "terminal": 9,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "failed",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-9",
+     "agent_title": "Linear token refresh",
+     "generation": 1,
+     "last_active_at_unix": 1795451700,
+     "status": "failed",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "activity": "exited 1"
+    },
+    {
+     "terminal": 4,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-4",
+     "agent_title": "Which org should own the repos",
+     "generation": 1,
+     "last_active_at_unix": 1795451820,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "stop": "1795451820.1",
+     "task": {
+      "id": 41,
+      "goal": "Create the repos",
+      "stage": "waiting-human"
+     }
+    },
+    {
+     "terminal": 13,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-13",
+     "agent_title": "Rust 1.100 toolchain bump",
+     "generation": 1,
+     "last_active_at_unix": 1795451400,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 2,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2",
+     "agent_title": "Microphone permission",
+     "generation": 1,
+     "last_active_at_unix": 1795452060,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Allow the microphone for this app?",
+      "seal": 21,
+      "options": [
+       {
+        "key": "1",
+        "label": "Allow"
+       },
+       {
+        "key": "2",
+        "label": "Deny"
+       }
+      ]
+     },
+     "menu_seal": 21
+    },
+    {
+     "terminal": 6,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-6",
+     "agent_title": "WebOS status",
+     "generation": 1,
+     "last_active_at_unix": 1795452600,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 14,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "working",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-14",
+     "agent_title": "Schedules inside the qass tab",
+     "generation": 1,
+     "last_active_at_unix": 1795452720,
+     "status": "working",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 15,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-15",
+     "agent_title": "Staging migration",
+     "generation": 1,
+     "last_active_at_unix": 1795452900,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 1,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-1",
+     "agent_title": "Release PR",
+     "generation": 1,
+     "last_active_at_unix": 1795453260,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Merge pull request #754?",
+      "seal": 11,
+      "options": [
+       {
+        "key": "1",
+        "label": "Merge"
+       },
+       {
+        "key": "2",
+        "label": "Wait"
+       },
+       {
+        "key": "3",
+        "label": "Close"
+       }
+      ]
+     },
+     "menu_seal": 11
+    },
+    {
+     "terminal": 5,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-5",
+     "agent_title": "Credit rows",
+     "generation": 1,
+     "last_active_at_unix": 1795450980,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Keep both conflicting credit rows, or drop the older one?",
+      "seal": 51,
+      "options": [
+       {
+        "key": "1",
+        "label": "Keep both"
+       },
+       {
+        "key": "2",
+        "label": "Drop the older one"
+       }
+      ]
+     },
+     "menu_seal": 51,
+     "with_qass": true
+    },
+    {
+     "terminal": 16,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-16",
+     "agent_title": "Left alone by qass",
+     "generation": 1,
+     "last_active_at_unix": 1795452300,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Delete the build cache?",
+      "seal": 161,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 161,
+     "qass_skip": true
+    },
+    {
+     "terminal": 17,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-17",
+     "agent_title": "Pick the checks",
+     "generation": 1,
+     "last_active_at_unix": 1795452420,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Which checks should run?",
+      "seal": 171,
+      "options": [
+       {
+        "key": "1",
+        "label": "fmt"
+       },
+       {
+        "key": "2",
+        "label": "clippy"
+       },
+       {
+        "key": "3",
+        "label": "test"
+       }
+      ],
+      "multi": true
+     },
+     "menu_seal": 171
+    },
+    {
+     "terminal": 18,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-18",
+     "agent_title": "Login dialog",
+     "generation": 1,
+     "last_active_at_unix": 1795452660,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 19,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-19",
+     "agent_title": "Docs rewrite",
+     "generation": 1,
+     "last_active_at_unix": 1795452720,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "task": {
+      "id": 55,
+      "goal": "Rewrite the docs",
+      "stage": "waiting-human"
+     }
+    },
+    {
+     "terminal": 20,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-20",
+     "agent_title": "Back after a restart",
+     "generation": 1,
+     "last_active_at_unix": null,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Continue the migration?",
+      "seal": 201,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 201
+    },
+    {
+     "terminal": 7,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "done",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-7",
+     "agent_title": "crw.md nightly task",
+     "generation": 1,
+     "last_active_at_unix": 1795450320,
+     "status": "done",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 8,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "done",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-8",
+     "agent_title": "workflow-runtime",
+     "generation": 1,
+     "last_active_at_unix": 1795450800,
+     "status": "done",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 3,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "working",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-3",
+     "agent_title": "Bun test suite",
+     "generation": 1,
+     "last_active_at_unix": 1795453320,
+     "status": "working",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "activity": "Bash bun test"
+    },
+    {
+     "terminal": 10,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-10",
+     "agent_title": "Coupon.ts suggestion",
+     "generation": 1,
+     "last_active_at_unix": 1795446000,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 11,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "sleeping",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-11",
+     "agent_title": "Old session",
+     "generation": 1,
+     "last_active_at_unix": 1795428000,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "slept_at_unix": 1795431600
+    },
+    {
+     "terminal": 12,
+     "workspace": 1,
+     "name": null,
+     "program": "zsh",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": false,
+     "agent_session": "s-12",
+     "agent_title": "zsh",
+     "generation": 1,
+     "last_active_at_unix": 1795453200,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 8000,
+     "workspace": 3,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-8000",
+     "agent_title": "qass",
+     "generation": 1,
+     "last_active_at_unix": 1795449600,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Allow qass to run a command?",
+      "seal": 801,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 801
+    },
+    {
+     "terminal": 2164260865,
+     "workspace": 1099511627777,
+     "name": null,
+     "program": "codex",
+     "behind": null,
+     "state": "working",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2164260865",
+     "agent_title": "Classifier comparison",
+     "generation": 1,
+     "last_active_at_unix": 1795453080,
+     "status": "working",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 2164260866,
+     "workspace": 1099511627777,
+     "name": null,
+     "program": "codex",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2164260866",
+     "agent_title": "Nightly benchmark",
+     "generation": 1,
+     "last_active_at_unix": 1795453080,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 2164260867,
+     "workspace": 1099511627777,
+     "name": null,
+     "program": "codex",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2164260867",
+     "agent_title": "Soak seed",
+     "generation": 1,
+     "last_active_at_unix": 1795451400,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Pick the seed for the next soak run",
+      "seal": 62,
+      "options": [
+       {
+        "key": "1",
+        "label": "7"
+       },
+       {
+        "key": "2",
+        "label": "42"
+       }
+      ]
+     },
+     "menu_seal": 62,
+     "with_qass": true,
+     "qass_away": {
+      "at": 5000,
+      "by": "testmac"
+     }
+    },
+    {
+     "terminal": 2181038081,
+     "workspace": 2199023255553,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2181038081",
+     "agent_title": "Build on ubox",
+     "generation": 1,
+     "last_active_at_unix": 1795452960,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 2197815297,
+     "workspace": 3298534883329,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2197815297",
+     "agent_title": "NAS backup",
+     "generation": 1,
+     "last_active_at_unix": 1795453020,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Overwrite the snapshot?",
+      "seal": 71,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 71
+    }
+   ],
+   "cards": [
+    {
+     "card": "E13",
+     "agent": "T13",
+     "terminal": 13,
+     "status": "open",
+     "opened_at": 1795452000,
+     "body": {
+      "handle": "rust",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Merge #754 and #761, then release?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Merge and release",
+        "reason": "because merge and release",
+        "words": "Merge and release"
+       },
+       {
+        "key": "b",
+        "label": "Merge only",
+        "reason": "because merge only",
+        "words": "Merge only"
+       }
+      ]
+     }
+    },
+    {
+     "card": "E14",
+     "agent": "T14",
+     "terminal": 14,
+     "status": "open",
+     "opened_at": 1795453080,
+     "body": {
+      "handle": "plan",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Approve the plan for QOOP-73, Schedules inside the qass tab?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Approve",
+        "reason": "because approve",
+        "words": "Approve"
+       },
+       {
+        "key": "b",
+        "label": "Open plan",
+        "reason": "because open plan",
+        "words": "Open plan"
+       },
+       {
+        "key": "c",
+        "label": "Change it",
+        "reason": "because change it",
+        "words": "Change it"
+       },
+       {
+        "key": "d",
+        "label": "Stop",
+        "reason": "because stop",
+        "words": "Stop"
+       }
+      ]
+     },
+     "item": {
+      "id": 73,
+      "key": "QOOP-73",
+      "plan": "written"
+     }
+    },
+    {
+     "card": "Q15",
+     "agent": "T15",
+     "terminal": 15,
+     "status": "open",
+     "opened_at": 1795452900,
+     "body": {
+      "handle": "migrate",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Run the migration on staging?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       },
+       {
+        "key": "b",
+        "label": "No",
+        "reason": "because no",
+        "words": "No"
+       }
+      ]
+     }
+    },
+    {
+     "card": "E41",
+     "agent": "T1",
+     "terminal": 1,
+     "status": "open",
+     "opened_at": 1795453380,
+     "body": {
+      "handle": "release",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Also bump the version?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       },
+       {
+        "key": "b",
+        "label": "No",
+        "reason": "because no",
+        "words": "No"
+       }
+      ]
+     }
+    },
+    {
+     "card": "W31",
+     "agent": "T18",
+     "terminal": 18,
+     "status": "open",
+     "opened_at": 1795452720,
+     "body": {
+      "handle": "login",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "A question waits on its screen",
+      "options": [
+       {
+        "key": "a",
+        "label": "Open it",
+        "reason": "because open it",
+        "words": "Open it"
+       }
+      ]
+     }
+    },
+    {
+     "card": "W32",
+     "agent": "T19",
+     "terminal": 19,
+     "status": "open",
+     "opened_at": 1795452780,
+     "body": {
+      "handle": "docs",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "It stopped and waits for your answer",
+      "options": []
+     },
+     "task": 55
+    },
+    {
+     "card": "W33",
+     "agent": null,
+     "terminal": null,
+     "status": "open",
+     "opened_at": 1795451580,
+     "body": {
+      "handle": "qass",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "qass stopped watching: start it?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Start qass",
+        "reason": "because start qass",
+        "words": "Start qass"
+       }
+      ]
+     }
+    },
+    {
+     "card": "E9",
+     "agent": "T20",
+     "terminal": 20,
+     "status": "answered",
+     "opened_at": 1795449600,
+     "body": {
+      "handle": "seo",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Run the SEO plan?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       },
+       {
+        "key": "b",
+        "label": "No",
+        "reason": "because no",
+        "words": "No"
+       }
+      ]
+     },
+     "closed_at": 1795452060,
+     "answer": "a",
+     "option": "a"
+    },
+    {
+     "card": "E10",
+     "agent": "T21",
+     "terminal": 21,
+     "status": "answered",
+     "opened_at": 1795449600,
+     "body": {
+      "handle": "docs",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Ship the page?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Merge",
+        "reason": "because merge",
+        "words": "Merge"
+       },
+       {
+        "key": "b",
+        "label": "Wait",
+        "reason": "because wait",
+        "words": "Wait"
+       }
+      ]
+     },
+     "closed_at": 1795451400,
+     "answer": "b",
+     "option": "b"
+    },
+    {
+     "card": "E8",
+     "agent": "T22",
+     "terminal": 22,
+     "status": "closed",
+     "opened_at": 1795449000,
+     "body": {
+      "handle": "superset",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Which seed?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Use 7",
+        "reason": "because use 7",
+        "words": "Use 7"
+       },
+       {
+        "key": "b",
+        "label": "Use 9",
+        "reason": "because use 9",
+        "words": "Use 9"
+       }
+      ]
+     },
+     "closed_at": 1795450800,
+     "answer": "Wait for the pick"
+    },
+    {
+     "card": "E11",
+     "agent": "T23",
+     "terminal": 23,
+     "status": "queued",
+     "opened_at": 1795453200,
+     "body": {
+      "handle": "ci",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Allow the deploy?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Allow",
+        "reason": "because allow",
+        "words": "Allow"
+       },
+       {
+        "key": "b",
+        "label": "Deny",
+        "reason": "because deny",
+        "words": "Deny"
+       }
+      ]
+     },
+     "closed_at": 1795453440,
+     "answer": "a",
+     "option": "a"
+    },
+    {
+     "card": "E5",
+     "agent": "T24",
+     "terminal": 24,
+     "status": "closed",
+     "opened_at": 1795384800,
+     "body": {
+      "handle": "api",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Old question?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       }
+      ]
+     },
+     "closed_at": 1795388400,
+     "answer": "Yes"
+    },
+    {
+     "card": "E6",
+     "agent": "T25",
+     "terminal": 25,
+     "status": "closed",
+     "opened_at": 1795446000,
+     "body": {
+      "handle": "api",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Gone?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       }
+      ]
+     },
+     "closed_at": 1795447800,
+     "note": "agent closed"
+    }
+   ],
+   "hand": {
+    "qass": [
+     8000,
+     1
+    ],
+    "watching": false,
+    "hand_id": "testmac",
+    "machines": {
+     "1": "build-node",
+     "2": "ubox",
+     "3": "old-nas"
+    },
+    "no_hands": [
+     3
+    ],
+    "listed_machines": [
+     0,
+     1,
+     2,
+     3
+    ]
+   },
+   "context": {
+    "day_start": 1795392000,
+    "old": [
+     2
+    ],
+    "qass_spaces": [
+     3
+    ]
+   },
+   "own_answers": [
+    {
+     "at": 1795452060,
+     "label": "Yes",
+     "to": "seo",
+     "card": "E9"
+    },
+    {
+     "at": 1795453320,
+     "label": "Allow",
+     "to": "api",
+     "card": null
+    },
+    {
+     "at": 1795391400,
+     "label": "Old",
+     "to": "api",
+     "card": null
+    }
+   ],
+   "expect": {
+    "order": [
+     "t:20",
+     "t:5",
+     "t:2164260867",
+     "c:W33",
+     "t:9",
+     "t:4",
+     "c:E13",
+     "t:2",
+     "t:16",
+     "t:17",
+     "t:6",
+     "c:W31",
+     "c:W32",
+     "c:Q15",
+     "t:2181038081",
+     "t:2197815297",
+     "c:E14",
+     "t:1",
+     "c:E41"
+    ],
+    "kinds": {
+     "t:20": "menu",
+     "c:W33": "qass",
+     "t:9": "failed",
+     "t:4": "reply",
+     "c:E13": "qass",
+     "t:2": "menu",
+     "t:16": "menu",
+     "t:17": "menu",
+     "t:6": "dialog",
+     "c:W31": "dialog",
+     "c:W32": "agent",
+     "c:Q15": "agent",
+     "t:2181038081": "open",
+     "t:2197815297": "menu",
+     "c:E14": "plan",
+     "t:1": "menu",
+     "c:E41": "qass",
+     "t:5": "menu",
+     "t:2164260867": "menu"
+    },
+    "hand_to_qass": [],
+    "lost": [],
+    "count": 19,
+    "with_qass": [],
+    "finished": [
+     7,
+     8
+    ],
+    "answered": [
+     [
+      1795453440,
+      "Allow",
+      "ci",
+      false
+     ],
+     [
+      1795453320,
+      "Allow",
+      "api",
+      true
+     ],
+     [
+      1795452060,
+      "Yes",
+      "seo",
+      true
+     ],
+     [
+      1795451400,
+      "Wait",
+      "docs",
+      false
+     ],
+     [
+      1795450800,
+      "Wait for the pick",
+      "superset",
+      false
+     ]
+    ]
+   }
+  },
+  "computer_lost": {
+   "now": 1795453800,
+   "rows": [
+    {
+     "terminal": 9,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "failed",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-9",
+     "agent_title": "Linear token refresh",
+     "generation": 1,
+     "last_active_at_unix": 1795451700,
+     "status": "failed",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "activity": "exited 1"
+    },
+    {
+     "terminal": 4,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-4",
+     "agent_title": "Which org should own the repos",
+     "generation": 1,
+     "last_active_at_unix": 1795451820,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "stop": "1795451820.1",
+     "task": {
+      "id": 41,
+      "goal": "Create the repos",
+      "stage": "waiting-human"
+     }
+    },
+    {
+     "terminal": 13,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-13",
+     "agent_title": "Rust 1.100 toolchain bump",
+     "generation": 1,
+     "last_active_at_unix": 1795451400,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 2,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2",
+     "agent_title": "Microphone permission",
+     "generation": 1,
+     "last_active_at_unix": 1795452060,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Allow the microphone for this app?",
+      "seal": 21,
+      "options": [
+       {
+        "key": "1",
+        "label": "Allow"
+       },
+       {
+        "key": "2",
+        "label": "Deny"
+       }
+      ]
+     },
+     "menu_seal": 21
+    },
+    {
+     "terminal": 6,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-6",
+     "agent_title": "WebOS status",
+     "generation": 1,
+     "last_active_at_unix": 1795452600,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 14,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "working",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-14",
+     "agent_title": "Schedules inside the qass tab",
+     "generation": 1,
+     "last_active_at_unix": 1795452720,
+     "status": "working",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 15,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-15",
+     "agent_title": "Staging migration",
+     "generation": 1,
+     "last_active_at_unix": 1795452900,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 1,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-1",
+     "agent_title": "Release PR",
+     "generation": 1,
+     "last_active_at_unix": 1795453260,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Merge pull request #754?",
+      "seal": 11,
+      "options": [
+       {
+        "key": "1",
+        "label": "Merge"
+       },
+       {
+        "key": "2",
+        "label": "Wait"
+       },
+       {
+        "key": "3",
+        "label": "Close"
+       }
+      ]
+     },
+     "menu_seal": 11
+    },
+    {
+     "terminal": 5,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-5",
+     "agent_title": "Credit rows",
+     "generation": 1,
+     "last_active_at_unix": 1795450980,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Keep both conflicting credit rows, or drop the older one?",
+      "seal": 51,
+      "options": [
+       {
+        "key": "1",
+        "label": "Keep both"
+       },
+       {
+        "key": "2",
+        "label": "Drop the older one"
+       }
+      ]
+     },
+     "menu_seal": 51,
+     "with_qass": true
+    },
+    {
+     "terminal": 16,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-16",
+     "agent_title": "Left alone by qass",
+     "generation": 1,
+     "last_active_at_unix": 1795452300,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Delete the build cache?",
+      "seal": 161,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 161,
+     "qass_skip": true
+    },
+    {
+     "terminal": 17,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-17",
+     "agent_title": "Pick the checks",
+     "generation": 1,
+     "last_active_at_unix": 1795452420,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Which checks should run?",
+      "seal": 171,
+      "options": [
+       {
+        "key": "1",
+        "label": "fmt"
+       },
+       {
+        "key": "2",
+        "label": "clippy"
+       },
+       {
+        "key": "3",
+        "label": "test"
+       }
+      ],
+      "multi": true
+     },
+     "menu_seal": 171
+    },
+    {
+     "terminal": 18,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-18",
+     "agent_title": "Login dialog",
+     "generation": 1,
+     "last_active_at_unix": 1795452660,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 19,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-19",
+     "agent_title": "Docs rewrite",
+     "generation": 1,
+     "last_active_at_unix": 1795452720,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "task": {
+      "id": 55,
+      "goal": "Rewrite the docs",
+      "stage": "waiting-human"
+     }
+    },
+    {
+     "terminal": 20,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-20",
+     "agent_title": "Back after a restart",
+     "generation": 1,
+     "last_active_at_unix": null,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Continue the migration?",
+      "seal": 201,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 201
+    },
+    {
+     "terminal": 7,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "done",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-7",
+     "agent_title": "crw.md nightly task",
+     "generation": 1,
+     "last_active_at_unix": 1795450320,
+     "status": "done",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 8,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "done",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-8",
+     "agent_title": "workflow-runtime",
+     "generation": 1,
+     "last_active_at_unix": 1795450800,
+     "status": "done",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 3,
+     "workspace": 1,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "working",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-3",
+     "agent_title": "Bun test suite",
+     "generation": 1,
+     "last_active_at_unix": 1795453320,
+     "status": "working",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "activity": "Bash bun test"
+    },
+    {
+     "terminal": 10,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-10",
+     "agent_title": "Coupon.ts suggestion",
+     "generation": 1,
+     "last_active_at_unix": 1795446000,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 11,
+     "workspace": 2,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "sleeping",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-11",
+     "agent_title": "Old session",
+     "generation": 1,
+     "last_active_at_unix": 1795428000,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "slept_at_unix": 1795431600
+    },
+    {
+     "terminal": 12,
+     "workspace": 1,
+     "name": null,
+     "program": "zsh",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": false,
+     "agent_session": "s-12",
+     "agent_title": "zsh",
+     "generation": 1,
+     "last_active_at_unix": 1795453200,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 8000,
+     "workspace": 3,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-8000",
+     "agent_title": "qass",
+     "generation": 1,
+     "last_active_at_unix": 1795449600,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Allow qass to run a command?",
+      "seal": 801,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 801
+    },
+    {
+     "terminal": 2164260866,
+     "workspace": 1099511627777,
+     "name": null,
+     "program": "codex",
+     "behind": null,
+     "state": "idle",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2164260866",
+     "agent_title": "Nightly benchmark",
+     "generation": 1,
+     "last_active_at_unix": 1795453080,
+     "status": "idle",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 2164260867,
+     "workspace": 1099511627777,
+     "name": null,
+     "program": "codex",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2164260867",
+     "agent_title": "Soak seed",
+     "generation": 1,
+     "last_active_at_unix": 1795451400,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Pick the seed for the next soak run",
+      "seal": 62,
+      "options": [
+       {
+        "key": "1",
+        "label": "7"
+       },
+       {
+        "key": "2",
+        "label": "42"
+       }
+      ]
+     },
+     "menu_seal": 62,
+     "with_qass": true,
+     "qass_away": {
+      "at": 5000,
+      "by": "testmac"
+     }
+    },
+    {
+     "terminal": 2181038081,
+     "workspace": 2199023255553,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2181038081",
+     "agent_title": "Build on ubox",
+     "generation": 1,
+     "last_active_at_unix": 1795452960,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ]
+    },
+    {
+     "terminal": 2197815297,
+     "workspace": 3298534883329,
+     "name": null,
+     "program": "claude",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2197815297",
+     "agent_title": "NAS backup",
+     "generation": 1,
+     "last_active_at_unix": 1795453020,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Overwrite the snapshot?",
+      "seal": 71,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 71
+    },
+    {
+     "terminal": 2164260865,
+     "workspace": 1099511627777,
+     "name": null,
+     "program": "codex",
+     "behind": null,
+     "state": "blocked",
+     "readiness": "ready",
+     "agent": true,
+     "agent_session": "s-2164260865",
+     "agent_title": "Classifier comparison",
+     "generation": 1,
+     "last_active_at_unix": 1795452900,
+     "status": "blocked",
+     "cwd": "/Users/dev/work",
+     "clients": [
+      "computer"
+     ],
+     "menu": {
+      "question": "Use the new labels for the comparison?",
+      "seal": 61,
+      "options": [
+       {
+        "key": "1",
+        "label": "Yes"
+       },
+       {
+        "key": "2",
+        "label": "No"
+       }
+      ]
+     },
+     "menu_seal": 61
+    }
+   ],
+   "cards": [
+    {
+     "card": "E13",
+     "agent": "T13",
+     "terminal": 13,
+     "status": "open",
+     "opened_at": 1795452000,
+     "body": {
+      "handle": "rust",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Merge #754 and #761, then release?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Merge and release",
+        "reason": "because merge and release",
+        "words": "Merge and release"
+       },
+       {
+        "key": "b",
+        "label": "Merge only",
+        "reason": "because merge only",
+        "words": "Merge only"
+       }
+      ]
+     }
+    },
+    {
+     "card": "E14",
+     "agent": "T14",
+     "terminal": 14,
+     "status": "open",
+     "opened_at": 1795453080,
+     "body": {
+      "handle": "plan",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Approve the plan for QOOP-73, Schedules inside the qass tab?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Approve",
+        "reason": "because approve",
+        "words": "Approve"
+       },
+       {
+        "key": "b",
+        "label": "Open plan",
+        "reason": "because open plan",
+        "words": "Open plan"
+       },
+       {
+        "key": "c",
+        "label": "Change it",
+        "reason": "because change it",
+        "words": "Change it"
+       },
+       {
+        "key": "d",
+        "label": "Stop",
+        "reason": "because stop",
+        "words": "Stop"
+       }
+      ]
+     },
+     "item": {
+      "id": 73,
+      "key": "QOOP-73",
+      "plan": "written"
+     }
+    },
+    {
+     "card": "Q15",
+     "agent": "T15",
+     "terminal": 15,
+     "status": "open",
+     "opened_at": 1795452900,
+     "body": {
+      "handle": "migrate",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Run the migration on staging?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       },
+       {
+        "key": "b",
+        "label": "No",
+        "reason": "because no",
+        "words": "No"
+       }
+      ]
+     }
+    },
+    {
+     "card": "E41",
+     "agent": "T1",
+     "terminal": 1,
+     "status": "open",
+     "opened_at": 1795453380,
+     "body": {
+      "handle": "release",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Also bump the version?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       },
+       {
+        "key": "b",
+        "label": "No",
+        "reason": "because no",
+        "words": "No"
+       }
+      ]
+     }
+    },
+    {
+     "card": "W31",
+     "agent": "T18",
+     "terminal": 18,
+     "status": "open",
+     "opened_at": 1795452720,
+     "body": {
+      "handle": "login",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "A question waits on its screen",
+      "options": [
+       {
+        "key": "a",
+        "label": "Open it",
+        "reason": "because open it",
+        "words": "Open it"
+       }
+      ]
+     }
+    },
+    {
+     "card": "W32",
+     "agent": "T19",
+     "terminal": 19,
+     "status": "open",
+     "opened_at": 1795452780,
+     "body": {
+      "handle": "docs",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "It stopped and waits for your answer",
+      "options": []
+     },
+     "task": 55
+    },
+    {
+     "card": "W33",
+     "agent": null,
+     "terminal": null,
+     "status": "open",
+     "opened_at": 1795451580,
+     "body": {
+      "handle": "qass",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "qass stopped watching: start it?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Start qass",
+        "reason": "because start qass",
+        "words": "Start qass"
+       }
+      ]
+     }
+    },
+    {
+     "card": "E9",
+     "agent": "T20",
+     "terminal": 20,
+     "status": "answered",
+     "opened_at": 1795449600,
+     "body": {
+      "handle": "seo",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Run the SEO plan?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       },
+       {
+        "key": "b",
+        "label": "No",
+        "reason": "because no",
+        "words": "No"
+       }
+      ]
+     },
+     "closed_at": 1795452060,
+     "answer": "a",
+     "option": "a"
+    },
+    {
+     "card": "E10",
+     "agent": "T21",
+     "terminal": 21,
+     "status": "answered",
+     "opened_at": 1795449600,
+     "body": {
+      "handle": "docs",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Ship the page?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Merge",
+        "reason": "because merge",
+        "words": "Merge"
+       },
+       {
+        "key": "b",
+        "label": "Wait",
+        "reason": "because wait",
+        "words": "Wait"
+       }
+      ]
+     },
+     "closed_at": 1795451400,
+     "answer": "b",
+     "option": "b"
+    },
+    {
+     "card": "E8",
+     "agent": "T22",
+     "terminal": 22,
+     "status": "closed",
+     "opened_at": 1795449000,
+     "body": {
+      "handle": "superset",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Which seed?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Use 7",
+        "reason": "because use 7",
+        "words": "Use 7"
+       },
+       {
+        "key": "b",
+        "label": "Use 9",
+        "reason": "because use 9",
+        "words": "Use 9"
+       }
+      ]
+     },
+     "closed_at": 1795450800,
+     "answer": "Wait for the pick"
+    },
+    {
+     "card": "E11",
+     "agent": "T23",
+     "terminal": 23,
+     "status": "queued",
+     "opened_at": 1795453200,
+     "body": {
+      "handle": "ci",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Allow the deploy?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Allow",
+        "reason": "because allow",
+        "words": "Allow"
+       },
+       {
+        "key": "b",
+        "label": "Deny",
+        "reason": "because deny",
+        "words": "Deny"
+       }
+      ]
+     },
+     "closed_at": 1795453440,
+     "answer": "a",
+     "option": "a"
+    },
+    {
+     "card": "E5",
+     "agent": "T24",
+     "terminal": 24,
+     "status": "closed",
+     "opened_at": 1795384800,
+     "body": {
+      "handle": "api",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Old question?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       }
+      ]
+     },
+     "closed_at": 1795388400,
+     "answer": "Yes"
+    },
+    {
+     "card": "E6",
+     "agent": "T25",
+     "terminal": 25,
+     "status": "closed",
+     "opened_at": 1795446000,
+     "body": {
+      "handle": "api",
+      "urgency": "now",
+      "doing": "its task",
+      "why": "it needs you",
+      "asks": "Gone?",
+      "options": [
+       {
+        "key": "a",
+        "label": "Yes",
+        "reason": "because yes",
+        "words": "Yes"
+       }
+      ]
+     },
+     "closed_at": 1795447800,
+     "note": "agent closed"
+    }
+   ],
+   "hand": {
+    "qass": [
+     8000,
+     1
+    ],
+    "watching": true,
+    "hand_id": "testmac",
+    "machines": {
+     "1": "build-node",
+     "2": "ubox",
+     "3": "old-nas"
+    },
+    "no_hands": [
+     3
+    ],
+    "listed_machines": [
+     0,
+     1,
+     2,
+     3
+    ]
+   },
+   "context": {
+    "day_start": 1795392000,
+    "old": [
+     2
+    ],
+    "qass_spaces": [
+     3
+    ],
+    "lost": [
+     1
+    ]
+   },
+   "own_answers": [
+    {
+     "at": 1795452060,
+     "label": "Yes",
+     "to": "seo",
+     "card": "E9"
+    },
+    {
+     "at": 1795453320,
+     "label": "Allow",
+     "to": "api",
+     "card": null
+    },
+    {
+     "at": 1795391400,
+     "label": "Old",
+     "to": "api",
+     "card": null
+    }
+   ],
+   "expect": {
+    "order": [
+     "t:20",
+     "c:W33",
+     "t:9",
+     "t:4",
+     "c:E13",
+     "t:2",
+     "t:16",
+     "t:17",
+     "t:6",
+     "c:W31",
+     "c:W32",
+     "t:2164260865",
+     "c:Q15",
+     "t:2181038081",
+     "t:2197815297",
+     "c:E14",
+     "t:1",
+     "c:E41"
+    ],
+    "kinds": {
+     "t:20": "menu",
+     "c:W33": "qass",
+     "t:9": "failed",
+     "t:4": "reply",
+     "c:E13": "qass",
+     "t:2": "menu",
+     "t:16": "menu",
+     "t:17": "menu",
+     "t:6": "dialog",
+     "c:W31": "dialog",
+     "c:W32": "agent",
+     "c:Q15": "agent",
+     "t:2181038081": "open",
+     "t:2197815297": "menu",
+     "c:E14": "plan",
+     "t:1": "menu",
+     "c:E41": "qass",
+     "t:2164260865": "menu"
+    },
+    "hand_to_qass": [
+     "t:20",
+     "t:2",
+     "c:W32",
+     "c:Q15",
+     "t:1"
+    ],
+    "lost": [
+     "t:2164260865"
+    ],
+    "count": 18,
+    "with_qass": [
+     5,
+     2164260867
+    ],
+    "finished": [
+     7,
+     8
+    ],
+    "answered": [
+     [
+      1795453440,
+      "Allow",
+      "ci",
+      false
+     ],
+     [
+      1795453320,
+      "Allow",
+      "api",
+      true
+     ],
+     [
+      1795452060,
+      "Yes",
+      "seo",
+      true
+     ],
+     [
+      1795451400,
+      "Wait",
+      "docs",
+      false
+     ],
+     [
+      1795450800,
+      "Wait for the pick",
+      "superset",
+      false
+     ]
+    ]
+   }
+  },
+  "first_run": {
+   "now": 1795453800,
+   "rows": [],
+   "cards": [],
+   "hand": {
+    "watching": null
+   },
+   "context": {
+    "day_start": 1795392000
+   },
+   "own_answers": [],
+   "expect": {
+    "order": [],
+    "kinds": {},
+    "hand_to_qass": [],
+    "lost": [],
+    "count": 0,
+    "with_qass": [],
+    "finished": [],
+    "answered": []
+   }
+  }
+ }
+}

@@ -6,6 +6,7 @@
 //! that drives them is small enough to read in one sitting.
 
 pub mod answer;
+pub mod answers;
 pub mod asks;
 pub mod chat_view;
 pub mod colorlevel;
@@ -14,6 +15,7 @@ pub mod copy;
 pub mod graphics;
 pub mod hyperlink;
 pub mod icons;
+pub mod inbox;
 pub mod input;
 pub mod keys;
 pub mod layout;

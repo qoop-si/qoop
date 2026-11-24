@@ -28,6 +28,8 @@ const MATCHED: &[(&str, &str)] = &[
         "\u{85}\u{2028}\u{2029}\u{200d}\u{fe0f}\u{fe0e}\u{1f1e6}\u{1f1ff}",
     ),
     ("qoop-runtime/src/idle.rs", "⏺◯"),
+    // A task's letters folded to a branch name's ASCII: compared, never drawn.
+    ("qoop-tui/src/answers.rs", "İçğıíìîïöóòôõşßüúùûáàâäãéèêëñ"),
     // The trust menu's pointers, looked for on an agent's screen, never drawn.
     ("qoop-detect/src/lib.rs", "\u{276f}\u{203a}"),
     // An agent's own menu read off its screen: its cursor, boxes, ticks and the tree mark of

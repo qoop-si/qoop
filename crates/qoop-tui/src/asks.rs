@@ -963,7 +963,7 @@ pub fn plan_word(plan: &str, by: Option<&str>) -> Option<(String, Role)> {
 }
 
 /// A plan card: qass asks him to approve its item's plan, which is not approved yet.
-fn plan_card(card: &AskInfo) -> bool {
+pub fn plan_card(card: &AskInfo) -> bool {
     card.body.handle == "plan"
         && card
             .item
