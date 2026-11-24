@@ -22,11 +22,11 @@ What needs you is counted the same way everywhere: agents that are `blocked` or 
 the other things waiting on you in the Inbox. An agent whose question you handed to qass is
 held under With qass and leaves the count, and a `done` nobody has looked at is listed apart
 and is not counted. The notch reads only the agents, so it counts the agents that need you by
-that rule and always points to the Inbox for questions from qass. It can differ from the
-interface in two cases until the notch reads the Inbox too: a hand held by another computer's
-qass, and a hand while qass is stopped or not watching, which the interface counts again at
-once and the notch keeps out of the count until the hand ends (at most 30 minutes). The notch
-also ignores a space or tab you keep from qass.
+that rule and always points to the Inbox for questions from qass. `qoop agents --watch --json`,
+which the notch reads, says `with_qass` for an agent only while the question is with qass by the same rule as
+the interface: qass runs, watches and does not skip that agent. A question handed while qass is
+stopped or paused is counted again, in the notch and in the interface alike, and one you keep
+from qass is never held under With qass.
 
 ## Detected agents
 
