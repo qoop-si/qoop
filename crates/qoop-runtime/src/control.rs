@@ -708,8 +708,8 @@ pub enum ControlRequest {
         token: Option<String>,
         action: TelemetryOp,
     },
-    /// Until when a person is at a terminal (typing there, or a line just sent), so another
-    /// sender does not type over them. A daemon from before it answers `unknown variant`.
+    /// Until when a person is at a terminal (an unsent draft there), so another sender
+    /// does not type over it. A daemon from before it answers `unknown variant`.
     PersonAt {
         id: String,
         terminal: TerminalStream,

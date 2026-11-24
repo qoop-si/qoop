@@ -111,9 +111,10 @@ The plugin's writes into any other terminal follow the rules above and below.
 One more exception: a key a person presses in a plugin's own pane lets that plugin send text and
 keys (not `agent prompt`) into the terminals of the pane's tab for the next 10 seconds, until
 its first write that ends in Enter.
-It passes only the hold that a line the person sent puts on a terminal (120 seconds); a draft
-they are typing there, a trust prompt, a blocked agent and a sleeping tab still refuse. Hooks,
-startup commands and actions started from the palette never get it.
+A line the person already sent holds no write at all (only an unsent draft does, so this
+pass no longer lifts a hold); a draft they are typing there, a trust prompt, a blocked agent and a
+sleeping tab refuse as before. Hooks, startup commands and actions started from the palette never
+get it.
 
 A plugin cannot report an agent's state: `pane.report_agent` is an unknown method here, and
 `agent report` is not a command. It never gets a terminal's token, because qoop strips its own

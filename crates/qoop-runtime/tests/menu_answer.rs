@@ -583,3 +583,72 @@ async fn who_answered_is_on_a_persons_row_for_a_while_and_never_on_a_programs() 
         }
     }
 }
+
+/// Until when a person is at `terminal`, as `PersonAt` says: `None` when nobody is.
+async fn person_until(client: &mut TestClient, terminal: u32) -> Option<i64> {
+    match Box::pin(client.control(
+        &ControlRequest::PersonAt {
+            id: "p".into(),
+            terminal,
+        },
+        PATIENCE,
+    ))
+    .await
+    {
+        Some(ControlResponse::PersonAt { until, .. }) => until,
+        other => panic!("no answer: {other:?}"),
+    }
+}
+
+/// A dialog answered from a card, the phone or the interface is no draft: the keys of the
+/// answer (a lone `1`, or the words and their Enter) must not hold the tab against
+/// `qoop prompt` for the three minutes a draft does.
+#[tokio::test]
+async fn an_answered_dialog_leaves_no_draft_holding_the_tab() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent = claude_shaped(dir.path());
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = token_of(&d, terminal);
+    let mut owner = d.attach("owner").await;
+    let mut ui = d.attach(qoop_proto::INTERFACE_ID).await;
+    let mut program = d.attach("qoop-agents").await;
+    start_aider(&d, &mut owner, terminal, &agent).await;
+
+    let (shown, generation) = blocked_menu(&mut owner, &mut ui, terminal, &token, None).await;
+    let typed = answer_text(&mut ui, terminal, generation, &shown, "3", "do it").await;
+    assert!(
+        matches!(
+            typed,
+            Some(ControlResponse::MenuAnswered { answers: true, .. })
+        ),
+        "{typed:?}"
+    );
+    assert!(
+        owner
+            .wait_for_text_on(terminal, "got:do it", PATIENCE)
+            .await
+    );
+    assert_eq!(
+        person_until(&mut program, terminal).await,
+        None,
+        "the words and their Enter are an answer, not a draft"
+    );
+
+    // The same menu again, answered with a lone key (no Enter after it).
+    owner.input_to(terminal, b"M").await;
+    let (again, generation) = blocked_menu(&mut owner, &mut ui, terminal, &token, None).await;
+    let key = answer(&mut ui, terminal, generation, &again).await;
+    assert!(
+        matches!(
+            key,
+            Some(ControlResponse::MenuAnswered { answers: true, .. })
+        ),
+        "{key:?}"
+    );
+    assert_eq!(
+        person_until(&mut program, terminal).await,
+        None,
+        "a lone key of an answer is no draft"
+    );
+}

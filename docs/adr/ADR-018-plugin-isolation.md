@@ -116,8 +116,8 @@ content and rechecked at every run:
 ## Amendment, 2026-11-16: the person grant and the own-pane pass
 
 - Two exceptions loosen the refusal above. A person's key in a plugin's own pane lets that
-  plugin write once into its tab within 10 s, past the hold a sent line puts on a terminal (never
-  past a draft). And a plugin's write into a pane it opened, still running its program, is never
+  plugin write once into its tab within 10 s (never past a draft). Since a line a person already
+  sent holds no write any more, only a draft does, this pass lifts nothing of the person's hold. And a plugin's write into a pane it opened, still running its program, is never
   held by a person there (a sidebar closing itself with `ctrl+q`).
 - Both are a courtesy against a plugin's mistakes, not a boundary against a process of the same
   user. The host knows who asks, and what runs in a pane, from the starting environment of a

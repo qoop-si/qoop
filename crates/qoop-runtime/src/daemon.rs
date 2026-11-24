@@ -12760,7 +12760,7 @@ async fn terminal_task(
                                 handle.set_menu(None);
                             }
                             let bytes = sent.keys.into_bytes();
-                            agents.note_person(stream, &bytes, false, kind, crate::agents::now_unix());
+                            agents.note_answer(stream, kind, crate::agents::now_unix());
                             ClientCommand::Input {
                                 from,
                                 bytes: Bytes::from(bytes),

@@ -344,18 +344,15 @@ pub struct AgentRegistry {
     /// answers too), as unix seconds: what tells an answer to a parked agent from a key that
     /// only moved something.
     sent_at_unix: Mutex<BTreeMap<u32, i64>>,
-    /// When a person last pressed a key in each terminal, and when they last sent a line there,
-    /// as unix seconds: only a person's connection (not `qoop prompt` or `qoop send`), only keys
-    /// a person presses ([`person_key`]). What another sender must not type over.
+    /// When a person last pressed a key in each terminal, as unix seconds: only a person's
+    /// connection (not `qoop prompt` or `qoop send`), only keys a person presses
+    /// ([`person_key`]). With `person_draft`, what another sender must not type over.
     person_typed: Mutex<BTreeMap<u32, i64>>,
-    person_sent: Mutex<BTreeMap<u32, i64>>,
-    /// Terminals where a person pressed keys after the last line they sent: a draft, kept as
-    /// its own fact so a line and a new draft in the same second are told apart.
+    /// Terminals where a person pressed keys after the last line they sent: an unsent draft.
+    /// Only a draft holds a terminal; a line already sent holds nothing.
     person_draft: Mutex<std::collections::BTreeSet<u32>>,
 }
 
-/// A person who sent a line into a terminal is at it for this long.
-pub const PERSON_SENT_SECS: i64 = 120;
 /// A person who typed and sent nothing (a draft, or an Esc and a thought) for this long.
 pub const PERSON_DRAFT_SECS: i64 = 180;
 /// How often the same kind of client typing on in a terminal is news again: under the ten
@@ -380,11 +377,29 @@ pub fn person_key(bytes: &[u8]) -> bool {
     false
 }
 
-/// The length of the escape sequence at the start of `bytes` (which starts with Esc): a CSI up
-/// to its final byte, an SS3 key, an OSC or DCS up to its terminator, else Esc and one byte.
-/// A return, or Enter as a kitty key report (`ESC[13u`, `ESC[13;1u`).
+/// A return, or Enter as a kitty key report (`ESC[13u`, `ESC[13;1u`, `ESC[13;1:1u`, keypad
+/// `ESC[57414u`; lock bits 64 and 128 in the modifier field are ignored). Shift+Enter and
+/// Ctrl+Enter are a new line inside a draft, not a send, and a key release is no key at all.
 fn is_enter(key: &[u8]) -> bool {
-    matches!(key, b"\r" | b"\n") || (key.starts_with(b"\x1b[13") && key.ends_with(b"u"))
+    matches!(key, b"\r" | b"\n")
+        || kitty_key(key).is_some_and(|(code, mods, event)| {
+            matches!(code, 13 | 57414) && event != KITTY_RELEASE && (mods - 1) & !(64 | 128) == 0
+        })
+}
+
+const KITTY_RELEASE: u32 = 3;
+
+/// A kitty key report `ESC[code[:alt];mods[:event]...u` as (code, modifiers, event type): the
+/// modifiers default to 1 (none) and the event type to 1 (press).
+fn kitty_key(seq: &[u8]) -> Option<(u32, u32, u32)> {
+    let num = |field: &[u8]| std::str::from_utf8(field).ok()?.parse::<u32>().ok();
+    let body = seq.strip_prefix(b"\x1b[")?.strip_suffix(b"u")?;
+    let mut fields = body.split(|b| *b == b';');
+    let code = num(fields.next()?.split(|b| *b == b':').next()?)?;
+    let mut mods = fields.next().unwrap_or_default().split(|b| *b == b':');
+    let modifiers = mods.next().and_then(num).unwrap_or(1).max(1);
+    let event = mods.next().and_then(num).unwrap_or(1);
+    Some((code, modifiers, event))
 }
 
 /// Whether input holds an Enter anywhere, a pasted line's return too.
@@ -404,6 +419,8 @@ fn has_enter(bytes: &[u8]) -> bool {
     false
 }
 
+/// The length of the escape sequence at the start of `bytes` (which starts with Esc): a CSI up
+/// to its final byte, an SS3 key, an OSC or DCS up to its terminator, else Esc and one byte.
 fn sequence_len(bytes: &[u8]) -> usize {
     match bytes.get(1) {
         None => 1,
@@ -428,13 +445,16 @@ fn sequence_len(bytes: &[u8]) -> usize {
 
 /// One escape sequence as a key a person pressed: a lone Esc, Alt and a key (`ESC x`), SS3
 /// keys (`ESC O A`..`ESC O S`), or a CSI with digits, `;` and `:` only that ends in an arrow,
-/// Home, End, F1, F2, F4, `~` or a kitty key report (`ESC[27u`). Not a mouse, focus, colour,
-/// device or mode report, nor a DCS or OSC reply: an allow list, since terminals answer in
+/// Home, End, F1, F2, F4, `~` or a kitty key report (`ESC[27u`), but not a kitty key release.
+/// Not a mouse, focus, colour, device or mode report, nor a DCS or OSC reply: an allow list, since terminals answer in
 /// many shapes. A bracketed paste reaches [`AgentRegistry::note_person`] as a paste.
 fn one_key(seq: &[u8]) -> bool {
     let Some(rest) = seq.strip_prefix(b"\x1b") else {
         return !seq.is_empty();
     };
+    if kitty_key(seq).is_some_and(|(_, _, event)| event == KITTY_RELEASE) {
+        return false;
+    }
     match rest {
         [] => true,
         [b'O', k] => matches!(k, b'A'..=b'D' | b'H' | b'F' | b'P'..=b'S'),
@@ -978,7 +998,6 @@ impl AgentRegistry {
             sent_at_unix: Mutex::new(BTreeMap::new()),
             person_typed: Mutex::new(BTreeMap::new()),
             seen: Mutex::new(BTreeMap::new()),
-            person_sent: Mutex::new(BTreeMap::new()),
             person_draft: Mutex::new(std::collections::BTreeSet::new()),
             changes: tokio::sync::broadcast::channel(64).0,
             announce_due: Arc::new(Mutex::new(BTreeSet::new())),
@@ -1231,7 +1250,7 @@ impl AgentRegistry {
     }
 
     /// Input from a person's own connection: a key they pressed stamps the draft clock, a line
-    /// with a return the sent one. A paste is typed, never sent: its return waits for theirs.
+    /// with a return ends the draft. A paste is typed, never sent: its return waits for theirs.
     ///
     /// `kind` is the kind of client the keys came from (`AgentRow::typed_by`). A change of
     /// kind is news at once; the same kind typing on is news again every [`TYPING_NEWS_SECS`],
@@ -1248,6 +1267,43 @@ impl AgentRegistry {
         if !paste && !person_key(bytes) {
             return;
         }
+        self.stamp_person(stream, kind, now_unix);
+        // A return, or Enter as a kitty key report (`ESC[13u`, `ESC[13;1u`), sends the line and
+        // ends the draft; any key after the last one in the same read starts the next draft.
+        let (mut sent, mut after) = (false, false);
+        let mut rest = bytes;
+        while !rest.is_empty() && !paste {
+            let len = if rest[0] == 0x1b {
+                sequence_len(rest)
+            } else {
+                1
+            };
+            let key = &rest[..len];
+            if is_enter(key) {
+                (sent, after) = (true, false);
+            } else if one_key(key) {
+                after = true;
+            }
+            rest = &rest[len..];
+        }
+        let mut draft = self.person_draft.lock().unwrap();
+        if !sent || after {
+            draft.insert(stream);
+        } else {
+            draft.remove(&stream);
+        }
+    }
+
+    /// A person's answer to an agent's dialog (the question card, the phone, the interface):
+    /// it says who typed, as [`Self::note_person`] does, and leaves the draft as it was. The
+    /// keys of an answer are no draft, and a draft typed before the dialog came up stays.
+    pub fn note_answer(&self, stream: u32, kind: &'static str, now_unix: i64) {
+        self.stamp_person(stream, kind, now_unix);
+    }
+
+    /// What a person's input says about who is at this terminal: the clock, the finish seen, the
+    /// news of typing.
+    fn stamp_person(&self, stream: u32, kind: &'static str, now_unix: i64) {
         self.person_typed.lock().unwrap().insert(stream, now_unix);
         // A person typing here has the finish in front of them.
         self.mark_seen(stream, None);
@@ -1267,49 +1323,16 @@ impl AgentRegistry {
         if news {
             self.announce_soon(stream);
         }
-        // A return, or Enter as a kitty key report (`ESC[13u`, `ESC[13;1u`), sends the line and
-        // ends the draft; any key after the last one in the same read starts the next draft.
-        let (mut sent, mut after) = (false, false);
-        let mut rest = bytes;
-        while !rest.is_empty() && !paste {
-            let len = if rest[0] == 0x1b {
-                sequence_len(rest)
-            } else {
-                1
-            };
-            let key = &rest[..len];
-            if is_enter(key) {
-                (sent, after) = (true, false);
-            } else if one_key(key) {
-                after = true;
-            }
-            rest = &rest[len..];
-        }
-        if sent {
-            self.person_sent.lock().unwrap().insert(stream, now_unix);
-        }
-        let mut draft = self.person_draft.lock().unwrap();
-        if !sent || after {
-            draft.insert(stream);
-        } else {
-            draft.remove(&stream);
-        }
     }
 
-    /// Until when a person is at this terminal, as unix seconds, `None` when nobody is: a line
-    /// they sent holds it [`PERSON_SENT_SECS`], keys they pressed after their last line (a
-    /// draft) [`PERSON_DRAFT_SECS`].
+    /// Until when a person is at this terminal, as unix seconds, `None` when nobody is: only an
+    /// unsent draft holds it, [`PERSON_DRAFT_SECS`] after the last key. A line already sent
+    /// holds nothing.
     pub fn person_until(&self, stream: u32, now_unix: i64) -> Option<i64> {
         let typed = self.person_typed.lock().unwrap().get(&stream).copied();
-        let sent = self.person_sent.lock().unwrap().get(&stream).copied();
-        let draft = typed
+        typed
             .filter(|_| self.person_draft.lock().unwrap().contains(&stream))
-            .map(|t| t + PERSON_DRAFT_SECS);
-        let line = sent.map(|s| s + PERSON_SENT_SECS);
-        draft
-            .into_iter()
-            .chain(line)
-            .max()
+            .map(|t| t + PERSON_DRAFT_SECS)
             .filter(|until| *until > now_unix)
     }
 
@@ -1501,7 +1524,6 @@ impl AgentRegistry {
         self.sent_at_unix.lock().unwrap().remove(&stream);
         self.person_typed.lock().unwrap().remove(&stream);
         self.seen.lock().unwrap().remove(&stream);
-        self.person_sent.lock().unwrap().remove(&stream);
         self.person_draft.lock().unwrap().remove(&stream);
         self.commands.lock().unwrap().remove(&stream);
         self.typed_by.lock().unwrap().remove(&stream);
@@ -2328,7 +2350,7 @@ mod tests {
             b"\x1b[3~",
             b"\x1bOP",
             b"\x1bb",
-            b"\x1b[97;1:3u",
+            b"\x1b[97;1:1u",
             b"ab\x1b[D",
             b"\x1b[Ahello",
             b"\x1b[I\x1b[A",
@@ -2337,6 +2359,7 @@ mod tests {
         }
         for not in [
             &b""[..],
+            b"\x1b[97;1:3u",
             b"\x1b[<0;10;5M",
             b"\x1b[M !!",
             b"\x1b[I",
@@ -2356,22 +2379,33 @@ mod tests {
         }
     }
 
-    /// A line holds the tab two minutes, a draft (keys after it, an Esc) three; both run out.
+    /// Only an unsent draft (keys after the last line, a paste, an Esc) holds a tab, three
+    /// minutes after the last key. A line a person sent holds nothing, and keys in another
+    /// tab hold this one not at all.
     #[test]
-    fn a_person_holds_a_tab_while_they_type_or_just_sent() {
+    fn only_a_draft_holds_a_tab() {
         let r = registry();
         assert_eq!(r.person_until(4, NOW), None);
         r.note_person(4, b"\x1b[<0;1;1M", false, "computer", NOW);
         assert_eq!(r.person_until(4, NOW), None, "a mouse report is nobody");
         r.note_person(4, b"go on\r", false, "computer", NOW);
-        assert_eq!(r.person_until(4, NOW + 10), Some(NOW + PERSON_SENT_SECS));
-        assert_eq!(r.person_until(4, NOW + PERSON_SENT_SECS), None);
+        assert_eq!(
+            r.person_until(4, NOW + 1),
+            None,
+            "a sent line holds nothing"
+        );
         r.note_person(4, b"\x1b", false, "computer", NOW + 200);
         assert_eq!(
             r.person_until(4, NOW + 210),
             Some(NOW + 200 + PERSON_DRAFT_SECS)
         );
+        assert_eq!(r.person_until(5, NOW + 210), None, "another tab is free");
         r.note_person(4, b"ok\r", false, "computer", NOW + 230);
+        assert_eq!(
+            r.person_until(4, NOW + 231),
+            None,
+            "the line ended the draft"
+        );
         r.note_person(4, b"and th", false, "computer", NOW + 230);
         assert_eq!(
             r.person_until(4, NOW + 231),
@@ -2384,12 +2418,6 @@ mod tests {
             Some(NOW + 240 + PERSON_DRAFT_SECS),
             "a key after a kitty Enter is a new draft"
         );
-        r.note_person(4, b"\x1b[13u", false, "computer", NOW + 250);
-        assert_eq!(
-            r.person_until(4, NOW + 251),
-            Some(NOW + 250 + PERSON_SENT_SECS),
-            "a kitty Enter sends"
-        );
         r.note_person(4, b"half a sente", true, "computer", NOW + 300);
         assert_eq!(
             r.person_until(4, NOW + 301),
@@ -2398,6 +2426,66 @@ mod tests {
         );
         r.forget(4);
         assert_eq!(r.person_until(4, NOW + 301), None);
+    }
+
+    /// Every way a terminal reports a plain Enter sends the line; Shift+Enter and Ctrl+Enter
+    /// are a new line inside a draft; a key release is neither an Enter nor a key.
+    #[test]
+    fn a_kitty_enter_sends_but_a_modified_one_keeps_the_draft() {
+        let after = |bytes: &[u8]| {
+            let r = registry();
+            r.note_person(4, b"x", false, "computer", NOW);
+            r.note_person(4, bytes, false, "computer", NOW + 1);
+            r.person_until(4, NOW + 2)
+        };
+        let draft = Some(NOW + 1 + PERSON_DRAFT_SECS);
+        for enter in [
+            &b"\r"[..],
+            b"\x1b[13u",
+            b"\x1b[13;1u",
+            b"\x1b[13;1:1u",
+            b"\x1b[13;65u",
+            b"\x1b[13;129u",
+            b"\x1b[57414u",
+        ] {
+            assert_eq!(after(enter), None, "{enter:?} sends");
+        }
+        for newline in [&b"\x1b[13;2u"[..], b"\x1b[13;5u", b"\x1b[13;2:1u"] {
+            assert_eq!(
+                after(newline),
+                draft,
+                "{newline:?} is a new line, not a send"
+            );
+        }
+        // A key release is no key: it never starts a draft after a send ...
+        assert_eq!(
+            after(b"\x1b[13u\x1b[107;1:3u"),
+            None,
+            "a release after Enter"
+        );
+        // ... and a release of Enter does not end a draft typed after it.
+        assert_eq!(
+            after(b"\x1b[13u\x1b[97u\x1b[13;1:3u"),
+            draft,
+            "an Enter release after a new key"
+        );
+    }
+
+    /// An answer to a dialog says who typed and leaves the draft as it was: it neither makes
+    /// a draft nor ends one a person typed before the dialog came up.
+    #[test]
+    fn an_answer_to_a_dialog_leaves_the_draft_alone() {
+        let r = registry();
+        r.note_answer(4, "computer", NOW);
+        assert_eq!(r.person_until(4, NOW + 1), None, "no draft made");
+        assert_eq!(r.typed_by(4).map(|t| t.at), Some(NOW), "but it typed");
+        r.note_person(4, b"half", false, "computer", NOW + 10);
+        r.note_answer(4, "computer", NOW + 20);
+        assert_eq!(
+            r.person_until(4, NOW + 21),
+            Some(NOW + 20 + PERSON_DRAFT_SECS),
+            "a draft stays, its clock moved by the answer"
+        );
     }
 
     /// What one registry exports another adopts, through the file between them: the same
