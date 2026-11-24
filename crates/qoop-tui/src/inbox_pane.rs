@@ -1997,9 +1997,14 @@ impl Pane {
         let n = inbox.count;
         let from_qass = inbox.items.iter().filter(|i| i.kind.from_qass()).count();
         let qass = match env.hand.qass_off() {
-            None => "\u{25c6} qass watching",
-            Some(why) if why.contains("watching") => "\u{25c6} qass not watching",
-            Some(_) => "\u{25c6} qass not running",
+            None => "\u{25c6} qass watching".to_string(),
+            Some(why) if why.contains("watching") => "\u{25c6} qass not watching".to_string(),
+            // When it was last seen running comes from the client's own record, in the words
+            // the ledger and the desktop use.
+            Some(_) => format!(
+                "\u{25c6} qass not running, {}",
+                env.beside.reach.qass_seen()
+            ),
         };
         let mut units = vec![Unit {
             role: if self.board {
@@ -2045,7 +2050,7 @@ impl Pane {
             text: "board".into(),
             hit: Some(Hit::Board(true)),
         });
-        units.push(unit(Role::FaintText, qass, None));
+        units.push(unit(Role::FaintText, &qass, None));
         flow(units, 1, 3, cols)
     }
 
@@ -2941,6 +2946,34 @@ mod tests {
         let ok = clock.as_bytes()[2] == b':'
             && clock.chars().filter(|c| c.is_ascii_digit()).count() == 4;
         assert!(ok, "{said}");
+    }
+
+    /// The header says when qass was last seen running, from the client's own record, and the
+    /// plain words stand when this window never saw it run (QOOP-71, round 5b).
+    #[test]
+    fn the_header_of_a_stopped_qass_says_when_it_was_last_seen() {
+        let mut w = world("normal");
+        w.hand.qass = None;
+        let (pane, ready) = armed(&w, Instant::now());
+        let head = pane.view(&env(&w, ready), 120, 2000).plain[0].clone();
+        assert!(
+            head.contains("qass not running, not seen running since this window opened"),
+            "{head:?}"
+        );
+        let mut reach = crate::places::Reach::default();
+        reach.note_qass(true, 1_763_000_000);
+        let said = clock(1_763_000_000);
+        let beside: &'static Beside<'static> = Box::leak(Box::new(Beside {
+            reach: Box::leak(Box::new(reach)),
+            ..*w.beside
+        }));
+        w.beside = beside;
+        let (pane, ready) = armed(&w, Instant::now());
+        let head = pane.view(&env(&w, ready), 120, 2000).plain[0].clone();
+        assert!(
+            head.contains(&format!("qass not running, last seen running at {said}")),
+            "{head:?}"
+        );
     }
 
     #[test]

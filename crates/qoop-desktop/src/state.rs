@@ -1393,10 +1393,7 @@ pub fn qass_said(stand: &qoop_tui::ledger::Stand, seen: Option<&str>, lost: &[St
         Stand::Paused => "paused: it wakes only when you write to it".to_string(),
         Stand::Stopped => format!(
             "stopped, {}. What it held is back in your Inbox, and new questions come straight to you.",
-            match seen {
-                Some(at) => format!("last seen running at {at}"),
-                None => "not seen running since this window opened".to_string(),
-            }
+            qoop_tui::places::seen_running(seen)
         ),
         Stand::Watching { agents, on, of } => {
             let mut said = format!("watching {}", plural(*agents, "agent"));

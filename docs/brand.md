@@ -84,6 +84,19 @@ cream letters on the lower three dot rows of its row, and the two tails as one e
 each alone on the row under it (`⠀⠁⠀⠀⠀⠀⠁⠀`): the q's in the q's second cell, the p's in the
 p's first. Where braille is not drawn that small word is `● qoop` in ember.
 
+## qass's mark
+
+qass is the nine-dot grid with its four corners lit and the five dots between them faint: the
+q is the ring, qass is the corners. The corners wear the surface's ink (cream on the ground,
+ground on cream) and the five between them the same ink at a faint step. Ember stays the q's
+tail's and the p's alone, so qass never reads as the brand itself. It is drawn as two layers
+on a 24 box with dots of radius 2.9, the corners at 3.43 and 20.57 on both axes and the other
+five at 3.43, 12 and 20.57 on the lines through the centre, so the corners can take the ink and
+the rest the faint step: the inline assets `icons/qass-lit.svg` and `icons/qass-dim.svg` (the
+four corners, the other five), composed by `qass_mark`, all in `crates/qoop-desktop/src/ui.rs`. The desktop puts it where qass is the one acting: the qass
+page's title, what it holds under Now and the line that points at its questions in the Inbox,
+and the chat drawer's header. The terminal names qass in words and with the diamond `◆`.
+
 ## State marks
 
 Every agent wears a picture in the same three by three grid, in its state's colour, two

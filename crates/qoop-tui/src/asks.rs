@@ -341,12 +341,12 @@ pub fn talk_target(card: &AskInfo, rows: &[AgentRow], spaces: &[WorkspaceRow]) -
         .or_else(|| named(&said, &workers))
 }
 
-/// `text` wrapped on words into rows of `cols` columns, at most `max` of them; a word longer than a
-/// row breaks on a character, and when text remains the last row ends in `\u{2026}`. With one row
-/// it is [`cut_dots`].
-fn wrap_dots(text: &str, cols: usize, max: usize) -> Vec<String> {
-    if max <= 1 || width::width(text) <= cols {
-        return vec![cut_dots(text, cols)];
+/// `text` wrapped on words into rows of `cols` columns, every word kept: what the Inbox, the
+/// columns and the places draw their words with, so none is ever cut, not even by an ellipsis. A
+/// word longer than a row breaks on a character.
+pub(crate) fn wrap_whole(text: &str, cols: usize) -> Vec<String> {
+    if width::width(text) <= cols {
+        return vec![text.to_string()];
     }
     let mut rows = vec![String::new()];
     let mut used = 0;
@@ -365,14 +365,28 @@ fn wrap_dots(text: &str, cols: usize, max: usize) -> Vec<String> {
             rows.push(String::new());
             used = 0;
         }
+        // Where this word starts in the row it is on, so a break can fall after a `-`, `/`, `_` or
+        // `.` of it rather than in the middle of a name.
+        let mut word_at = rows.last().map_or(0, String::len);
         for c in chars {
             let cw = width::columns(c);
             if cw > cols {
                 continue;
             }
             if used + cw > cols {
-                rows.push(String::new());
-                used = 0;
+                let mut carry = String::new();
+                if let Some(row) = rows.last_mut() {
+                    let broke = row[word_at..]
+                        .rfind(['-', '/', '_', '.'])
+                        .map(|at| word_at + at + 1)
+                        .filter(|at| *at > word_at + 1 && *at < row.len());
+                    if let Some(at) = broke {
+                        carry = row.split_off(at);
+                    }
+                }
+                used = width::width(&carry);
+                rows.push(carry);
+                word_at = 0;
             }
             if let Some(r) = rows.last_mut() {
                 r.push(c);
@@ -380,40 +394,7 @@ fn wrap_dots(text: &str, cols: usize, max: usize) -> Vec<String> {
             used += cw;
         }
     }
-    if rows.len() > max {
-        rows.truncate(max);
-        if let Some(last) = rows.last_mut() {
-            *last = cut_dots(&format!("{last}\u{2026}"), cols);
-        }
-    }
     rows
-}
-
-/// `text` wrapped on words into rows of `cols` columns, every word kept: what the Inbox
-/// draws a card's words with, so none is ever cut.
-pub(crate) fn wrap_whole(text: &str, cols: usize) -> Vec<String> {
-    wrap_dots(text, cols, usize::MAX)
-}
-
-/// `text` cut to `cols` columns with a closing `\u{2026}` when it did not fit, never after a
-/// space.
-pub(crate) fn cut_dots(text: &str, cols: usize) -> String {
-    if width::width(text) <= cols {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in text.chars().filter(|c| width::drawn(*c)) {
-        let w = width::columns(c);
-        if used + w + 1 > cols {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    let mut out = out.trim_end().to_string();
-    out.push('\u{2026}');
-    out
 }
 
 #[cfg(test)]
@@ -600,22 +581,37 @@ mod tests {
     }
 
     #[test]
-    fn wrap_dots_wraps_on_words_and_ends_in_dots_only_when_text_is_left() {
-        assert_eq!(wrap_dots("ab cd ef", 5, 3), ["ab cd", "ef"]);
-        assert_eq!(wrap_dots("ab cd", 5, 3), ["ab cd"]);
-        assert_eq!(wrap_dots("abcdefgh ij", 4, 5), ["abcd", "efgh", "ij"]);
-        assert_eq!(wrap_dots("ab cd ef gh ij", 5, 2), ["ab cd", "ef g\u{2026}"]);
-        assert_eq!(wrap_dots("ab cd ef gh", 5, 1), [cut_dots("ab cd ef gh", 5)]);
+    fn wrap_whole_wraps_on_words_and_keeps_every_one() {
+        assert_eq!(wrap_whole("ab cd ef", 5), ["ab cd", "ef"]);
+        assert_eq!(wrap_whole("ab cd", 5), ["ab cd"]);
+        assert_eq!(wrap_whole("abcdefgh ij", 4), ["abcd", "efgh", "ij"]);
+        // A name longer than a row breaks after a `-`, `/`, `_` or `.` when there is one in the
+        // row, and on a character when there is not; every character is kept either way.
         assert_eq!(
-            wrap_dots("\u{4e2d}\u{4e2d}\u{4e2d}", 4, 3),
+            wrap_whole("customer-portal-redesign-and-billing", 20),
+            ["customer-portal-", "redesign-and-billing"]
+        );
+        assert_eq!(wrap_whole("a/bcdefgh", 5), ["a/", "bcdef", "gh"]);
+        assert_eq!(wrap_whole("ab cd-efghij", 6), ["ab", "cd-", "efghij"]);
+        // A break leaves at least two columns before it, so what moves down always fits, a wide
+        // character included, and no row holds a separator alone.
+        assert_eq!(wrap_whole("-abcdefghij", 5), ["-abcd", "efghi", "j"]);
+        assert_eq!(wrap_whole("-abcd\u{4e2d}", 5), ["-abcd", "\u{4e2d}"]);
+        assert_eq!(
+            wrap_whole("ab cd ef gh ij", 5),
+            ["ab cd", "ef gh", "ij"],
+            "no row is dropped for a last one ending in an ellipsis"
+        );
+        assert_eq!(
+            wrap_whole("\u{4e2d}\u{4e2d}\u{4e2d}", 4),
             ["\u{4e2d}\u{4e2d}", "\u{4e2d}"]
         );
         assert_eq!(
-            wrap_dots("\u{4e2d}x", 1, 3),
+            wrap_whole("\u{4e2d}x", 1),
             ["x"],
             "a wide char that never fits is dropped"
         );
-        assert_eq!(wrap_dots("", 5, 3), [""]);
+        assert_eq!(wrap_whole("", 5), [""]);
     }
 
     #[test]

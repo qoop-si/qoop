@@ -840,7 +840,7 @@ pub(crate) fn drag_chip(
     more: usize,
 ) -> (String, crate::theme::Role, String) {
     let (role, _) = dot_of(c, agent);
-    let name = chip_name(&session_name(agent));
+    let name = session_name(agent);
     let name = if more > 0 {
         format!("{name} (+{more})")
     } else {
@@ -848,15 +848,6 @@ pub(crate) fn drag_chip(
     };
     (cell_mark(role, false, 0), role, name)
 }
-
-/// A dragged row's name as its chip shows it, shortened in the middle.
-pub(crate) fn chip_name(name: &str) -> String {
-    shorten_middle(name, DRAG_CHIP_NAME)
-}
-
-/// The most columns a dragged row's name takes in its chip: enough to tell agents apart,
-/// short enough that the chip does not cover the pane it is being dragged over.
-const DRAG_CHIP_NAME: usize = 24;
 
 /// The rows above the list, the foot rows kept, and how many rows the list gets between.
 fn parts(
@@ -1340,7 +1331,9 @@ fn content(c: &Column) -> Vec<Row> {
                 }
                 // A search shows what it found, so it opens every fold it finds things in.
                 let open = !query.is_empty() || !c.shut.contains(&space.id);
-                out.push((rule(c, space, &tabs, open), Some(Hit::Space(space.id))));
+                for line in rule(c, space, &tabs, open) {
+                    out.push((line, Some(Hit::Space(space.id))));
+                }
                 // The rows are laid out for the space's inside, one column in from each edge.
                 let inside = Column {
                     width: box_inside(c.width),
@@ -1353,9 +1346,12 @@ fn content(c: &Column) -> Vec<Row> {
                         continue;
                     }
                     let hit = Some(Hit::Terminal(tab.terminal));
-                    out.push((boxed(tree_line(&inside, tab), c.width), hit));
-                    let (line, hit) = second_row(&inside, tab, 2, place_of(tab, space));
-                    out.push((boxed(line, c.width), hit));
+                    for line in tree_line(&inside, tab) {
+                        out.push((boxed(line, c.width), hit));
+                    }
+                    for (line, hit) in second_rows(&inside, tab, 2, place_of(tab, space)) {
+                        out.push((boxed(line, c.width), hit));
+                    }
                 }
                 // A sleeping space has no terminals, only the tabs a wake brings back: one
                 // faint row each, under the same fold as live tabs. In an awake space two or
@@ -1372,10 +1368,9 @@ fn content(c: &Column) -> Vec<Row> {
                 }
                 for tab in asleep {
                     if (open && listed) || tab.terminal == c.focused_terminal {
-                        out.push((
-                            boxed(sleeping_line(&inside, tab, space), c.width),
-                            Some(Hit::Terminal(tab.terminal)),
-                        ));
+                        for line in sleeping_line(&inside, tab, space) {
+                            out.push((boxed(line, c.width), Some(Hit::Terminal(tab.terminal))));
+                        }
                     }
                 }
                 out.push((box_bottom(c.width), None));
@@ -1387,8 +1382,8 @@ fn content(c: &Column) -> Vec<Row> {
                     && !c.spaces.iter().any(|s| s.id == a.workspace)
                     && fits(query, || agent_text(a, None))
             }) {
-                out.push((flat_line(c, agent), Some(Hit::Terminal(agent.terminal))));
-                out.push(second_row(c, agent, DOT_AT + 2, None));
+                out.extend(entry_rows(c, agent_entry(c, agent, false)));
+                out.extend(second_rows(c, agent, DOT_AT + 2, None));
             }
             if out.is_empty() && !query.is_empty() {
                 out.push((nothing_found(c.width), None));
@@ -2050,7 +2045,7 @@ fn pick_hit(pick: Pick) -> Hit {
 /// agent wants a person, so a fold never hides a blocked agent silently. Open, the count
 /// stays grey: the agents are right there, wearing their own marks. Only agents colour it:
 /// a shell never wants a person.
-fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Line {
+fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Vec<Line> {
     use crate::theme::Role;
     let width = c.width;
     // A space qass leaves alone wears its name one step quieter, a sleeping one's calm ink
@@ -2128,25 +2123,35 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
             .saturating_sub(NAME_AT + lead)
             .saturating_sub(crate::width::width(slot))
     };
-    let slot = slots
-        .iter()
-        .find(|slot| room(slot) >= MIN_NAME_COLS)
-        .or(slots.last())
-        .cloned()
-        .unwrap_or_default();
-    let slot_w = crate::width::width(&slot);
     // A down link's reason after the name, as the mux sends it beside the name.
     let named = space.link_reason.as_ref().map_or_else(
         || space.name.clone(),
         |why| format!("{} ({why})", space.name),
     );
-    let name = shorten_middle(&named, room(&slot));
+    // The fullest count that leaves the whole name on one row; when none does, the shortest count
+    // that leaves a name its columns, which then wraps; and only then no count at all.
+    let named_w = crate::width::width(&named).max(MIN_NAME_COLS);
+    let counts = || slots.iter().filter(|slot| !slot.is_empty());
+    let slot = counts()
+        .find(|slot| room(slot) >= named_w)
+        .or_else(|| counts().rev().find(|slot| room(slot) >= MIN_NAME_COLS))
+        .or(slots.last())
+        .cloned()
+        .unwrap_or_default();
+    let slot_w = crate::width::width(&slot);
+    // The name is never cut: a long one takes more rows, the controls stay on the first and the
+    // count ends the last.
+    let pieces = crate::asks::wrap_whole(&named, room(&slot));
+    let name = pieces.first().cloned().unwrap_or_default();
     let name_w = crate::width::width(&name);
+    let slot_at = |piece: &str| NAME_AT + lead + crate::width::width(piece);
     let fold = if folds(c, space.id) {
         if open { "\u{25be}" } else { "\u{25b8}" }
     } else {
         " "
     };
+    let slot_role = if space.asleep { Role::Sleeping } else { mark };
+    let single = pieces.len() <= 1;
     let mut runs = Vec::new();
     if fold != " " {
         runs.push((0, 1, Role::Faint));
@@ -2154,12 +2159,8 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     if let Some(role) = remote {
         runs.push((NAME_AT, 1, role));
     }
-    if !slot.is_empty() {
-        runs.push((
-            NAME_AT + lead + name_w,
-            slot_w,
-            if space.asleep { Role::Sleeping } else { mark },
-        ));
+    if !slot.is_empty() && single {
+        runs.push((slot_at(&name), slot_w, slot_role));
     }
     let clip = |(at, w, role): (usize, usize, Role)| {
         (at < left_w && w > 0).then(|| (at, w.min(left_w - at), role))
@@ -2171,7 +2172,8 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     } else {
         String::new()
     };
-    let left = fit(&format!("{fold}{prefix}{name}{slot}"), left_w);
+    let first_slot = if single { slot.as_str() } else { "" };
+    let left = fit(&format!("{fold}{prefix}{name}{first_slot}"), left_w);
     // The cells of the block, all in the fold's faint grey: controls are furniture, the
     // name and its slot carry the colour. The cup is the one that says something: full, in
     // the brand ink, while the space is kept awake. The two answers of a question are
@@ -2185,14 +2187,34 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         runs.push((*at, *w, role));
     }
     let text = format!("{left} {}", block.text(width));
-    Line {
+    let mut rows = vec![Line {
         fill: None,
         text: fit(&text, width),
         colour: None,
         accent,
         indicator: None,
         runs,
+    }];
+    // The rest of the name, under the first row's: no controls, the same click.
+    let last = pieces.len().saturating_sub(1);
+    for (at, piece) in pieces.iter().enumerate().skip(1) {
+        let indent = NAME_AT + lead;
+        let ends = at == last && !slot.is_empty();
+        let mut runs = Vec::new();
+        if ends {
+            runs.push((slot_at(piece), slot_w, slot_role));
+        }
+        let tail = if ends { slot.as_str() } else { "" };
+        rows.push(Line {
+            fill: None,
+            text: fit(&format!("{}{piece}{tail}", " ".repeat(indent)), width),
+            colour: None,
+            accent: Some((indent, crate::width::width(piece), ink)),
+            indicator: None,
+            runs,
+        });
     }
+    rows
 }
 
 /// A control's cells: `word`, padded after to `inner` columns. Text only, nothing drawn
@@ -2513,51 +2535,76 @@ fn place_of(agent: &AgentRow, space: &WorkspaceRow) -> Option<String> {
 /// named (or the program, when nobody did) comes back, followed by the directory it runs
 /// in when that says something the space name does not. The row reaches the same
 /// terminal as the name above it.
-fn second_row(c: &Column, agent: &AgentRow, at: usize, place: Option<String>) -> Row {
+fn second_rows(c: &Column, agent: &AgentRow, at: usize, place: Option<String>) -> Vec<Row> {
     use crate::theme::Role;
     let lead = format!("{}\u{2514} ", " ".repeat(at));
     let lead_w = crate::width::width(&lead);
     let room = c.width.saturating_sub(lead_w);
-    let mut runs = vec![(at, 1, Role::Rule)];
-    let text = match said(agent) {
-        Some((what, ink)) => {
-            let what = shorten_middle(&what, room);
-            if spins(agent) && c.tick > 0 {
-                // While it works and the column moves, a band of brighter greys crosses
-                // what it is doing, left to right: the row says "alive" without a word
-                // for it.
-                runs.extend(sweep(&what, lead_w, c.tick));
-            } else if ink != Role::Faint {
-                runs.push((lead_w, crate::width::width(&what), ink));
-            }
-            format!("{lead}{what}")
-        }
+    // The words are never cut: they wrap, the rows after the first indented under them.
+    let (words, ink, dot) = match said(agent) {
+        Some((what, ink)) => (what, Some(ink), None),
         None => {
-            let tail_w = |tail: &str| crate::width::width(tail) + 3;
-            let tab_room = place
-                .as_deref()
-                .map_or(room, |p| room.saturating_sub(tail_w(p)).max(room.min(12)));
-            let tab = shorten_middle(&label(agent), tab_room);
-            let mut text = format!("{lead}{tab}");
-            let rest = room.saturating_sub(crate::width::width(&tab) + 3);
-            // A place is a place and never moves: no band, only the quiet grey.
-            if let Some(place) = place.filter(|_| rest >= 2) {
-                runs.push((crate::width::width(&text) + 1, 1, Role::Rule));
-                text.push_str(" \u{b7} ");
-                text.push_str(&shorten_middle(&place, rest));
+            let tab = label(agent);
+            match place {
+                // A place is a place and never moves: its dot is the quiet grey.
+                Some(place) => {
+                    // The dot is the next character after the label's own, spaces not counted.
+                    let dot = tab.chars().filter(|ch| !ch.is_whitespace()).count();
+                    (format!("{tab} \u{b7} {place}"), None, Some(dot))
+                }
+                None => (tab, None, None),
             }
-            text
         }
     };
-    (
-        Line {
-            text: fit(&text, c.width),
-            colour: Some(Role::Faint),
-            runs,
-            ..Line::default()
-        },
-        Some(Hit::Terminal(agent.terminal)),
-    )
+    let mut seen = 0;
+    crate::asks::wrap_whole(&words, room)
+        .into_iter()
+        .enumerate()
+        .map(|(row, piece)| {
+            let mut runs = Vec::new();
+            if row == 0 {
+                runs.push((at, 1, Role::Rule));
+            }
+            match ink {
+                Some(_) if spins(agent) && c.tick > 0 => {
+                    // While it works and the column moves, a band of brighter greys crosses
+                    // what it is doing, left to right: the row says "alive" without a word
+                    // for it.
+                    runs.extend(sweep(&piece, lead_w, c.tick));
+                }
+                Some(ink) if ink != Role::Faint => {
+                    runs.push((lead_w, crate::width::width(&piece), ink));
+                }
+                _ => {}
+            }
+            if let Some(dot) = dot {
+                let mut col = 0;
+                for ch in piece.chars() {
+                    if !ch.is_whitespace() {
+                        if seen == dot && ch == '\u{b7}' {
+                            runs.push((lead_w + col, 1, Role::Rule));
+                        }
+                        seen += 1;
+                    }
+                    col += crate::width::columns(ch);
+                }
+            }
+            let head = if row == 0 {
+                lead.clone()
+            } else {
+                " ".repeat(lead_w)
+            };
+            (
+                Line {
+                    text: fit(&format!("{head}{piece}"), c.width),
+                    colour: Some(Role::Faint),
+                    runs,
+                    ..Line::default()
+                },
+                Some(Hit::Terminal(agent.terminal)),
+            )
+        })
+        .collect()
 }
 
 /// What an agent's activity says in its state, and the colour it says it in: working
@@ -2880,7 +2927,7 @@ fn dot_of(c: &Column, agent: &AgentRow) -> (crate::theme::Role, bool) {
 /// yet seen) wears the quieter step of it, so the rows that want a person or are working
 /// stand out of their own space without a second hue. The keyboard's own row always wears
 /// the full step: standing on it is reading it. A stale row dims as a whole, as before.
-fn tree_line(c: &Column, agent: &AgentRow) -> Line {
+fn tree_line(c: &Column, agent: &AgentRow) -> Vec<Line> {
     let (role, stale) = dot_of(c, agent);
     let lead = 2;
     // What it costs, flush right, when costs are shown and the column around the box is
@@ -2896,7 +2943,9 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
     // A blank and the crossed eye ahead of the cup and the close, while qass leaves it alone.
     let eye_w = if agent.qass_skip { EYE_W } else { 0 };
     let room = c.width.saturating_sub(lead + tail + LIVE_TAIL + eye_w);
-    let name = shorten_middle(&session_name(agent), room);
+    // The session is never cut: a long one takes more rows, the controls stay on the first.
+    let pieces = crate::asks::wrap_whole(&session_name(agent), room);
+    let name = pieces.first().cloned().unwrap_or_default();
     let mut text = format!("{}{name}", mark_of(c, agent, role));
     let focused = agent.terminal == c.focused_terminal;
     let calm = !focused
@@ -2957,14 +3006,29 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
     ));
     let (text, close) = with_close(&text, c.width);
     runs.push(close);
-    Line {
+    let colour = stale.then_some(crate::theme::Role::Faint);
+    let mut rows = vec![Line {
         fill: None,
         text,
-        colour: stale.then_some(crate::theme::Role::Faint),
+        colour,
         accent: None,
         indicator: Some((0, 2, role)),
         runs,
+    }];
+    // The rest of the name, under the first row's name: no mark and no controls, the same click.
+    for piece in pieces.iter().skip(1) {
+        let runs = (!stale)
+            .then(|| (lead, crate::width::width(piece), ink))
+            .into_iter()
+            .collect();
+        rows.push(Line {
+            text: fit(&format!("{}{piece}", " ".repeat(lead)), c.width),
+            colour,
+            runs,
+            ..Line::default()
+        });
     }
+    rows
 }
 
 /// The columns the close at the end of an agent's row takes: a blank and the `x`.
@@ -3043,7 +3107,7 @@ pub fn on_agent_eye(col: usize, terminal: u32, c: &Column) -> bool {
 /// the sleeping mark and no other dot, since nothing runs in it. What a person called it,
 /// else the agent that comes back in it, else a shell (a sleep refuses any other program),
 /// and where.
-fn sleeping_line(c: &Column, tab: &SleepingTab, space: &WorkspaceRow) -> Line {
+fn sleeping_line(c: &Column, tab: &SleepingTab, space: &WorkspaceRow) -> Vec<Line> {
     let name = tab.label().to_string();
     let text = match cwd_basename(Some(&tab.cwd)).filter(|b| !b.eq_ignore_ascii_case(&space.name)) {
         Some(place) => format!("{name} \u{b7} {place}"),
@@ -3055,16 +3119,27 @@ fn sleeping_line(c: &Column, tab: &SleepingTab, space: &WorkspaceRow) -> Line {
         cell_mark(crate::theme::Role::Sleeping, false, 0)
     };
     let room = c.width.saturating_sub(crate::width::width(&lead) + CLOSE_W);
-    let head = format!("{lead}{}", shorten_middle(&text, room));
+    // Never cut: the words wrap, the mark and the close stay on the first row.
+    let pieces = crate::asks::wrap_whole(&text, room);
+    let head = format!("{lead}{}", pieces.first().map_or("", String::as_str));
     let (text, close) = with_close(&head, c.width);
-    let runs = vec![close];
-    Line {
+    let colour = Some(crate::theme::space_calm_in(c.spaces, space.id));
+    let mut rows = vec![Line {
         text,
-        colour: Some(crate::theme::space_calm_in(c.spaces, space.id)),
+        colour,
         indicator: Some((0, 2, crate::theme::Role::Sleeping)),
-        runs,
+        runs: vec![close],
         ..Line::default()
+    }];
+    let indent = crate::width::width(&lead);
+    for piece in pieces.iter().skip(1) {
+        rows.push(Line {
+            text: fit(&format!("{}{piece}", " ".repeat(indent)), c.width),
+            colour,
+            ..Line::default()
+        });
     }
+    rows
 }
 
 /// Whether a sleeping pane stands for its tab: a tab alone, or the lead of its split. A count
@@ -3086,46 +3161,6 @@ fn doze_line(c: &Column, space: &WorkspaceRow, count: usize, listed: bool) -> Li
         colour: Some(crate::theme::space_calm_in(c.spaces, space.id)),
         runs: vec![(0, 1, crate::theme::Role::Faint)],
         ..Line::default()
-    }
-}
-
-/// An agent in a flat list, the priority view or a space the client has not heard of:
-/// the dot, the session, and the space it lives in on the right, in the space's own colour.
-fn flat_line(c: &Column, agent: &AgentRow) -> Line {
-    let (role, stale) = dot_of(c, agent);
-    let space = c
-        .spaces
-        .iter()
-        .find(|s| s.id == agent.workspace)
-        .map(|s| shorten_middle(&s.name, c.width / 3))
-        .unwrap_or_default();
-    let space_w = crate::width::width(&space);
-    // The dot and its two spaces, the name, a gap, the space and a trailing space.
-    let right = if space.is_empty() { 0 } else { space_w + 2 };
-    let room = c.width.saturating_sub(DOT_AT + 2 + right);
-    let name = shorten_middle(&session_name(agent), room);
-    let head = format!("{}{}{name}", " ".repeat(DOT_AT), mark_of(c, agent, role));
-    let left = fit_to(&head, c.width.saturating_sub(right));
-    let (text, accent) = if space.is_empty() {
-        (left, None)
-    } else {
-        let at = crate::width::width(&left) + 1;
-        (
-            fit(&format!("{left} {space} "), c.width),
-            Some((
-                at,
-                space_w,
-                crate::theme::space_in(c.spaces, agent.workspace),
-            )),
-        )
-    };
-    Line {
-        fill: None,
-        text,
-        colour: stale.then_some(crate::theme::Role::Faint),
-        accent,
-        indicator: Some((DOT_AT, 2, role)),
-        runs: Vec::new(),
     }
 }
 
@@ -3152,7 +3187,7 @@ fn first_row(content: &[Row], body: usize, c: &Column) -> usize {
             .or_else(|| {
                 content
                     .iter()
-                    .position(|(_, hit)| *hit == Some(Hit::Space(c.focused_space)))
+                    .rposition(|(_, hit)| *hit == Some(Hit::Space(c.focused_space)))
             }),
     };
     // The last row of the target goes at the foot of the window at the latest; the
@@ -3164,7 +3199,7 @@ fn first_row(content: &[Row], body: usize, c: &Column) -> usize {
         let mut first = first;
         while first > 0
             && first < last
-            && matches!(content[first].1, Some(Hit::Terminal(_)))
+            && matches!(content[first].1, Some(Hit::Terminal(_) | Hit::Space(_)))
             && content[first].1 == content[first - 1].1
         {
             first += 1;
@@ -3476,7 +3511,7 @@ pub(crate) fn rows_collapsed(c: &Column, height: usize) -> Vec<Row> {
 /// What the first row names: the agent's own conversation title, and only
 /// that. The title is what the agent calls the conversation, and it follows
 /// renames on its own because the daemon re-resolves it while the
-/// conversation runs. Without a title the shortened conversation id answers,
+/// conversation runs. Without a title the conversation id answers,
 /// and without that the tab's own label, which prefers a chosen name over
 /// whatever happens to be running. No program beside any of them: the row
 /// below already says what runs in which tab, and a program prefix is how
@@ -3509,36 +3544,8 @@ fn cwd_basename(cwd: Option<&str>) -> Option<String> {
     Some(base.to_string())
 }
 
-/// The middle shortened to `room` columns, tail-cut with an ellipsis, or the
-/// whole middle when it already fits. A room under two columns still yields the
-/// ellipsis, which the caller's own fit then cuts to the row.
-pub(crate) fn shorten_middle(middle: &str, room: usize) -> String {
-    if crate::width::width(middle) <= room {
-        return middle.to_string();
-    }
-    // Nothing to shorten into. The ellipsis is a column of its own and would be one too
-    // many, which shifts every control after the name a column right of where `act` looks
-    // for it, so a rule with no room for its name draws no name at all.
-    if room == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in middle.chars() {
-        let wide = crate::width::columns(c);
-        if used + wide + 1 > room {
-            break;
-        }
-        out.push(c);
-        used += wide;
-    }
-    out.push('…');
-    out
-}
-
-/// The conversation id, shortened for a thirty column row. A basename,
-/// because hooks report paths as well as ids, and a prefix when even that
-/// is long: the start is what a person recognises.
+/// The conversation id: its basename, because hooks report paths as well as ids. Whole: the
+/// row wraps it rather than cutting it.
 fn short_session(session: Option<&str>) -> Option<String> {
     let base = session?.trim();
     if base.is_empty() {
@@ -3549,11 +3556,7 @@ fn short_session(session: Option<&str>) -> Option<String> {
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or(base);
-    if base.chars().count() > 12 {
-        Some(format!("{}…", base.chars().take(8).collect::<String>()))
-    } else {
-        Some(base.to_string())
-    }
+    Some(base.to_string())
 }
 
 /// One row of the folded strip for an agent: the state mark, then the space's
@@ -4865,6 +4868,26 @@ mod tests {
             .unwrap_or_else(|| panic!("space {id} has no rule"))
     }
 
+    /// Every row `hit` draws under the title, in order: a wrapped name or line is more than one.
+    fn rows_of(rows: &[Row], hit: Hit) -> Vec<&Line> {
+        rows.iter()
+            .skip_while(|(_, h)| *h != Some(Hit::Title))
+            .filter(|(_, h)| *h == Some(hit))
+            .map(|(l, _)| l)
+            .collect()
+    }
+
+    /// The words of the rows `hit` draws after its first, without the box and the tail: what a
+    /// wrapped row says after its first line.
+    fn words_after_first(rows: &[Row], hit: Hit) -> String {
+        rows_of(rows, hit)
+            .iter()
+            .skip(1)
+            .map(|l| unbox(&l.text).trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// The text a run of a row covers, for rows of single column characters.
     fn run_text(line: &Line, at: usize, len: usize) -> String {
         line.text.chars().skip(at).take(len).collect()
@@ -5668,16 +5691,16 @@ mod tests {
     }
 
     #[test]
-    fn a_long_session_is_shortened_to_its_prefix() {
+    fn a_long_session_id_is_shown_whole() {
         let spaces = vec![space(1, "app")];
         let mut a = agent(1, 1, "claude", "idle");
         a.agent_session = Some("sess_abc123def456".to_string());
         let texts = agent_texts(&spaces, &[a], 1);
-        assert!(texts.iter().any(|t| t.contains("sess_abc…")), "{texts:?}");
         assert!(
-            !texts.iter().any(|t| t.contains("sess_abc123def456")),
+            texts.iter().any(|t| t.contains("sess_abc123def456")),
             "{texts:?}"
         );
+        assert!(!texts.iter().any(|t| t.contains('\u{2026}')), "{texts:?}");
     }
 
     #[test]
@@ -7939,7 +7962,7 @@ mod tests {
             WIDTH,
             &shut,
         );
-        let row = second_row(&still, &working, BOX_LEAD + 2, None);
+        let row = second_rows(&still, &working, BOX_LEAD + 2, None).remove(0);
         assert!(
             !row.0
                 .runs
@@ -7964,7 +7987,7 @@ mod tests {
             WIDTH,
             &shut,
         );
-        let row = second_row(&moving, &working, BOX_LEAD + 2, Some("qoop".into()));
+        let row = second_rows(&moving, &working, BOX_LEAD + 2, Some("qoop".into())).remove(0);
         assert_eq!(row.0.text.trim_end(), "   \u{2514} claude \u{b7} qoop");
         assert!(
             !row.0
@@ -8532,13 +8555,13 @@ mod tests {
                 .collect()
         };
         let one = under(1);
-        assert_eq!(one.len(), 2, "{texts:?}");
-        // What it does and nothing else: the tab gives the whole row to it.
-        assert_eq!(
-            unbox(&one[1].text),
-            "   \u{2514} editing sidebar_rows_and_the_fo\u{2026}"
-        );
+        // What it does and nothing else, whole: the file name is longer than the row, so the
+        // words wrap under their own first letter.
+        assert_eq!(one.len(), 3, "{texts:?}");
+        assert_eq!(unbox(&one[1].text), "   \u{2514} editing");
+        assert_eq!(unbox(&one[2].text), "     sidebar_rows_and_the_foot.rs");
         assert_eq!(one[1].colour, Some(crate::theme::Role::Faint));
+        assert_eq!(one[2].colour, Some(crate::theme::Role::Faint));
         let two = under(2);
         assert_eq!(unbox(&two[1].text), "   \u{2514} wants: bun test");
         // Quiet grey, with what it wants in the blocked colour.
@@ -8880,7 +8903,7 @@ mod tests {
             &shut,
         );
         let band = |a: &AgentRow| {
-            second_row(&moving, a, BOX_LEAD + 2, None)
+            second_rows(&moving, a, BOX_LEAD + 2, None)[0]
                 .0
                 .runs
                 .iter()
@@ -9464,11 +9487,11 @@ mod tests {
         assert_eq!(wants_tick(&rows, NOW), Some(((NOW + 840) + 59) / 60 * 60));
     }
 
-    /// A session longer than the row ends in an ellipsis rather than a hard
-    /// cut, and only then: a fitting session keeps today's bytes exactly,
-    /// wide titles never split, and the row still measures thirty columns.
+    /// A session longer than the row wraps whole onto more rows and is never cut: a fitting
+    /// session keeps today's bytes exactly, wide titles never split, and every row still
+    /// measures thirty columns.
     #[test]
-    fn a_long_session_ends_in_an_ellipsis() {
+    fn a_long_session_wraps_whole_and_is_never_cut() {
         let spaces = vec![space(1, "app")];
         let fitting = agent(1, 1, "claude", "working");
         let long_title = "Implement OAuth scopes and refresh the dispatcher";
@@ -9480,32 +9503,37 @@ mod tests {
             &spaces,
             &[fitting, long, wide],
             9,
-            20,
+            30,
             &Seen::new(),
             &Shut::new(),
         );
-        let rows: Vec<String> = (1..=3).map(|t| tree_row(&rows, t).text.clone()).collect();
-        for row in &rows {
-            assert_eq!(crate::width::width(row), WIDTH, "{row:?}");
-            assert!(!row.contains('\u{fffd}'));
+        for (line, _) in &rows {
+            assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
+            assert!(!line.text.contains('\u{fffd}'));
+            assert!(!line.text.contains('\u{2026}'), "{:?}", line.text);
         }
-        // Fitting session: today's bytes, no ellipsis.
-        assert_eq!(unbox(&rows[0]), " \u{2818}\u{2802}claude");
-        // Cut sessions: the mark and the ellipsis frame the text.
-        assert!(unbox(&rows[1]).ends_with('…'), "{:?}", rows[1]);
-        assert!(
-            unbox(&rows[1]).starts_with(" \u{2818}\u{2802}Implement"),
-            "{:?}",
-            rows[1]
-        );
-        assert!(unbox(&rows[2]).ends_with('…'), "{:?}", rows[2]);
-        // A session that already ends in an ellipsis is cut once, not twice.
-        let mut dotty = agent(4, 1, "claude", "working");
-        dotty.agent_session = Some("abcdefghijklmnop…".into());
-        let rows = tree_rows(&spaces, &[dotty], 9, 20, &Seen::new(), &Shut::new());
-        let row = tree_row(&rows, 4);
-        assert_eq!(row.text.chars().filter(|c| *c == '…').count(), 1);
-        assert_eq!(crate::width::width(&row.text), WIDTH);
+        // Fitting session: today's bytes, one name row.
+        assert_eq!(unbox(&tree_row(&rows, 1).text), " \u{2818}\u{2802}claude");
+        // The long title: every word, in order, over the rows of one agent; only the first
+        // carries the mark and so the controls, and every row answers the agent's click.
+        let long_rows = rows_of(&rows, Hit::Terminal(2));
+        assert!(long_rows.len() >= 3, "{long_rows:?}");
+        let said: String = long_rows
+            .iter()
+            .map(|l| unbox(&l.text))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for word in long_title.split(' ') {
+            assert!(said.contains(word), "{word:?} lost from {said:?}");
+        }
+        assert!(long_rows[0].indicator.is_some());
+        assert!(long_rows[1].indicator.is_none(), "{:?}", long_rows[1]);
+        // A wide title keeps every glyph.
+        let glyphs: usize = rows_of(&rows, Hit::Terminal(3))
+            .iter()
+            .map(|l| l.text.matches('程').count())
+            .sum();
+        assert_eq!(glyphs, 20);
     }
 
     /// The second row a calm agent with this cwd draws under a space of this name.
@@ -9581,44 +9609,76 @@ mod tests {
         assert_eq!(texts[top + 6], "   \u{2514} codex \u{b7} x");
     }
 
-    /// A long worktree shortens with an ellipsis while the tab keeps every letter it
-    /// had; a tab too long to leave room shortens too, down to a floor, and the row
+    /// A long worktree wraps whole after its tab: no letter of either is lost, and every row
     /// still measures the column.
     #[test]
-    fn a_long_worktree_shortens_and_the_tab_keeps_its_floor() {
-        let line = worktree_row(
-            "app",
-            Some("/home/u/a-very-long-worktree-name-that-keeps-going"),
-            "claude",
-        );
+    fn a_long_worktree_wraps_and_the_tab_keeps_every_letter() {
+        let place = "a-very-long-worktree-name-that-keeps-going";
+        let spaces = vec![space(1, "app")];
+        let mut row = agent(1, 1, "claude", "idle");
+        row.cwd = Some(format!("/home/u/{place}"));
+        let rows = tree_rows(&spaces, &[row], 9, 20, &Seen::new(), &Shut::new());
+        let seconds = words_after_first(&rows, Hit::Terminal(1));
+        // The name row is the first of the agent's rows; its second line follows it.
         assert!(
-            unbox(&line.text).starts_with("   \u{2514} claude \u{b7} a-very"),
-            "{:?}",
-            line.text
+            seconds.starts_with("\u{2514} claude \u{b7} a-very"),
+            "{seconds:?}"
         );
-        assert!(line.text.contains('\u{2026}'), "{:?}", line.text);
-        assert_eq!(crate::width::width(&line.text), WIDTH);
+        let flat: String = seconds.split_whitespace().collect();
+        assert!(flat.contains(place), "{seconds:?}");
+        assert!(!seconds.contains('\u{2026}'), "{seconds:?}");
+        for (line, _) in &rows {
+            assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
+        }
+        // The dot between the tab and the place is its own quiet mark, wherever the wrap put it.
+        let dots = rows_of(&rows, Hit::Terminal(1))
+            .iter()
+            .flat_map(|l| l.runs.iter().map(move |r| (l, r)))
+            .filter(|(l, (at, len, role))| {
+                *role == crate::theme::Role::Rule && run_text(l, *at, *len) == "\u{b7}"
+            })
+            .count();
+        assert_eq!(dots, 1);
 
-        // A tab so long it would push the worktree off: both shorten, neither vanishes.
-        let line = worktree_row("app", Some("/home/u/somewhere"), &"c".repeat(40));
-        assert!(line.text.contains("cccc"), "{:?}", line.text);
-        assert!(line.text.contains(" \u{b7} some"), "{:?}", line.text);
-        assert_eq!(crate::width::width(&line.text), WIDTH);
+        // A tab so long it would push the worktree off: both stay whole, neither vanishes.
+        let mut row = agent(1, 1, &"c".repeat(40), "idle");
+        row.cwd = Some("/home/u/somewhere".into());
+        let rows = tree_rows(&spaces, &[row], 9, 20, &Seen::new(), &Shut::new());
+        let said = words_after_first(&rows, Hit::Terminal(1));
+        let dots = rows_of(&rows, Hit::Terminal(1))
+            .iter()
+            .flat_map(|l| l.runs.iter().map(move |r| (l, r)))
+            .filter(|(l, (at, len, role))| {
+                *role == crate::theme::Role::Rule && run_text(l, *at, *len) == "\u{b7}"
+            })
+            .count();
+        assert_eq!(
+            dots, 1,
+            "a tab label that itself wraps keeps its dot: {said:?}"
+        );
+        let flat: String = said.split_whitespace().collect();
+        assert!(flat.contains(&"c".repeat(40)), "{said:?}");
+        assert!(flat.contains("somewhere"), "{said:?}");
+        assert!(!said.contains('\u{2026}'), "{said:?}");
     }
 
-    /// An overlong wide worktree shortens by columns, never splitting a wide
-    /// character, and the row stays thirty columns.
+    /// A wide worktree wraps by columns, never splitting a wide character, and every row stays
+    /// thirty columns.
     #[test]
-    fn a_wide_worktree_shortens_by_columns() {
-        let line = worktree_row("app", Some("/home/u/程程程程程程程程程程程程"), "claude");
-        assert!(
-            unbox(&line.text).starts_with("   \u{2514} claude \u{b7} 程"),
-            "{:?}",
-            line.text
-        );
-        assert!(line.text.contains('\u{2026}'), "{:?}", line.text);
-        assert_eq!(crate::width::width(&line.text), WIDTH);
-        assert!(!line.text.contains('\u{fffd}'));
+    fn a_wide_worktree_wraps_by_columns() {
+        let spaces = vec![space(1, "app")];
+        let mut row = agent(1, 1, "claude", "idle");
+        row.cwd = Some("/home/u/程程程程程程程程程程程程".into());
+        let rows = tree_rows(&spaces, &[row], 9, 20, &Seen::new(), &Shut::new());
+        let glyphs: usize = rows_of(&rows, Hit::Terminal(1))
+            .iter()
+            .map(|l| l.text.matches('程').count())
+            .sum();
+        assert_eq!(glyphs, 12);
+        for (line, _) in &rows {
+            assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
+            assert!(!line.text.contains('\u{fffd}') && !line.text.contains('\u{2026}'));
+        }
     }
 
     /// Worktrees, wide names and long names all still measure exactly thirty columns
@@ -9662,21 +9722,26 @@ mod tests {
         }
     }
 
-    /// A space name longer than the row cannot break the painter: the rule shortens
-    /// the name before it gives up the fold mark or the count, the accent stays on the
-    /// row, and the row still measures thirty columns.
+    /// A space name longer than the row wraps whole on its rule: the controls keep their
+    /// columns on the first row, the count ends the last, the accent stays on every row of the
+    /// name, and every row still measures thirty columns.
     #[test]
-    fn a_space_name_longer_than_the_row_shortens_on_its_rule() {
+    fn a_space_name_longer_than_the_row_wraps_on_its_rule() {
         let spaces = vec![space(1, &"s".repeat(40))];
         let agents = vec![agent(1, 1, "claude", "working")];
         let rows = tree_rows(&spaces, &agents, 9, 14, &Seen::new(), &Shut::new());
         for (line, _) in &rows {
             assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
         }
+        let rule_rows = rows_of(&rows, Hit::Space(1));
+        assert!(rule_rows.len() >= 2, "{rule_rows:?}");
+        let said: String = rule_rows.iter().map(|l| l.text.clone()).collect();
+        assert_eq!(said.matches('s').count(), 40, "{said:?}");
+        assert!(!said.contains('\u{2026}'), "{said:?}");
+        let last = rule_rows.last().expect("a last row");
+        assert!(last.text.contains("(1)"), "{:?}", last.text);
+        // The controls keep their columns on the first row, and the rows after it have none.
         let rule = rule_row(&rows, 1);
-        assert!(rule.text.contains("(1)"), "{:?}", rule.text);
-        assert!(rule.text.contains('…'), "{:?}", rule.text);
-        // The name gave way, not the block: the controls keep their columns.
         assert_eq!(
             columns_from(&rule.text, WIDTH - 4, 1),
             "+",
@@ -9689,7 +9754,11 @@ mod tests {
             "{:?}",
             rule.text
         );
-
+        for line in &rule_rows[1..] {
+            assert!(!line.text.contains('+') && !line.text.contains('\u{22ef}'));
+            let (at, len, _) = line.accent.expect("the name is accented");
+            assert!(at + len <= WIDTH);
+        }
         let (at, len, _) = rule.accent.expect("the name is accented");
         assert!(at + len <= WIDTH);
     }
@@ -10082,6 +10151,24 @@ mod tests {
         first_rule(&clicks(&spaces, &agents, View::Tree, width, &none)).text
     }
 
+    /// Every row of the rule, as [`rule_at`] draws it: a name too long for the column wraps.
+    fn rule_rows_at(
+        width: usize,
+        name: &str,
+        held: usize,
+        asleep: bool,
+        closable: bool,
+    ) -> Vec<String> {
+        let (spaces, agents) = space_in_state(name, held, asleep, closable);
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let c = clicks(&spaces, &agents, View::Tree, width, &none);
+        rows_folded(&c, 4096, current_avatar().as_ref())
+            .into_iter()
+            .filter(|(_, h)| matches!(h, Some(Hit::Space(_))))
+            .map(|(l, _)| l.text)
+            .collect()
+    }
+
     /// A rule of `c`, the way the painter gets it.
     fn rule_styled(c: &Column, id: i64) -> Line {
         let space = c.spaces.iter().find(|s| s.id == id).expect("the space");
@@ -10090,7 +10177,7 @@ mod tests {
             .iter()
             .filter(|a| a.workspace == id && a.agent)
             .collect();
-        rule(c, space, &kids, !c.shut.contains(&id))
+        rule(c, space, &kids, !c.shut.contains(&id)).remove(0)
     }
 
     /// A control as the column draws it: around one glyph or in the sleep control's width.
@@ -10123,23 +10210,11 @@ mod tests {
         out
     }
 
-    /// No room for the name is a column with no name in it, not a name that runs one
-    /// column over. A narrow rule whose count has taken the whole budget would otherwise
-    /// draw the ellipsis past it and push every control a column right of where `act`
-    /// looks for it, so the painted chip would be one column from the click that means it.
+    /// The narrowest column the interface draws pays for the fold column, the block and the
+    /// blank last column, and still leaves a name the columns it needs to stay one: a name is
+    /// never cut, so what it keeps is where it wraps.
     #[test]
-    fn a_name_with_no_room_is_left_out_rather_than_over_running() {
-        assert_eq!(
-            shorten_middle("qoop", 0),
-            "",
-            "an ellipsis is a column of its own"
-        );
-        assert_eq!(crate::width::width(&shorten_middle("qoop", 0)), 0);
-        assert_eq!(shorten_middle("qoop", 1), "\u{2026}");
-        assert_eq!(shorten_middle("qoop", 4), "qoop");
-        assert_eq!(shorten_middle("qoop", 3), "qo\u{2026}");
-        // The narrowest column the interface draws pays for the fold column, the block and
-        // the blank last column, and still leaves a name the columns it needs to stay one.
+    fn the_narrowest_column_leaves_a_name_its_columns() {
         assert!(SIDEBAR_MIN.saturating_sub(BLOCK_TAIL_MAX) >= MIN_NAME_COLS);
         assert_eq!(SIDEBAR_MIN, 24);
     }
@@ -10212,11 +10287,18 @@ mod tests {
         assert!(row.contains("qoop (3)"), "{row:?}");
         assert!(!row.contains("sleeping"), "{row:?}");
         // Narrower, where the word no longer fits, the count stays, so the name never
-        // starves for a state; at the narrowest column the name is cut and the count stays.
+        // starves for a state; at the narrowest column the name wraps and the count ends it.
         let row = rule_at(30, "qoop", 3, true, true);
         assert!(row.contains("qoop (3)"), "{row:?}");
-        let row = rule_at(SIDEBAR_MIN, "qoop-mobile", 3, true, true);
-        assert!(row.contains("\u{2026} (3)"), "{row:?}");
+        let rows = rule_rows_at(SIDEBAR_MIN, "qoop-mobile", 3, true, true);
+        assert!(rows.len() >= 2, "{rows:?}");
+        assert!(rows.last().is_some_and(|r| r.contains(" (3)")), "{rows:?}");
+        let said: String = rows.concat();
+        assert!(
+            said.contains("qoop-") && said.contains("mobile"),
+            "{said:?}"
+        );
+        assert!(!said.contains('\u{2026}'), "{said:?}");
     }
 
     /// A space with tabs asleep beside awake ones says both while there is room, then the
@@ -10235,18 +10317,35 @@ mod tests {
             "{:?}",
             at(60)
         );
-        // With the drawer closed the narrowest column still holds the whole slot, the
-        // name cut short for it; with it open, the slot gives up its sleeping part first.
+        // The narrowest column wraps the name and keeps a count on its last row; with the drawer
+        // open, the slot gives up its sleeping part first.
         let mut drawn = clicks(&spaces, &agents, View::Tree, SIDEBAR_MAX, &none);
         drawn.icons = true;
         let zzz = format!("(3, 2{})", crate::icons::ASLEEP);
         assert!(first_rule(&drawn).text.contains(&zzz), "{zzz:?}");
-        let narrow = at(SIDEBAR_MIN);
-        assert!(narrow.contains("\u{2026} (3, 2z)"), "{narrow:?}");
+        let narrow_column = clicks(&spaces, &agents, View::Tree, SIDEBAR_MIN, &none);
+        let narrow: Vec<String> = rows_folded(&narrow_column, 4096, None)
+            .into_iter()
+            .filter(|(_, h)| matches!(h, Some(Hit::Space(_))))
+            .map(|(l, _)| l.text)
+            .collect();
+        assert!(!narrow.concat().contains('\u{2026}'), "{narrow:?}");
+        assert!(
+            narrow.last().is_some_and(|r| r.contains("(3")),
+            "{narrow:?}"
+        );
         let mut c = clicks(&spaces, &agents, View::Tree, 30, &none);
         c.drawer = Some((1, DRAWER));
-        let open = first_rule(&c).text;
-        assert!(open.contains(" (3) ") && !open.contains("2z"), "{open:?}");
+        let open: Vec<String> = rows_folded(&c, 4096, None)
+            .into_iter()
+            .filter(|(_, h)| matches!(h, Some(Hit::Space(_))))
+            .map(|(l, _)| l.text)
+            .collect();
+        let last = open.last().cloned().unwrap_or_default();
+        assert!(
+            last.contains(" (3)") && !open.concat().contains("2z"),
+            "{open:?}"
+        );
     }
 
     /// An awake space folds two or more sleeping agents to one row, so the agents at work stay

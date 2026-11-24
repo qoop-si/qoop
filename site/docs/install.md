@@ -92,7 +92,7 @@ so; [Usage counts](#telemetry) shows exactly what and how to stop it.
 
 ## The desktop app (macOS)
 
-A window for the same agents: home, sessions, the Inbox, qass, schedules and settings. It uses the
+A window for the same agents: the Inbox first, a sidebar of spaces and agents, each agent's own page, New agent, qass, the Board, schedules and settings. It uses the
 `qoop` the install line puts in place, so install that first. Download the zip for your Mac:
 
 - Apple silicon: [qoop-desktop-aarch64-apple-darwin.zip](https://qoop.si/releases/latest/qoop-desktop-aarch64-apple-darwin.zip)

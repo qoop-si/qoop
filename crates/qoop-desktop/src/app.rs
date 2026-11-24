@@ -1064,7 +1064,7 @@ impl Desk {
         });
     }
 
-    /// Keys nobody else took: Tab moves focus, Escape closes the right panel.
+    /// Keys nobody else took: Tab moves focus, Escape closes the changes drawer.
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &event.keystroke;
         match keys::typed(k) {

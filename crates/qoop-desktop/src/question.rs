@@ -1,7 +1,7 @@
-//! Answering: the question card docked under an agent that needs the owner, the panel beside
-//! it, the 3 s hold with Undo, typed answers and the hand-off to qass. The card, the corner
-//! note, the sidebar line and the Inbox all answer through `pick`, and a qass card's option
-//! through `pick_card`: one hold, one Undo, one way of saying what became of it.
+//! Answering: the question card docked under an agent that needs the owner, the 3 s hold with
+//! Undo, typed answers and the hand-off to qass. The card, the sidebar line and the Inbox all
+//! answer through `pick`, and a qass card's option through `pick_card`: one hold, one Undo, one
+//! way of saying what became of it.
 //!
 //! A pick is never sent at once: it waits `state::HOLD` ("Sends in 3 s, Undo `u`"), then goes
 //! as `AnswerMenu`, `AnswerMenuText` or `HandToQass`, and the card says "Sending" until the
