@@ -342,15 +342,15 @@ pub(crate) type Sessions = BTreeMap<String, Vec<AgentRow>>;
 /// reader that missed a line would otherwise hold a row that is no longer true. Ends when
 /// the daemon does, so a caller that wants to outlive a session starts it again.
 pub(crate) fn run_watch(
-    line: impl Fn(&Sessions) -> std::io::Result<String>,
+    line: impl Fn(&Sessions, &[WorkspaceRow]) -> std::io::Result<String>,
 ) -> std::io::Result<()> {
     use std::io::Write;
 
-    let line = |rows: &[AgentRow]| {
-        line(&Sessions::from([(
-            paths::DEFAULT_SESSION.to_string(),
-            rows.to_vec(),
-        )]))
+    let line = |rows: &[AgentRow], spaces: &[WorkspaceRow]| {
+        line(
+            &Sessions::from([(paths::DEFAULT_SESSION.to_string(), rows.to_vec())]),
+            spaces,
+        )
     };
     let rt = tokio::runtime::Runtime::new()?;
     let watch = async move {
@@ -381,7 +381,7 @@ pub(crate) fn run_watch(
             }
             // Nothing is awake, so nothing is listed: said, then waited out without a
             // process started or a timer run, until a daemon binds its socket again.
-            if !say(line(&[])?)? {
+            if !say(line(&[], &[])?)? {
                 return Ok(());
             }
             if !wait_for_daemon().await? {
@@ -429,7 +429,7 @@ fn daemon_gone(e: &std::io::Error) -> bool {
 /// Follow one daemon's agents until it goes, printing each change through `say`.
 async fn follow(
     link: &mut Link,
-    line: &impl Fn(&[AgentRow]) -> std::io::Result<String>,
+    line: &impl Fn(&[AgentRow], &[WorkspaceRow]) -> std::io::Result<String>,
     say: &mut impl FnMut(String) -> std::io::Result<bool>,
 ) -> std::io::Result<()> {
     let mut unsubscribed = false;
@@ -448,16 +448,25 @@ async fn follow(
                 .await?;
             stashed.extend(meanwhile);
         }
-        if !say(line(&agents)?)? {
+        // The spaces say whether qass runs: a question handed to it is only with it then.
+        let (spaces, meanwhile) = match link
+            .ask(&ControlRequest::ListWorkspaces {
+                id: super::request_id("spaces"),
+            })
+            .await?
+        {
+            (ControlResponse::Workspaces { workspaces, .. }, meanwhile) => (workspaces, meanwhile),
+            (_, meanwhile) => (Vec::new(), meanwhile),
+        };
+        stashed.extend(meanwhile);
+        if !say(line(&agents, &spaces)?)? {
             return Ok(());
         }
         // A change that landed while asking is news already had: ask again at once.
-        if stashed.iter().any(|i| {
-            matches!(
-                i,
-                client::Incoming::Event(EventMessage::AgentChanged { .. } | EventMessage::Resync)
-            )
-        }) {
+        if stashed
+            .iter()
+            .any(|i| matches!(i, client::Incoming::Event(event) if is_news(event)))
+        {
             continue;
         }
         // A row carries its agent's task, so a board change can change a row while its state
@@ -465,20 +474,34 @@ async fn follow(
         // when the listing reads differently.
         loop {
             let events = link.next_events(None).await?.unwrap_or_default();
-            if events.iter().any(|e| {
-                !matches!(
-                    e,
-                    EventMessage::Focus { .. }
-                        | EventMessage::AsksChanged
-                        | EventMessage::MessagesChanged { .. }
-                        | EventMessage::ShowsChanged
-                        | EventMessage::SchedulesChanged
-                )
-            }) {
+            if events.iter().any(wakes) {
                 break;
             }
         }
     }
+}
+
+/// Whether an event that came while the listing was being asked for means it must be asked for
+/// again at once: an agent changed, the daemon dropped news, or the board did (a qass pause or
+/// resume is told that way, and the notch counts by it).
+fn is_news(event: &EventMessage) -> bool {
+    matches!(
+        event,
+        EventMessage::AgentChanged { .. } | EventMessage::Resync | EventMessage::TasksChanged
+    )
+}
+
+/// Whether an event wakes a watch that is waiting: all but the ones that cannot change a row
+/// (a focus, the cards, a chat, a shown result, the schedules).
+fn wakes(event: &EventMessage) -> bool {
+    !matches!(
+        event,
+        EventMessage::Focus { .. }
+            | EventMessage::AsksChanged
+            | EventMessage::MessagesChanged { .. }
+            | EventMessage::ShowsChanged
+            | EventMessage::SchedulesChanged
+    )
 }
 
 /// Wait, without a timer, until a daemon's socket appears in the runtime directory, and
@@ -2110,6 +2133,22 @@ pub(crate) use qoop_domain::shell::quote as shell_quote;
 
 #[cfg(test)]
 mod tests {
+    /// A watch wakes on a change of the board, waiting or just after its listing: a qass pause
+    /// or resume is told that way, and the notch's count follows it.
+    #[test]
+    fn a_watch_wakes_on_a_board_change() {
+        use qoop_runtime::control::EventMessage as E;
+        assert!(super::is_news(&E::TasksChanged), "while asking");
+        assert!(super::wakes(&E::TasksChanged), "while waiting");
+        assert!(super::is_news(&E::AgentChanged { terminal: 1 }) && super::is_news(&E::Resync));
+        for quiet in [E::AsksChanged, E::ShowsChanged, E::SchedulesChanged] {
+            assert!(
+                !super::wakes(&quiet) && !super::is_news(&quiet),
+                "{quiet:?}"
+            );
+        }
+    }
+
     use super::*;
 
     /// Frames as the daemon writes them: `body` on `channel` for `stream`.

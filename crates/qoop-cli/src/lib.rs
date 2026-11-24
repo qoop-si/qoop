@@ -3344,7 +3344,15 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
     }
     if watch {
         let json = matches!(mode, Mode::List { json: true });
-        let line = move |sessions: &supervise::Sessions| watch_listing(sessions, json, all);
+        let line = move |sessions: &supervise::Sessions,
+                         spaces: &[qoop_runtime::control::WorkspaceRow]| {
+            let machine = qoop_tui::answers::HandInput {
+                watching: Some(qoop_runtime::paths::qass_watching()),
+                hand_id: read_hand_id(),
+                ..Default::default()
+            };
+            watch_listing(sessions, spaces, machine, json, all)
+        };
         // One daemon, so `--all` is the same watch with each row naming its session, which
         // is what a notch built for many sessions reads.
         return supervise::run_watch(line);
@@ -3443,10 +3451,41 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
 /// and columns would then stop lining up exactly when they are needed.
 /// One listing of a watch. With `all`, every row names its session: as a `session` field
 /// in JSON, as a first word in text.
-fn watch_listing(sessions: &supervise::Sessions, json: bool, all: bool) -> std::io::Result<String> {
-    let rows = sessions
-        .iter()
-        .flat_map(|(name, rows)| rows.iter().map(move |row| (name, row)));
+///
+/// A row says `with_qass` only while the question is with qass by the rule the interface counts
+/// by (`qoop_tui::answers::handed`: qass runs, watches and does not skip the agent), so the notch
+/// reads the same count. `spaces` and `machine` (whether qass watches, this machine's hand id) are
+/// what that rule asks of the machine.
+fn watch_listing(
+    sessions: &supervise::Sessions,
+    spaces: &[qoop_runtime::control::WorkspaceRow],
+    machine: qoop_tui::answers::HandInput,
+    json: bool,
+    all: bool,
+) -> std::io::Result<String> {
+    let all_rows: Vec<qoop_runtime::control::AgentRow> =
+        sessions.values().flatten().cloned().collect();
+    let watching = machine.watching;
+    let mut hand = machine;
+    let now = qoop_runtime::agents::now_unix();
+    // No hand id file is made here: a watcher only reads.
+    qoop_tui::inbox_pane::update_hand(
+        &mut hand,
+        spaces,
+        &all_rows,
+        &[],
+        &Default::default(),
+        watching,
+        now,
+    );
+    let hand = &hand;
+    let rows = sessions.iter().flat_map(|(name, rows)| {
+        rows.iter().map(move |row| {
+            let mut row = row.clone();
+            row.with_qass = row.with_qass && qoop_tui::answers::handed(&row, hand);
+            (name, row)
+        })
+    });
     if json {
         let rows = rows
             .map(|(name, row)| {
@@ -3463,11 +3502,18 @@ fn watch_listing(sessions: &supervise::Sessions, json: bool, all: bool) -> std::
     // A blank line between listings, so a person reading along sees where one ends.
     let lines: Vec<String> = rows
         .map(|(name, row)| match all {
-            true => format!("session={name} {}", agent_line(row)),
-            false => agent_line(row),
+            true => format!("session={name} {}", agent_line(&row)),
+            false => agent_line(&row),
         })
         .collect();
     Ok(lines.join("\n") + "\n")
+}
+
+/// This machine's hand id as its file says, never made.
+fn read_hand_id() -> Option<String> {
+    let dir = qoop_runtime::paths::qass_data_dir()?;
+    let id = std::fs::read_to_string(dir.join(qoop_runtime::paths::HAND_ID_FILE)).ok()?;
+    Some(id.trim().to_string()).filter(|id| !id.is_empty())
 }
 
 fn agent_line(row: &qoop_runtime::control::AgentRow) -> String {
@@ -4132,20 +4178,69 @@ mod tests {
     }
 
     /// The notch reads only `agents --watch --json`, and counts a handed question by the row's
-    /// `with_qass`: the watch output carries it for a handed agent and omits it otherwise, so an
+    /// `with_qass`: the watch output carries it for a handed agent only while the interface's
+    /// rule holds (qass runs, watches and does not skip the agent), and omits it otherwise, so an
     /// older notch and an older daemon both read an absent field as false.
     #[test]
-    fn the_watch_json_carries_with_qass_for_a_handed_agent_only() {
-        let mut handed = row(1, Some("a"), Some("claude"));
-        handed.state = "blocked".into();
-        handed.with_qass = true;
-        let mut mine = row(2, Some("b"), Some("claude"));
-        mine.state = "blocked".into();
-        let sessions = super::supervise::Sessions::from([("s".to_string(), vec![handed, mine])]);
-        let said = super::watch_listing(&sessions, true, true).expect("a listing");
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&said).expect("json");
-        assert_eq!(rows[0]["with_qass"], true, "{said}");
-        assert!(rows[1].get("with_qass").is_none(), "{said}");
+    fn the_watch_json_carries_with_qass_only_while_qass_can_take_the_question() {
+        let blocked = |terminal, with_qass| {
+            let mut r = row(terminal, Some("a"), Some("claude"));
+            r.state = "blocked".into();
+            r.with_qass = with_qass;
+            r
+        };
+        let space = |id: i64, name: &str| qoop_runtime::control::WorkspaceRow {
+            dir: None,
+            keep_awake: false,
+            qass_skip: false,
+            id,
+            name: name.into(),
+            terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
+            closable: true,
+            ink: None,
+            link: None,
+            link_reason: None,
+            goal: None,
+        };
+        let mut qass = row(9, Some("qass"), Some("claude"));
+        qass.workspace = 3;
+        let mut skipped = blocked(3, true);
+        skipped.qass_skip = true;
+        let sessions = super::supervise::Sessions::from([(
+            "s".to_string(),
+            vec![blocked(1, true), blocked(2, false), skipped, qass],
+        )]);
+        let spaces = [space(1, "work"), space(3, "qass")];
+        let machine = |watching| qoop_tui::answers::HandInput {
+            watching: Some(watching),
+            hand_id: Some("testmac".into()),
+            ..Default::default()
+        };
+        let carried = |spaces: &[qoop_runtime::control::WorkspaceRow], watching| {
+            let said = super::watch_listing(&sessions, spaces, machine(watching), true, true)
+                .expect("a listing");
+            let rows: Vec<serde_json::Value> = serde_json::from_str(&said).expect("json");
+            rows.iter()
+                .map(|r| r.get("with_qass").is_some())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            carried(&spaces, true),
+            [true, false, false, false],
+            "qass runs and watches"
+        );
+        assert_eq!(
+            carried(&spaces, false),
+            [false; 4],
+            "qass is paused: counted again"
+        );
+        assert_eq!(
+            carried(&spaces[..1], true),
+            [false; 4],
+            "qass is not running"
+        );
     }
 
     #[test]
