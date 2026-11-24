@@ -5,7 +5,7 @@
 # `strings` and never run. Two rules also lean on screens recorded from qoop's own Claude
 # sessions (the captures in this crate's tests): `selection_prompt`'s hint as a session
 # draws it, and `draft_after_turn`'s turn summary (`✻ Crunched for 16m 31s · done 6:31 PM`)
-# and the notices stacked over the composer.
+# and the notices stacked over the composer. `startup_unreachable` is a real 2.1.331 screen.
 #
 # The layout these rules lean on, from the same strings: the composer sits between two
 # full-width `─` rules with the footer under the lower one, and every dialog (a permission,
@@ -73,6 +73,25 @@ accept = "Yes, I trust this folder"
 all = [
   { line_regex = '^\s*Accessing workspace:' },
   { contains = "Yes, I trust this folder" },
+]
+
+# Startup that could not reach the network for the organization's settings, read from a real
+# screen (Claude Code 2.1.331, after a DNS outage) and its strings: `Claude Code can't start this
+# session yet`, then `Automatic retries have stopped. Choose Retry now to check again.` over
+# `1. Retry now` and `2. Quit`, under its own rule. Nothing reads it otherwise, so a tab left
+# on it looked idle for days and kept its schedule's run open; Retry now is pressed for the
+# person, as folder trust is.
+[[rules]]
+id = "startup_unreachable"
+state = "blocked"
+priority = 300
+region = "after_last_horizontal_rule"
+visible_blocker = true
+setup_gate = true
+accept = "Retry now"
+all = [
+  { line_regex = "^\\s*Claude Code can't start this session yet" },
+  { line_regex = '^\s*([❯>]\s+)?\d+\. Retry now\s*$' },
 ]
 
 # The first-run dialogs of a fresh home, read from a real first start of 2.1.296 (qass starts in
