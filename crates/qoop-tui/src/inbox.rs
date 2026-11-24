@@ -216,6 +216,35 @@ impl Inbox {
     }
 }
 
+impl Inbox {
+    /// The item `ctrl-a tab` goes to: only what is counted (finished work and handed
+    /// questions are not in the list), the oldest after the one the keyboard is on and then
+    /// round, skipping the agent already in front of the person. An item that names no agent
+    /// (a notice from qass) is still the answer: the caller opens the Inbox for it.
+    pub fn next_after(&self, focused: u32) -> Option<&Item> {
+        let at = self
+            .items
+            .iter()
+            .position(|i| i.terminal == Some(focused))
+            .map_or(0, |at| at + 1);
+        (0..self.items.len())
+            .map(|k| &self.items[(at + k) % self.items.len()])
+            .find(|i| i.terminal != Some(focused))
+    }
+
+    /// The terminals of the counted items that name an agent, oldest first.
+    pub fn terminals(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for terminal in self.items.iter().filter_map(|i| i.terminal) {
+            // An agent with a menu and a card is two items, one terminal.
+            if !out.contains(&terminal) {
+                out.push(terminal);
+            }
+        }
+        out
+    }
+}
+
 /// The terminals of `rows`, oldest first.
 fn oldest(mut rows: Vec<&AgentRow>) -> Vec<u32> {
     rows.sort_by_key(|r| (r.last_active_at_unix.unwrap_or(i64::MIN), r.terminal));

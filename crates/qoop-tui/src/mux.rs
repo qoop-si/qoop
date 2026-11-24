@@ -247,6 +247,10 @@ struct Link {
     hidden: BTreeSet<u32>,
     /// Single-target requests sent and not answered, by request id.
     inflight: BTreeSet<String>,
+    /// The answers (to a menu, to qass) sent and not answered, by request id, with the request's
+    /// name: a daemon too old to read one refuses it with no id, naming only the variant, and
+    /// the refusal is given back under the id of the request it was for.
+    answers: BTreeMap<String, &'static str>,
     /// This link just created, closed or renamed something and its lists in the cache are
     /// older than that answer. The interface asks for fresh ones right after such an
     /// answer, and a merged list built from the old one in between would show a new tab
@@ -284,6 +288,7 @@ impl Link {
             desired: BTreeSet::new(),
             hidden: BTreeSet::new(),
             inflight: BTreeSet::new(),
+            answers: BTreeMap::new(),
             stale_agents: false,
             stale_spaces: false,
             agents_seen: false,
@@ -907,6 +912,9 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             let sent = l.send(&request);
             if sent {
                 l.inflight.insert(id.clone());
+                if let Some(name) = answer_variant(&request) {
+                    l.answers.insert(id.clone(), name);
+                }
             }
             sent
         });
@@ -1599,6 +1607,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     && qoop_runtime::paths::is_newer_version(&server_version, &l.server_version))
                 .then(|| format!("{} now runs qoop {server_version}", l.name));
                 l.conn = Some((conn, writer));
+                note_menus(link, &server_version);
                 l.server_version = server_version;
                 l.control_seq = 0;
                 l.seqs.clear();
@@ -1712,6 +1721,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 };
                 let name = l.name.clone();
                 let pending: Vec<String> = std::mem::take(&mut l.inflight).into_iter().collect();
+                l.answers.clear();
                 for id in pending {
                     self.failed(id, format!("{name} went offline")).await?;
                 }
@@ -1868,6 +1878,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             return Ok(());
         };
         l.inflight.remove(&id);
+        l.answers.remove(&id);
         let name = l.name.clone();
         match response {
             C::Agents { agents, splits, .. } => {
@@ -2038,11 +2049,26 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             C::Failed { id, reason }
                 if !name.is_empty() && reason.contains("older than the client") =>
             {
-                self.failed(
-                    id,
-                    format!("{name} runs an older qoop that cannot do this yet"),
-                )
-                .await
+                // No id: the daemon could not read the request. The one it names is the answer
+                // asked under that variant, and the refusal goes back under its id.
+                let id = if id.is_empty() {
+                    self.link(link)
+                        .and_then(|l| {
+                            let variant = refused_variant(&reason)?;
+                            let at = l
+                                .answers
+                                .iter()
+                                .find(|(_, v)| **v == variant)
+                                .map(|(id, _)| id.clone())?;
+                            l.answers.remove(&at);
+                            l.inflight.remove(&at);
+                            Some(at)
+                        })
+                        .unwrap_or(id)
+                } else {
+                    id
+                };
+                self.failed(id, format!("{name} {OLDER_QOOP}")).await
             }
             C::WorkspaceAsleep {
                 id,
@@ -2280,6 +2306,57 @@ fn via_carries(request: &ControlRequest) -> bool {
             ..
         } => !matches!(**action, ScheduleOp::Report { .. }),
         _ => false,
+    }
+}
+
+/// What a machine's name is followed by in the refusal the mux gives for a request that
+/// machine's daemon is too old to know ("devbox runs an older qoop that cannot do this yet").
+pub const OLDER_QOOP: &str = "runs an older qoop that cannot do this yet";
+
+/// Whether a refusal says the daemon is older than the request: its own words (`unknown
+/// variant`), or the mux's for a machine behind it ([`OLDER_QOOP`]), which loses the variant's
+/// name.
+pub fn refused_as_old(reason: &str) -> bool {
+    qoop_runtime::control::too_old_for(reason, None) || reason.contains(OLDER_QOOP)
+}
+
+/// The name of an answer to a menu or to qass, for [`Link::answers`]: the requests a remote
+/// from before them refuses as unknown.
+fn answer_variant(request: &ControlRequest) -> Option<&'static str> {
+    match request {
+        ControlRequest::AnswerMenu { .. } => Some("AnswerMenu"),
+        ControlRequest::AnswerMenuText { .. } => Some("AnswerMenuText"),
+        ControlRequest::HandToQass { .. } => Some("HandToQass"),
+        _ => None,
+    }
+}
+
+/// The variant an `unknown variant` refusal names.
+fn refused_variant(reason: &str) -> Option<&str> {
+    let (name, _) = reason.split_once("unknown variant `")?.1.split_once('`')?;
+    Some(name)
+}
+
+/// The last release whose daemon sends no menu with a blocked agent and knows no `AnswerMenu`
+/// (both came in 0.15.0): a machine this old shows a blocked agent as a dialog it cannot read.
+const BEFORE_MENUS: &str = "0.14.0";
+
+/// The machines (by number) running a qoop from before [`BEFORE_MENUS`], as their links last
+/// said: what the Inbox reads to offer Open the agent there, not a dialog card.
+static NO_MENUS: std::sync::Mutex<BTreeSet<usize>> = std::sync::Mutex::new(BTreeSet::new());
+
+pub fn machines_without_menus() -> BTreeSet<usize> {
+    NO_MENUS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn note_menus(link: usize, version: &str) {
+    let parsed = qoop_runtime::paths::parse_version(version).is_some();
+    let old = parsed && !qoop_runtime::paths::is_newer_version(version, BEFORE_MENUS);
+    let mut set = NO_MENUS.lock().unwrap_or_else(|e| e.into_inner());
+    if old {
+        set.insert(link);
+    } else {
+        set.remove(&link);
     }
 }
 
@@ -2882,6 +2959,136 @@ mod tests {
                 col: 4,
                 resume: None,
             }
+        );
+    }
+
+    /// Through the mux, a remote that predates typed answers refuses one as an unknown request
+    /// with no id: the refusal comes back under the id of the answer it was for (the mux keeps
+    /// the variant), the card says that machine's qoop is too old, and nothing is typed into
+    /// any pane.
+    #[tokio::test]
+    async fn a_remote_older_than_typed_answers_refuses_one_and_nothing_is_typed() {
+        use crate::answers::{HandInput, Hold, Pick, Slot};
+        use crate::inbox::Context;
+        use crate::inbox_pane::{Env, Pane};
+        use std::time::Instant;
+        let (mut mux, _home_rx, mut remote_rx, _events) = two_links();
+        let there = terminal_out(1, 21).expect("fits");
+        let space = workspace_out(1, 3).expect("fits");
+        let mut row: AgentRow = serde_json::from_value(serde_json::json!({
+            "terminal": there, "workspace": space, "program": "claude", "state": "blocked",
+            "agent": true, "generation": 1,
+        }))
+        .expect("row");
+        row.status = Some("blocked".into());
+        row.menu = serde_json::from_value(serde_json::json!({
+            "question": "Go on?", "seal": 4,
+            "options": [
+                {"key": "1", "label": "Yes"},
+                {"key": "9", "label": "Type something.", "input": true},
+            ],
+        }))
+        .ok();
+        let spaces = vec![WorkspaceRow {
+            dir: None,
+            keep_awake: false,
+            qass_skip: false,
+            id: space,
+            name: "devbox:work".into(),
+            terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
+            closable: true,
+            ink: None,
+            link: None,
+            link_reason: None,
+            goal: None,
+        }];
+        let (hand, ctx, typed) = (HandInput::default(), Context::default(), BTreeMap::new());
+        let now = Instant::now();
+        let env = Env {
+            rows: std::slice::from_ref(&row),
+            spaces: &spaces,
+            cards: &[],
+            hand: &hand,
+            ctx: &ctx,
+            now,
+            now_unix: 0,
+            typed: &typed,
+        };
+        let mut pane = Pane::new();
+        pane.open();
+        pane.holds.start(Hold {
+            slot: Slot::Agent(there),
+            generation: Some(1),
+            seal: 4,
+            pick: Pick::Text {
+                key: "9".into(),
+                text: "not now".into(),
+            },
+            label: "your words".into(),
+            until: now,
+        });
+        assert!(pane.tick(&env));
+        let sends = pane.take();
+        let [asked @ ControlRequest::AnswerMenuText { .. }] = &sends.requests[..] else {
+            panic!("{sends:?}");
+        };
+        let id = asked.request_id().to_string();
+        mux.control(asked.clone()).await.expect("sent");
+        let at_remote: ControlRequest =
+            body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert!(
+            matches!(
+                at_remote,
+                ControlRequest::AnswerMenuText { terminal: 21, .. }
+            ),
+            "{at_remote:?}"
+        );
+        mux.answer(
+            1,
+            ControlResponse::Failed {
+                id: String::new(),
+                reason: "this daemon is older than the client that called it: it does not know \
+                         the method that was asked for (unknown variant `AnswerMenuText`)"
+                    .into(),
+            },
+        )
+        .await
+        .expect("answered");
+        let said: ControlResponse = body_of(&mux.down);
+        let ControlResponse::Failed { id: back, reason } = &said else {
+            panic!("{said:?}");
+        };
+        assert_eq!(back, &id, "the refusal is not under the answer's id");
+        assert!(refused_as_old(reason), "{reason}");
+        assert!(pane.answered(&said, &env));
+        assert!(pane.take().is_empty(), "something was sent or typed");
+        let card = pane.view(&env, 80, 40).plain.join("\n");
+        assert!(
+            card.contains("qoop on devbox is too old for typed answers"),
+            "{card}"
+        );
+        // Another failure is not taken for it.
+        assert!(!refused_as_old("busy") && !refused_as_old("already_answered"));
+    }
+
+    /// A machine from before menus (0.14.0 and older) is known as one, for the Inbox to offer Open
+    /// the agent there; a newer one, or one whose version is not said, is not.
+    #[test]
+    fn a_machine_from_before_menus_is_known_by_its_version() {
+        // A link number no other test uses: the set is the process's.
+        let link = 97;
+        note_menus(link, "0.14.0");
+        assert!(machines_without_menus().contains(&link));
+        note_menus(link, "0.15.0");
+        assert!(!machines_without_menus().contains(&link));
+        note_menus(link, "0.9.1");
+        assert!(machines_without_menus().contains(&link));
+        note_menus(link, "");
+        assert!(
+            !machines_without_menus().contains(&link),
+            "no version, no guess"
         );
     }
 

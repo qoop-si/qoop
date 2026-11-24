@@ -2816,3 +2816,335 @@ fn under_the_floor_keys_act_on_nothing_unseen_and_a_detach_still_leaves() {
         "ctrl-q under the floor did not detach"
     );
 }
+
+// The Inbox (`ctrl-a i`) -------------------------------------------------------------------
+
+impl Interface {
+    /// Read until a row of the screen as it is now holds `needle`.
+    fn wait_on_screen(&mut self, needle: &str, within: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < within {
+            if self.on_screen(needle) {
+                return true;
+            }
+            let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
+        }
+        self.on_screen(needle)
+    }
+
+    /// Whether a row of the screen as it is now holds `needle`.
+    fn on_screen(&self, needle: &str) -> bool {
+        (1..=self.rows as usize).any(|r| self.screen.text(r).is_some_and(|t| t.contains(needle)))
+    }
+
+    /// Read for `how_long`, so what happens in that time has happened.
+    fn wait_a_while(&mut self, how_long: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < how_long {
+            let _ = self.wait_for("this needle never appears", Duration::from_millis(100));
+        }
+    }
+}
+
+/// A stand-in `claude` that draws Claude Code's permission menu, then keeps the first key it
+/// is given in `typed` (empty until it is given one). Returns where that file will be.
+fn menu_agent(ui: &mut Interface) -> std::path::PathBuf {
+    let dir = ui.runtime_dir().join("bin");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let typed = ui.runtime_dir().join("typed");
+    let agent = dir.join("claude");
+    std::fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\nprintf '\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\\n'\n\
+             printf ' Do you want to proceed?\\n \u{276F} 1. Yes\\n   2. No\\n'\n\
+             stty raw -echo\ndd bs=1 count=1 2>/dev/null > '{}'\nsleep 30\n",
+            typed.display()
+        ),
+    )
+    .expect("write");
+    std::fs::set_permissions(
+        &agent,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .expect("chmod");
+    ui.type_in(format!("{}\n", agent.display()).as_bytes());
+    typed
+}
+
+/// A blocked agent and the Inbox open over it: the interface, and the file the agent types to.
+fn inbox_over_a_blocked_agent() -> (Interface, std::path::PathBuf) {
+    inbox_over_a_blocked_agent_sized(COLS, ROWS)
+}
+
+fn inbox_over_a_blocked_agent_sized(cols: u16, rows: u16) -> (Interface, std::path::PathBuf) {
+    let mut ui = Interface::start_impl_sized(false, cols, rows);
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    let typed = menu_agent(&mut ui);
+    assert!(
+        ui.wait_for_agents(|line| line.contains("claude"), Duration::from_secs(15)),
+        "no agent on the panel: {:?}",
+        agents_panel(&ui.screen)
+    );
+    assert!(
+        ui.wait_for_agents_raw(
+            |line| line.contains("claude")
+                && [
+                    qoop_tui::theme::fg(qoop_tui::theme::Role::Blocked),
+                    qoop_tui::theme::selected_in(qoop_tui::theme::Role::Blocked),
+                ]
+                .iter()
+                .any(|ink| line.contains(ink.as_str())),
+            Duration::from_secs(15)
+        ),
+        "the agent is not blocked: {:?}",
+        agents_panel(&ui.screen)
+    );
+    // From the agent's own tab, the keyboard in its pane.
+    ui.type_in(b"\x01i");
+    assert!(
+        ui.wait_on_screen("needs you 1", Duration::from_secs(10)),
+        "ctrl-a i did not open the Inbox:\n{}",
+        ui.screen
+    );
+    (ui, typed)
+}
+
+/// `ctrl-a i` opens the Inbox from an agent's tab, over the pane: the count, the agent's
+/// question whole and its answers numbered; esc puts it away.
+#[test]
+fn ctrl_a_i_opens_the_inbox_from_an_agent_tab() {
+    let (mut ui, _) = inbox_over_a_blocked_agent();
+    assert!(
+        ui.wait_on_screen("Do you want to proceed?", Duration::from_secs(5)),
+        "the question is not in the Inbox:\n{}",
+        ui.screen
+    );
+    assert!(
+        ui.on_screen("1 Yes") && ui.on_screen("2 No"),
+        "{}",
+        ui.screen
+    );
+    assert!(
+        ui.on_screen("h hand to qass") || ui.on_screen("1-9 answer"),
+        "{}",
+        ui.screen
+    );
+    ui.type_in(b"\x1b");
+    ui.wait_a_while(Duration::from_millis(600));
+    assert!(
+        !ui.on_screen("from qass"),
+        "esc left the Inbox open:\n{}",
+        ui.screen
+    );
+    // The same key opens it again and puts it away again.
+    ui.type_in(b"\x01i");
+    assert!(
+        ui.wait_on_screen("from qass", Duration::from_secs(5)),
+        "{}",
+        ui.screen
+    );
+    ui.type_in(b"\x01i");
+    ui.wait_a_while(Duration::from_millis(600));
+    assert!(
+        !ui.on_screen("from qass"),
+        "ctrl-a i did not put the Inbox away:\n{}",
+        ui.screen
+    );
+}
+
+/// `f` filters the Inbox to what qass wrote, and `f` again clears it.
+#[test]
+fn f_filters_the_inbox_to_qass_and_clears_it() {
+    let (mut ui, _) = inbox_over_a_blocked_agent();
+    ui.type_in(b"f");
+    assert!(
+        ui.wait_on_screen("nothing from qass needs you", Duration::from_secs(5)),
+        "{}",
+        ui.screen
+    );
+    assert!(
+        !ui.on_screen("1 Yes"),
+        "the agent's own menu stayed under the filter"
+    );
+    ui.type_in(b"f");
+    assert!(
+        ui.wait_on_screen("1 Yes", Duration::from_secs(5)),
+        "the second f did not clear the filter:\n{}",
+        ui.screen
+    );
+}
+
+/// A digit starts a three second hold shown on the card, and the answer reaches the agent
+/// when it is up, not before.
+#[test]
+fn a_held_menu_answer_reaches_the_agent_after_three_seconds() {
+    let (mut ui, typed) = inbox_over_a_blocked_agent();
+    // The menu has been on the row for more than its arming by now.
+    ui.wait_a_while(Duration::from_millis(800));
+    ui.type_in(b"1");
+    assert!(
+        ui.wait_on_screen("sending in", Duration::from_secs(5)),
+        "no hold on the card:\n{}",
+        ui.screen
+    );
+    assert!(
+        ui.on_screen("u undo") && ui.on_screen("enter send now"),
+        "{}",
+        ui.screen
+    );
+    ui.wait_a_while(Duration::from_millis(1500));
+    assert_eq!(
+        std::fs::read_to_string(&typed).unwrap_or_default(),
+        "",
+        "the agent had its answer before the hold was up"
+    );
+    let start = Instant::now();
+    while std::fs::read_to_string(&typed)
+        .unwrap_or_default()
+        .is_empty()
+        && start.elapsed() < Duration::from_secs(8)
+    {
+        ui.wait_a_while(Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read_to_string(&typed).unwrap_or_default(), "1");
+}
+
+/// An undone answer never reaches the agent.
+#[test]
+fn an_undone_answer_never_reaches_the_agent() {
+    let (mut ui, typed) = inbox_over_a_blocked_agent();
+    ui.wait_a_while(Duration::from_millis(800));
+    ui.type_in(b"1");
+    assert!(
+        ui.wait_on_screen("sending in", Duration::from_secs(5)),
+        "{}",
+        ui.screen
+    );
+    ui.type_in(b"u");
+    assert!(
+        ui.wait_on_screen("undone", Duration::from_secs(5)),
+        "undo said nothing:\n{}",
+        ui.screen
+    );
+    ui.wait_a_while(Duration::from_secs(5));
+    assert_eq!(
+        std::fs::read_to_string(&typed).unwrap_or_default(),
+        "",
+        "an undone answer reached the agent"
+    );
+}
+
+/// Detaching sends what is held, so an answer the person gave is not lost to the three
+/// seconds.
+#[test]
+fn detaching_sends_an_answer_on_hold() {
+    let (mut ui, typed) = inbox_over_a_blocked_agent();
+    ui.wait_a_while(Duration::from_millis(800));
+    ui.type_in(b"1");
+    assert!(
+        ui.wait_on_screen("sending in", Duration::from_secs(5)),
+        "{}",
+        ui.screen
+    );
+    // `ctrl-q` leaves at once, inside the hold.
+    ui.type_in(b"\x11");
+    let start = Instant::now();
+    while std::fs::read_to_string(&typed)
+        .unwrap_or_default()
+        .is_empty()
+        && start.elapsed() < Duration::from_secs(6)
+    {
+        ui.wait_a_while(Duration::from_millis(100));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&typed).unwrap_or_default(),
+        "1",
+        "a held answer was lost on detach"
+    );
+}
+
+/// A hangup (the terminal window closed) inside the hold sends the answer too.
+#[test]
+fn a_hangup_sends_an_answer_on_hold() {
+    let (mut ui, typed) = inbox_over_a_blocked_agent();
+    ui.wait_a_while(Duration::from_millis(800));
+    ui.type_in(b"1");
+    assert!(
+        ui.wait_on_screen("sending in", Duration::from_secs(5)),
+        "{}",
+        ui.screen
+    );
+    // SAFETY: a signal to the interface process this test spawned and still owns.
+    unsafe { libc::kill(ui.child.id() as i32, libc::SIGHUP) };
+    let start = Instant::now();
+    while std::fs::read_to_string(&typed)
+        .unwrap_or_default()
+        .is_empty()
+        && start.elapsed() < Duration::from_secs(6)
+    {
+        ui.wait_a_while(Duration::from_millis(100));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&typed).unwrap_or_default(),
+        "1",
+        "a held answer was lost to a hangup"
+    );
+}
+
+/// Below 100 columns the agents column folds to its strip while the Inbox is open, and comes
+/// back when it is put away. The screen as a person sees it is kept when `QOOP_INBOX_SHOTS` is
+/// set.
+#[test]
+fn at_80_columns_the_inbox_folds_the_column_and_esc_brings_it_back() {
+    let (mut ui, _) = inbox_over_a_blocked_agent_sized(80, 24);
+    assert!(
+        ui.wait_on_screen("Do you want to proceed?", Duration::from_secs(5)),
+        "{}",
+        ui.screen
+    );
+    assert!(
+        !ui.on_screen("tree +"),
+        "the column stayed wide under the cards:\n{}",
+        ui.screen
+    );
+    if let Ok(dir) = std::env::var("QOOP_INBOX_SHOTS") {
+        let path = std::path::Path::new(&dir).join("inbox-real-80x24.txt");
+        std::fs::write(path, ui.screen.to_string()).expect("keep the screen");
+    }
+    ui.type_in(b"\x1b");
+    assert!(
+        ui.wait_on_screen("tree +", Duration::from_secs(5)),
+        "esc did not bring the column back:\n{}",
+        ui.screen
+    );
+}
+
+/// At 100 columns (the gates' own size) the column stays, and the screen is kept the same way.
+#[test]
+fn the_inbox_at_100_columns_keeps_the_column() {
+    let (mut ui, _) = inbox_over_a_blocked_agent();
+    assert!(
+        ui.wait_on_screen("Do you want to proceed?", Duration::from_secs(5)),
+        "{}",
+        ui.screen
+    );
+    assert!(
+        ui.on_screen("tree +"),
+        "the column folded at 100 columns:\n{}",
+        ui.screen
+    );
+    // The question is said once: what the agent drew above its options is not said again.
+    let said = (1..=ui.rows as usize)
+        .filter(|r| {
+            ui.screen
+                .text(*r)
+                .is_some_and(|t| t.contains("Do you want to proceed?"))
+        })
+        .count();
+    assert_eq!(said, 1, "{}", ui.screen);
+    if let Ok(dir) = std::env::var("QOOP_INBOX_SHOTS") {
+        let path = std::path::Path::new(&dir).join("inbox-real-100x30.txt");
+        std::fs::write(path, ui.screen.to_string()).expect("keep the screen");
+    }
+}
