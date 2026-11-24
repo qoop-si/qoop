@@ -1,7 +1,8 @@
-//! The Board as the Inbox's second view, read only: Waiting on you, Doing, Todo and Done, from
-//! `TaskRead { board: true }`. The bands and their order are the phone's (`bandsOf` and
+//! The Board the desktop's Inbox shows as its second view: Waiting on you, Doing, Todo and Done,
+//! from `TaskRead { board: true }`. Shared data, read by the desktop; the terminal interface
+//! shows the board page in its own pane on qass's screen. The bands and their order are the phone's (`bandsOf` and
 //! `group` in `ui/inboxView.ts` and `ui/board.ts`), so the two surfaces list the same items in
-//! the same order. Pure values and functions, so a test reads the rows instead of a screen.
+//! the same order. Pure values and functions, so a test reads the values instead of a screen.
 //!
 //! "Waiting on you" holds the same records as the Inbox's cards ("also in Needs you, the same
 //! records"): an item is in that band and in no other, and an item whose only waiting agent is
@@ -10,9 +11,6 @@
 use std::collections::BTreeSet;
 
 use qoop_runtime::control::{ControlRequest, ControlResponse, ItemInfo};
-
-use crate::inbox_pane::Row;
-use crate::theme::Role;
 
 /// The request id the board is read under.
 pub const READ_ID: &str = "board-read";
@@ -86,7 +84,7 @@ impl Board {
         })
     }
 
-    /// The daemon's answer to the read. True when the screen changed.
+    /// The daemon's answer to the read. True when what is shown changes.
     pub fn answered(&mut self, response: &ControlResponse) -> bool {
         self.answered_to(READ_ID, response)
     }
@@ -317,95 +315,6 @@ pub fn why(i: &ItemInfo, band: Band) -> String {
     }
 }
 
-/// The board's rows in `cols` columns, every word whole: each band's title with its count,
-/// then its items as `KEY title` and under it the reason.
-#[cfg(test)]
-pub(crate) fn rows(board: &Board, handed: &BTreeSet<u32>, cols: usize) -> Vec<Row> {
-    rows_of(board, "This Mac", handed, cols)
-}
-
-/// [`rows`] for the board of the computer called `machine`, which a too old qoop there names.
-pub(crate) fn rows_of(
-    board: &Board,
-    machine: &str,
-    handed: &BTreeSet<u32>,
-    cols: usize,
-) -> Vec<Row> {
-    use crate::inbox_pane::wrapped;
-    let plain = |text: &str| vec![Row::plain(Role::FaintText, format!(" {text}"))];
-    match &board.read {
-        Read::Unread | Read::Reading => return plain("reading the board"),
-        Read::Old => {
-            return wrapped(&too_old(machine), 1, cols, Role::FaintText, false);
-        }
-        Read::Failed(why) => {
-            return wrapped(
-                &format!("the board could not be read: {why}"),
-                1,
-                cols,
-                Role::Failed,
-                false,
-            );
-        }
-        Read::Items(items) if items.iter().all(|i| i.hidden) => {
-            return wrapped("nothing on the board yet", 1, cols, Role::FaintText, false);
-        }
-        Read::Items(_) => {}
-    }
-    let Read::Items(items) = &board.read else {
-        return Vec::new();
-    };
-    let bands = bands_of(items, handed);
-    let mut out: Vec<Row> = Vec::new();
-    for band in Band::ALL {
-        let list = bands.of(band);
-        let (ink, title) = match band {
-            Band::Wait => (Role::Blocked, "waiting on you"),
-            Band::Doing => (Role::Working, "doing"),
-            Band::Todo => (Role::FaintText, "todo"),
-            Band::Done => (Role::Done, "done"),
-        };
-        out.extend(wrapped(
-            &format!("{title} {}", list.len()),
-            1,
-            cols,
-            ink,
-            true,
-        ));
-        if band == Band::Wait {
-            out.extend(wrapped(WAIT_NOTE, 3, cols, Role::FaintText, false));
-        }
-        if list.is_empty() {
-            out.extend(wrapped("nothing here", 3, cols, Role::FaintText, false));
-        }
-        for i in list {
-            out.extend(wrapped(
-                &format!("{} {}", i.key, i.title),
-                3,
-                cols,
-                Role::Text,
-                false,
-            ));
-            let why = why(i, band);
-            if !why.is_empty() {
-                out.extend(wrapped(
-                    &why,
-                    7,
-                    cols,
-                    if band == Band::Wait {
-                        Role::Blocked
-                    } else {
-                        Role::FaintText
-                    },
-                    false,
-                ));
-            }
-        }
-        out.push(Row::blank());
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,35 +413,5 @@ mod tests {
         };
         assert!(board.answered(&said));
         assert_eq!(board.read, Read::Old);
-    }
-
-    /// Every word of a band is on screen whole, at any width, and the waiting band says it is
-    /// the Inbox's records.
-    #[test]
-    fn rows_say_the_bands_and_cut_nothing() {
-        let long = "Rust 1.100 toolchain bump and CI cache for every crate in the workspace";
-        let mut a = item("QOOP-68", "doing", 20, serde_json::json!({"open_asks": 1}));
-        a.title = long.into();
-        let board = Board {
-            read: Read::Items(vec![a, item("QOOP-72", "todo", 40, serde_json::json!({}))]),
-            stale: false,
-        };
-        for cols in [30, 41, 63, 160] {
-            let text: Vec<String> = rows(&board, &BTreeSet::new(), cols)
-                .iter()
-                .map(|r| r.segs.iter().map(|s| s.text.as_str()).collect::<String>())
-                .collect();
-            let joined = text.join(" ");
-            assert!(joined.contains("waiting on you 1"), "{cols}: {text:?}");
-            assert!(joined.contains(WAIT_NOTE.split(',').next().unwrap_or("")));
-            assert!(!joined.contains('\u{2026}'), "{cols}: an ellipsis");
-            for word in long.split(' ') {
-                assert!(joined.contains(word), "{cols}: lost {word}");
-            }
-            assert!(
-                text.iter().all(|t| crate::width::width(t) <= cols),
-                "{cols}: a row is wider than the pane"
-            );
-        }
     }
 }

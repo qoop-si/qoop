@@ -80,9 +80,42 @@ pub fn board_page(argv: &[String]) -> bool {
     }
 }
 
-/// The name of the pane `qoop qass` used to show the board in, above qass in its tab: what the
-/// daemon types the page into on a wake, and an interface finds an old one by.
+/// The name of the pane `qoop qass` shows the board in, above qass in its tab.
 pub const BOARD_PANE: &str = "board";
+
+/// Whether qass's terminal `qass` has the board in its tab: a pane named [`BOARD_PANE`] among
+/// `tree`, the rows of the panes of the tab it is in, whatever runs in that pane now. qass is
+/// found by its folder, never by a pane's place, and another pane is left alone. A board pane
+/// that came back as a shell gets its page from the wake that brought it back (`restore_rows`),
+/// the one place that types it, so it is never typed twice.
+pub fn has_board<'a>(
+    tree: impl IntoIterator<Item = &'a crate::control::AgentRow>,
+    qass: u32,
+) -> bool {
+    tree.into_iter()
+        .any(|r| r.terminal != qass && r.name.as_deref() == Some(BOARD_PANE))
+}
+
+/// A board pane in qass's space left in a tab of its own (qass's tab closed and the board
+/// stayed): the next start puts that one beside the new qass rather than opening a second
+/// board. A board sharing a tab with anything else is left alone.
+pub fn lone_board(
+    rows: &[crate::control::AgentRow],
+    trees: &[crate::control::Pane],
+    qass: u32,
+) -> Option<u32> {
+    let space = rows.iter().find(|r| r.terminal == qass)?.workspace;
+    rows.iter()
+        .filter(|r| {
+            r.terminal != qass && r.workspace == space && r.name.as_deref() == Some(BOARD_PANE)
+        })
+        .map(|r| r.terminal)
+        .find(|t| {
+            trees
+                .iter()
+                .all(|tree| !tree.leaves().contains(t) || tree.leaves() == [*t])
+        })
+}
 
 /// [`board_page`], for the process in front of the terminal `master`, run by this very
 /// binary: a script that only calls itself `qoop` is no page of ours, and keeps its tab awake.
@@ -518,6 +551,78 @@ mod tests {
         ] {
             assert!(!board_page(&argv(not)), "{not:?}");
         }
+    }
+
+    /// The board is the pane named so beside qass, wherever it sits in the tab and whatever
+    /// runs in it: a board pane at a shell is left for the wake to type into, never typed
+    /// into here, and a pane already running the page is never typed into.
+    #[test]
+    fn qass_has_its_board_by_the_panes_name_alone() {
+        let row = |terminal: u32, name: Option<&str>, program: Option<&str>| {
+            serde_json::from_value::<crate::control::AgentRow>(serde_json::json!({
+                "terminal": terminal, "workspace": 1, "name": name, "program": program,
+                "behind": null, "state": "idle", "generation": null,
+            }))
+            .unwrap()
+        };
+        let qass = 7;
+        let me = row(7, Some("qass"), Some("claude"));
+        assert!(!has_board([], qass));
+        assert!(!has_board([&me], qass), "qass alone in its tab");
+        let notes = row(8, Some("notes"), Some("zsh"));
+        assert!(!has_board([&notes, &me], qass), "another pane is no board");
+        let named_qass = row(7, Some(BOARD_PANE), Some("claude"));
+        assert!(
+            !has_board([&named_qass], qass),
+            "qass itself is never its board"
+        );
+        for program in [Some("qoop"), Some("zsh"), None] {
+            let board = row(9, Some(BOARD_PANE), program);
+            assert!(has_board([&board, &me], qass), "{program:?}");
+            assert!(
+                has_board([&notes, &me, &board], qass),
+                "anywhere: {program:?}"
+            );
+        }
+    }
+
+    /// qass's tab closed and its board stayed in a tab of its own: the next start takes that
+    /// board back, never a second one; a board in a tab with something else, or in another
+    /// space, is not it.
+    #[test]
+    fn a_board_left_alone_is_taken_back() {
+        use crate::control::Pane;
+        let row = |terminal: u32, workspace: i64, name: &str| {
+            serde_json::from_value::<crate::control::AgentRow>(serde_json::json!({
+                "terminal": terminal, "workspace": workspace, "name": name,
+                "program": "qoop", "behind": null, "state": "idle", "generation": null,
+            }))
+            .unwrap()
+        };
+        let leaf = |terminal| Pane::Leaf { terminal };
+        let pair = |a, b| Pane::Split {
+            dir: crate::control::SplitDir::V,
+            permille: 500,
+            questions: 0,
+            first: Box::new(leaf(a)),
+            second: Box::new(leaf(b)),
+        };
+        let qass = row(20, 3, "qass");
+        let left = row(9, 3, BOARD_PANE);
+        assert_eq!(lone_board(&[qass.clone(), left.clone()], &[], 20), Some(9));
+        assert_eq!(
+            lone_board(&[qass.clone(), left.clone()], &[leaf(9)], 20),
+            Some(9),
+            "a tab of its own"
+        );
+        assert_eq!(
+            lone_board(&[qass.clone(), left.clone()], &[pair(9, 11)], 20),
+            None,
+            "it shares a tab"
+        );
+        let elsewhere = row(9, 4, BOARD_PANE);
+        assert_eq!(lone_board(&[qass.clone(), elsewhere], &[], 20), None);
+        assert_eq!(lone_board(&[left], &[], 20), None, "no qass listed");
     }
 
     #[test]

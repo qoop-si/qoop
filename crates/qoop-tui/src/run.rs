@@ -91,16 +91,18 @@ fn copied(text: &str, via: crate::selection::CopyVia) -> String {
     }
 }
 
-/// The short form of what was copied: a line count, the text itself while it is short, or how
-/// many characters it was. Never the text cut: past 40 columns the count says what was taken.
+/// The short form of what was copied: a line count, or the text itself cut to
+/// the notice row.
 fn short_copied(text: &str) -> String {
     let lines = text.lines().count();
     if lines > 1 {
         return format!("{lines} lines");
     }
     let one = text.trim();
+    // Shown, so a person can see they got the right thing, and cut so a long line does not
+    // push the rest of the notice off the row.
     if crate::width::width(one) > 40 {
-        format!("{} characters", one.chars().count())
+        format!("{}\u{2026}", crate::selection::in_columns(one, 0..39))
     } else {
         one.to_string()
     }
@@ -255,6 +257,9 @@ const QASS_OPENING: &str = "opening qass";
 
 /// What a second press says while that `qoop qass` is still running.
 const QASS_ON_ITS_WAY: &str = "qass is on its way";
+
+/// The request id of the open pane's task read (`crate::tabq`).
+const TABQ_READ: &str = "tabq-task";
 
 /// What ctrl-a U says: whether a newer release is waiting, and how it gets installed.
 ///
@@ -579,7 +584,7 @@ enum Blocked {
     },
     /// An agent's last answer read from its transcript, or why it could not be.
     Answer(u32, Result<crate::answer::Answer, String>),
-    /// `qoop qass` ran for Start qass in the ledger: what it said when it could not start or wake qass.
+    /// `qoop qass` ran for `ctrl-a Q`: what it said when it could not start or wake qass.
     Qass(Result<(), String>),
     /// A picture for a remote tab made small, or the clipboard read for one, by its id.
     Picture(String, Result<Option<crate::picture::Prepared>, String>),
@@ -773,6 +778,15 @@ async fn send_to_terminal(
         seqs.entry(terminal).or_default(),
     )?;
     wr.write_all(&frame).await
+}
+
+/// What a board page is told about its held press let go outside it.
+fn board_drop(on_qass: bool) -> Vec<u8> {
+    format!(
+        "\x1b]7701;drop={}\x07",
+        if on_qass { "qass" } else { "none" }
+    )
+    .into_bytes()
 }
 
 /// The id of the interface's own question whether the daemon could move onto a newer qoop.
@@ -1030,12 +1044,16 @@ struct State {
     message: Option<String>,
     /// A terminal to move to once the loop can write the subscription for it.
     pending_focus: Option<u32>,
-    /// When Start qass last asked `qoop qass` to start or wake it, so a second press before
+    /// Where the keyboard was before it went to qass's space, for `ctrl-a Q` to go back to.
+    qass_back: Option<u32>,
+    /// When `ctrl-a Q` last asked `qoop qass` to start or wake it, so a second press before
     /// its tab is listed does not start a second qass.
     qass_asked: Option<std::time::Instant>,
-    /// The cards qass keeps for the owner, as read: the Inbox lists them.
+    /// The qass screen's own memory: its zoom, and the clocks its lines age on.
+    qass_ui: crate::qass_screen::Ui,
+    /// The question inbox beside qass's terminal: its cards, what is typed, the answer held.
     asks: crate::asks::Pane,
-    /// The schedules, as read: qass's ledger lists them.
+    /// The schedules on qass's screen: the rows, the pick, the form.
     clock: crate::schedules::Pane,
     /// When this client last forwarded a key or a paste to each terminal, so a talk line is
     /// never pasted over what he is typing there, nor twice.
@@ -1137,9 +1155,12 @@ struct State {
     creating: usize,
     /// How the column orders its agents: the tree of spaces, or flat by urgency.
     view: sidebar::View,
-    /// The Inbox as it stood when the rows or the cards last moved: the left column's groups
-    /// and its one count are read from it, so no screen says a number the Inbox does not.
-    ibx_list: crate::inbox::Inbox,
+    /// The inbox at the top of the column: its list, its height, folded or not. Client-local
+    /// like `view`.
+    inbox: sidebar::Inbox,
+    /// The title row held by the mouse to drag the inbox's edge: the screen row the press
+    /// landed on and the list rows the inbox had then.
+    inbox_drag: Option<(u16, usize)>,
     /// The spaces folded away under their rule. Client-local like `view`: the daemon
     /// never knows, and a space that goes away leaves this set with the next index.
     shut: sidebar::Shut,
@@ -1153,21 +1174,6 @@ struct State {
     prefix_pending: bool,
     /// An agent's last answer, open as a page over the pane.
     answer: Option<crate::answer::Answer>,
-    /// The Inbox pane: what needs the person, over the pane (`ctrl-a i`).
-    ibx: crate::inbox_pane::Pane,
-    /// What this client knows about qass and the hands to it, for the Inbox.
-    hand: crate::answers::HandInput,
-    /// Every card read (open, answered and ended), as the Inbox lists them.
-    ibx_cards: Vec<qoop_runtime::control::AskInfo>,
-    /// What the Inbox needs around the rows: today's start, the computers not reached.
-    ibx_ctx: crate::inbox::Context,
-    /// The status row's word about an answer on hold while the Inbox is put away.
-    ibx_held: Option<String>,
-    /// When the person's day began, as last looked up ([`crate::inbox_pane::day_start`]).
-    ibx_day: i64,
-    /// What the places beside the Inbox (the Board, qass's ledger, a computer, the new agent
-    /// box) have read and are owed.
-    beside: BesideState,
     /// What each local agent costs, as last sampled. Empty unless `QOOP_USAGE=1`.
     usage: sidebar::Usage,
     /// Each sampled terminal's group, when it was read, and each member's CPU nanoseconds
@@ -1247,6 +1253,24 @@ struct State {
     /// first list row. A move of the keyboard to another terminal lets the list follow it
     /// again, so a scroll never hides where the keys went.
     list_scroll: Option<(u32, usize)>,
+    /// The agent terminal whose tab has its questions rail unfolded to the pane (`ctrl-a T`, a
+    /// click on the rail): the one state the rail's width follows (`crate::tabq`).
+    tabq: Option<u32>,
+    /// The keyboard is in that pane, given while this leaf had the focus: the focus moving to
+    /// another leaf (a shell beside the agent) takes it back.
+    tabq_focus: Option<u32>,
+    /// `s` folded or opened the pane's task part by hand.
+    tabq_task: Option<bool>,
+    /// The pane's task read, by what it was read for ([`crate::tabq::read_key`]), and the
+    /// request id and key of a read on its way: an answer under another id is an old one.
+    tabq_read: Option<(crate::tabq::ReadKey, crate::tabq::TaskRead)>,
+    tabq_asked: Option<(String, crate::tabq::ReadKey)>,
+    /// Where that agent stood when its pane unfolded ([`State::tab_home`]): the pane folds once
+    /// the agent is gone or stands anywhere else.
+    tabq_home: Option<TabHome>,
+    /// The unfolded pane's width as he dragged its edge or stepped it with `<` `>`, kept for the
+    /// session and never saved, like qass's rail; `None` for [`crate::tabq::OPEN`].
+    tabq_w: Option<usize>,
     /// The panel width the focused child was last sized to.
     ///
     /// Drag motions repaint every frame but reflow at most once per frame:
@@ -1371,6 +1395,13 @@ struct State {
     /// program is owed the rest of that gesture wherever the pointer goes; without the
     /// flag a release outside the tile was dropped and vim never saw the button come up.
     forwarded_press: bool,
+    /// A press forwarded to the board page of qass's tab, still held: let go outside the
+    /// board, the page is told where (qass's pane or nowhere) instead of getting a release
+    /// on its edge, which would land on a lane.
+    board_drag: Option<u32>,
+    /// A board page owed the word that its held card was let go (`drop=none`): the gesture
+    /// ended where no write was in hand (the keyboard left for an empty space).
+    board_owed: Option<u32>,
     /// The last press in the focused pane, as the terminal and its tile-local cell,
     /// with when it landed. Two presses on the same cell within [`DOUBLE_CLICK_MS`]
     /// are one double click, which takes the word under the pointer and copies it.
@@ -1390,6 +1421,15 @@ struct Toast {
 /// Which tile a screen position lands in: its terminal, the pane-global cell,
 /// and the tile-local cell. Divider cells answer `None`.
 type TileHit = (u32, (usize, usize), (usize, usize));
+
+/// Where a terminal stands ([`State::tab_home`]): its space, its tab's first leaf, and the
+/// other panes of its tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabHome {
+    space: i64,
+    tab: u32,
+    others: Vec<u32>,
+}
 
 /// An agent row under a held button. `name` is whether the press landed on the row that
 /// names the agent rather than the one under it.
@@ -1472,10 +1512,16 @@ struct Closing {
 ///
 /// Together because they are one idea: a key means something else until the mode is left,
 /// and `apply` (which cannot write) sometimes has to ask the daemon on a mode's behalf.
-/// An edge held by the mouse: a divider of the tree.
+/// An edge of qass's tab held by the mouse: a divider of the tree, the questions' own edge, or the
+/// rail's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Grab {
     Divider(layout::SplitPath),
+    Questions,
+    /// The edge line of qass's rail: its width, kept for the session and never saved.
+    Rail,
+    /// The left frame line of an agent pane's unfolded questions pane: its width, the same.
+    Tabq,
 }
 
 #[derive(Default)]
@@ -1503,6 +1549,8 @@ struct Modes {
     side_ask: Option<Vec<i64>>,
     /// An edge held by the mouse.
     split_drag: Option<Grab>,
+    /// The edge last pressed and when, so a second press on it is a double click.
+    divider_click: Option<(Grab, std::time::Instant)>,
     /// A close waiting for its `y`: the terminal, and the question on the notice row.
     confirm_close: Option<(u32, String)>,
     /// Rows for a pinned view that went behind the screen have been asked for and not
@@ -1521,174 +1569,6 @@ impl Modes {
     /// Whether a mode owns the keyboard.
     fn open(&self) -> bool {
         self.copy.is_some() || self.resizing || self.side.is_some() || self.confirm_close.is_some()
-    }
-}
-
-/// What the places beside the Inbox have read from the daemon and what they are owed.
-#[derive(Default)]
-struct BesideState {
-    board: crate::board::Board,
-    /// The boards of other computers, read when the Board shows one (`m` turns to it).
-    boards: std::collections::BTreeMap<usize, crate::board::Board>,
-    /// The computer last asked for its board, and when, so it is read again on a 30 s tick.
-    board_asked: Option<(usize, std::time::Instant)>,
-    /// What qass did today; `None` until read.
-    acts: Option<Vec<qoop_runtime::control::QassAct>>,
-    /// The acts are owed a new read.
-    acts_stale: bool,
-    /// When the ledger last asked what qass did, so it asks again on a 30 s tick while it shows.
-    acts_asked: Option<std::time::Instant>,
-    /// Why they could not be read, and whether the daemon is too old to have them.
-    acts_failed: Option<(String, bool)>,
-    /// qass's rules as the lessons file counts them, read when the ledger opens.
-    rules: Option<crate::answers::Lessons>,
-    /// When each machine, and qass, was last seen reached.
-    reach: crate::places::Reach,
-    /// The agents that can start in a worktree, listed when the new agent box opens.
-    offers: Vec<(String, String)>,
-    /// `qoop qass` is owed: Start qass was pressed.
-    start_qass: bool,
-    /// The old board panes already asked to close, so each is asked once.
-    closed_boards: std::collections::BTreeSet<u32>,
-    /// Requests the places made, numbered apart from the loop's own.
-    asked: u64,
-    /// Where `qoop qass` and the like are run from.
-    blocking: Option<tokio::sync::mpsc::UnboundedSender<Blocked>>,
-}
-
-impl BesideState {
-    /// The board of `computer` as read so far (This Mac's is the one the ledger reads too).
-    fn board_for(&self, computer: usize) -> &crate::board::Board {
-        static UNREAD: std::sync::OnceLock<crate::board::Board> = std::sync::OnceLock::new();
-        match computer {
-            0 => &self.board,
-            m => self
-                .boards
-                .get(&m)
-                .unwrap_or_else(|| UNREAD.get_or_init(crate::board::Board::default)),
-        }
-    }
-}
-
-/// The Inbox's view of the client: the rows, the cards, what is known about qass and the
-/// clocks, borrowed field by field so the pane itself can be borrowed mutably beside them.
-macro_rules! ibx_env {
-    ($s:expr) => {
-        crate::inbox_pane::Env {
-            rows: &$s.rows,
-            spaces: &$s.spaces,
-            cards: &$s.ibx_cards,
-            hand: &$s.hand,
-            ctx: &$s.ibx_ctx,
-            now: std::time::Instant::now(),
-            now_unix: sidebar::now_unix(),
-            typed: &$s.typed_at,
-            beside: &crate::places::Beside {
-                // The board the Inbox shows: another computer's while the Board is turned to
-                // it, This Mac's for everything else (the ledger reads it too).
-                board: $s.beside.board_for(
-                    if $s.ibx.open && $s.ibx.board && $s.ibx.place.is_none() {
-                        $s.ibx.computer
-                    } else {
-                        0
-                    },
-                ),
-                acts: $s.beside.acts.as_deref(),
-                acts_failed: $s
-                    .beside
-                    .acts_failed
-                    .as_ref()
-                    .map(|(r, old)| (r.as_str(), *old)),
-                schedules: $s.clock.loaded.then_some(&$s.clock.list[..]),
-                rules: $s.beside.rules,
-                reach: &$s.beside.reach,
-                offers: &$s.beside.offers,
-            },
-        }
-    };
-}
-
-impl State {
-    /// Read what the Inbox needs around the rows: qass and the hands to it, the computers not
-    /// reached, when the person's day began. Called when the rows or the cards moved, and
-    /// before every frame.
-    fn refresh_ibx(&mut self) {
-        let now = sidebar::now_unix();
-        crate::inbox_pane::update_hand(
-            &mut self.hand,
-            &self.spaces,
-            &self.rows,
-            &self.ibx_cards,
-            &self.ibx.no_hands,
-            sidebar::watching(),
-            now,
-        );
-        // One record, the window's: noted here, and read back for the places drawn from `Env`.
-        crate::places::note_reach(&self.spaces, now, self.hand.qass.is_some());
-        self.beside.reach = crate::places::reach_now();
-        let day = crate::inbox_pane::day_start(&mut self.ibx_day, now);
-        self.ibx_ctx =
-            crate::inbox_pane::context(&self.spaces, day, crate::mux::machines_without_menus());
-        self.ibx.unlisted = crate::mux::machines_unlisted();
-        let env = ibx_env!(self);
-        let list = self.ibx.inbox(&env);
-        self.ibx_held = self.ibx.held_line(&env);
-        self.ibx_list = list;
-    }
-
-    /// A new agent list: the hands are noted, the held answers whose menu changed are dropped.
-    fn rows_changed_ibx(&mut self) {
-        self.refresh_ibx();
-        let env = ibx_env!(self);
-        self.ibx.rows_changed(&env);
-    }
-
-    /// The cards were read again: the Inbox lists open, answered and ended ones alike.
-    fn cards_changed_ibx(&mut self) {
-        self.ibx_cards = self
-            .asks
-            .live
-            .iter()
-            .chain(self.asks.ended.iter())
-            .cloned()
-            .collect();
-        self.rows_changed_ibx();
-    }
-
-    /// The Inbox's list as it stands now: what needs the person.
-    fn inbox_now(&self) -> crate::inbox::Inbox {
-        let env = ibx_env!(self);
-        self.ibx.inbox(&env)
-    }
-
-    /// Where the Inbox is painted: from the first screen row, over the tab bar and the pane,
-    /// as wide as the pane. In pane columns and rows.
-    fn ibx_size(&self) -> (usize, usize) {
-        let (cols, rows) =
-            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
-        (cols as usize, rows as usize + screen::TABS)
-    }
-
-    /// The Inbox painted, when it is open and nothing else owns the screen.
-    fn ibx_view(&self) -> Option<crate::inbox_pane::View> {
-        // A box, a mode or a close asking its question has the screen: the Inbox steps aside
-        // and comes back when it is answered.
-        if !self.ibx.open
-            || self.palette.is_some()
-            || self.prompt.is_some()
-            || self.menu.is_some()
-            || self.reading.is_some()
-            || self.modes.open()
-            || self.armed.is_some()
-        {
-            return None;
-        }
-        let (cols, rows) = self.ibx_size();
-        if cols == 0 || rows == 0 {
-            return None;
-        }
-        let env = ibx_env!(self);
-        Some(self.ibx.view(&env, cols, rows))
     }
 }
 
@@ -1719,7 +1599,7 @@ impl State {
         }
         // No tree yet (a space just made, an adopt before its first focus): the pane is drawn
         // in its frame all the same, as it is sized (`focused_rect`).
-        if tiles.is_empty() && self.focused != 0 {
+        if tiles.is_empty() && self.focused != 0 && !self.on_qass_screen() {
             tiles.push(screen::Tile {
                 terminal: self.focused,
                 rect: self.lone_rect(self.focused),
@@ -1739,10 +1619,7 @@ impl State {
             cols: self.cols,
             lines: self.lines,
             // A mode speaks for itself on the notice row: its keys, or its question.
-            message: self
-                .mode_line()
-                .or(self.ibx_held.as_deref().filter(|_| !self.ibx.open))
-                .or(self.message.as_deref()),
+            message: self.mode_line().or(self.message.as_deref()),
             hint: self.hint.as_deref().or_else(|| self.chat_hint()),
             view: self.view,
             seen: &self.seen_done,
@@ -1772,13 +1649,20 @@ impl State {
             image_notice: None,
             toast: toast_text(self),
             chrome: screen::Chrome {
+                qass: self.qass_header().then(|| crate::qass_screen::Ui {
+                    clock: self.clock_rows(),
+                    ..self.qass_ui
+                }),
+                asks: self.qass_header().then_some(&self.asks),
+                clock: self.qass_header().then_some(&self.clock),
+                questions: self.qass_split().then(|| self.questions()).flatten(),
+                rail: self.qass_split().then(|| self.rail_paint()).flatten(),
+                handle: self.qass_split().then(|| self.handle()).flatten(),
+                questions_handle: self.qass_split().then(|| self.questions_handle()).flatten(),
+                fold: self.qass_split().then(|| self.fold_paint()).flatten(),
                 agent_order: self.agent_view.as_ref(),
-                tab_lines: self.tab_lines(),
-                list: &self.ibx_list,
-                next: self.next_waiting(),
-                hand: self.hand.qass_off().is_none(),
-                holding: !self.ibx.holds.held.is_empty(),
-                words: self.ibx.can_type(&ibx_env!(self)),
+                tab_rails: self.tab_rails(),
+                cards: &self.asks.live,
                 chat_refused: self.chat.is_refused(self.focused),
                 shut: &self.shut,
                 doze_open: &self.doze_open,
@@ -1787,6 +1671,7 @@ impl State {
                 answer: self.answer.is_some(),
                 dim: self.dim_tab().unwrap_or(0),
                 list_scroll: self.list_scroll(),
+                inbox: self.inbox,
                 nav: self.modes.side.as_ref(),
                 keys_query: self.keys_query.as_deref(),
                 keys_page: self.keys_page,
@@ -1799,7 +1684,16 @@ impl State {
                 mode: if self.modes.confirm_close.is_some() {
                     None
                 } else if self.modes.resizing {
-                    Some(("resize", screen::RESIZE_HINT))
+                    Some((
+                        "resize",
+                        if self.questions().is_some_and(|side| !side.replaces) {
+                            screen::RESIZE_QUESTIONS_HINT
+                        } else if self.on_board_tab() {
+                            screen::RESIZE_BOARD_HINT
+                        } else {
+                            screen::RESIZE_HINT
+                        },
+                    ))
                 } else if let Some(nav) = &self.modes.side {
                     // With something to say, the row says it: a refusal from the daemon
                     // would otherwise sit under the keys, unread.
@@ -1826,10 +1720,10 @@ impl State {
                     && screen::left_for(self.cols, self.collapsed, self.sidebar_width) > 0
                 {
                     screen::KeyContext::Sidebar
-                } else if self.ibx.open && self.ibx.place.is_some() {
-                    screen::KeyContext::Place
-                } else if self.ibx.open {
-                    screen::KeyContext::Inbox
+                } else if self.tabq_focused() {
+                    screen::KeyContext::Questions
+                } else if self.qass_split() && fold_leaves(self).is_some() {
+                    screen::KeyContext::Qass
                 } else {
                     screen::KeyContext::Pane
                 },
@@ -1935,19 +1829,39 @@ impl State {
         if self.focused == 0 {
             return None;
         }
+        // qass's box: only its inside is the terminal, counted from the inside's corner.
+        if self.on_qass_screen() {
+            let inner = self.qass_rect()?;
+            if within < inner.y
+                || within >= inner.y + inner.rows
+                || x < inner.x
+                || x >= inner.x + inner.cols
+            {
+                return None;
+            }
+            let local = (within - inner.y, x - inner.x);
+            return Some((self.focused, local, local));
+        }
+        // The pane open over the agent's tile has its cells: no terminal is under them.
+        if self.tabq_open().is_some_and(|open| {
+            let r = open.rect;
+            open.over && x >= r.x && x < r.x + r.cols && within >= r.y && within < r.y + r.rows
+        }) {
+            return None;
+        }
         if let Some(space) = self.space
             && let Some(layout) = self.drawn_tree(space)
         {
             let hit = layout.hit(self.tree_area(&layout), x, within)?;
-            // An agent's reserved line is not its terminal's cells.
+            // An agent's rail and the line before it are not its terminal's cells.
             let rect = self.term_rect_in(&layout, hit)?;
-            if within >= rect.y + rect.rows {
+            if x >= rect.x + rect.cols {
                 return None;
             }
             return Some((hit, (within, x), (within - rect.y, x - rect.x)));
         }
         // No tree yet: the pane stands in its frame as it is drawn (`frame`), and the frame's
-        // own cells are not the terminal's, nor its reserved line's.
+        // own cells are not the terminal's, nor its rail's.
         let r = self.lone_rect(self.focused);
         if within < r.y || within >= r.y + r.rows || x < r.x || x >= r.x + r.cols {
             return None;
@@ -1962,6 +1876,10 @@ impl State {
     fn scrolled_rows(&self) -> usize {
         let (_, pane_rows) =
             screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        let pane_rows = self
+            .qass_rect()
+            .filter(|_| self.on_qass_screen())
+            .map_or(pane_rows, |inner| inner.rows as u16);
         let Some(anchor) = self.anchor else {
             return 0;
         };
@@ -2119,21 +2037,6 @@ impl State {
         )
     }
 
-    /// Whether a click lands on the reserved line of an agent that waits: its words say
-    /// `ctrl-a i answers`, and the click is that key.
-    fn line_hit(&self, row: u16, col: u16, left: usize) -> bool {
-        let (Some(x), Some(y)) = (
-            (col as usize).checked_sub(left + 1),
-            (row as usize).checked_sub(screen::TABS + 1),
-        ) else {
-            return false;
-        };
-        self.tab_lines().iter().any(|line| {
-            let r = line.rect;
-            line.waiting && y == r.y && (r.x..r.x + r.cols).contains(&x)
-        })
-    }
-
     /// The park control a click lands on, as the paint drew it (`screen::park_spot`).
     fn park_hit(&self, row: u16, col: u16, left: usize) -> Option<u32> {
         // Cheap first: no control, nothing to build a frame for.
@@ -2167,10 +2070,52 @@ impl State {
             return false;
         }
         let (x, y) = self.pane_cell(row, col);
-        let grab = self
-            .space
-            .and_then(|space| self.drawn_tree(space))
-            .and_then(|layout| layout.divider_at(area, x, y).map(Grab::Divider));
+        // An agent pane's unfolded questions pane: its left edge drags its width.
+        if self.on_tabq_edge(x, y) {
+            self.modes.split_drag = Some(Grab::Tabq);
+            return true;
+        }
+        // The rail's edge first, also with a pane folded (that is when there is one): it is
+        // a line of its own, and a stacked tab's divider runs under it.
+        let rail = self.on_rail_edge(x, y);
+        // The rail's body is not a stacked tab's divider, which runs under it.
+        if !rail
+            && self
+                .rail_paint()
+                .is_some_and(|r| x < r.x + r.w + crate::rail::EDGE)
+        {
+            return false;
+        }
+        // A pane folded away: no divider to drag, it is not where its ratio says.
+        if !rail && self.folded().is_some() {
+            return false;
+        }
+        let shown = self.space.and_then(|space| self.drawn_tree(space));
+        let grab = if rail {
+            Some(Grab::Rail)
+        } else {
+            shown.and_then(|layout| match layout.divider_at(area, x, y) {
+                Some(path) => Some(Grab::Divider(path)),
+                None => layout
+                    .on_questions_edge(area, x, y)
+                    .then_some(Grab::Questions),
+            })
+        };
+        // A second press on an edge of qass's tab within a double click's time puts what it
+        // moves back to its default, and holds nothing.
+        let now = std::time::Instant::now();
+        let double = self.on_board_tab()
+            && grab.as_ref().is_some_and(|grab| {
+                self.modes.divider_click.as_ref().is_some_and(|(was, at)| {
+                    was == grab && now.duration_since(*at).as_millis() <= DOUBLE_CLICK_MS as u128
+                })
+            });
+        self.modes.divider_click = grab.clone().map(|grab| (grab, now)).filter(|_| !double);
+        if double && let (Some(space), Some(grab)) = (self.space, grab.clone()) {
+            self.modes.split_drag = None;
+            self.reset_split(space, &grab);
+            return true;
+        }
         self.modes.split_drag = grab;
         self.modes.split_drag.is_some()
     }
@@ -2188,8 +2133,16 @@ impl State {
         };
         match grab {
             Grab::Divider(path) => {
-                self.change_shown(space, |layout| layout.drag(area, &path, x, y))
+                // The kept tree knows nothing of the rail: the pointer is measured where the
+                // divider is drawn, with the whole split moved right by it when qass is first.
+                let shift = self.drawn_tree(space).map_or(0, |drawn| drawn.rail_shift());
+                self.change_absorbing(space, |layout| {
+                    layout.drag(area, &path, x.saturating_sub(shift), y)
+                })
             }
+            Grab::Questions => self.questions_to(space, |layout| layout.gap_at(area, x)),
+            Grab::Rail => self.rail_to(x),
+            Grab::Tabq => self.tabq_to(x),
         }
     }
 
@@ -2214,12 +2167,9 @@ impl State {
         if let Some(terminal) = self.park_hit(row, col, left) {
             return Some(Clicked::Park(terminal));
         }
-        if self.line_hit(row, col, left) {
-            return Some(Clicked::Inbox);
-        }
         // Right of the column, which is the pane and the bar above it.
         if left == 0 || col as usize > left {
-            if row == 0 || (row as usize) > screen::TABS {
+            if row == 0 || (row as usize) > screen::TABS || self.header_in_strip() {
                 // The pane. A terminal application that wants the mouse asks for it, and
                 // passing a click to one that did not would type its report at a prompt.
                 // Over qass's header the bar's rows are the header's, and hold no tab.
@@ -2259,14 +2209,8 @@ impl State {
                 return Some(Clicked::QassSkipAgent(terminal));
             }
         }
-        // The rows a long space name wraps onto carry no controls: a click there is a click on
-        // the name, whatever column it lands in.
-        let act_col = match hit {
-            sidebar::Hit::Space(_) if !first => 0,
-            _ => col as usize,
-        };
         // A row that does two things answers with the row; the column decides which.
-        match sidebar::act(hit, act_col, &column, self.collapsed)? {
+        match sidebar::act(hit, col as usize, &column, self.collapsed)? {
             sidebar::Act::Space(space) => Some(Clicked::Space(space)),
             sidebar::Act::Fold(space) => Some(Clicked::Fold(space)),
             sidebar::Act::Doze(space) => Some(Clicked::Doze(space)),
@@ -2293,8 +2237,8 @@ impl State {
             sidebar::Act::Collapse => Some(Clicked::Collapse),
             sidebar::Act::Qass => Some(Clicked::Qass),
             sidebar::Act::QassWatch => Some(Clicked::QassWatch),
-            sidebar::Act::Inbox => Some(Clicked::Inbox),
-            sidebar::Act::Computer(machine) => Some(Clicked::Computer(machine)),
+            sidebar::Act::InboxTab(tab) => Some(Clicked::InboxTab(tab)),
+            sidebar::Act::InboxFold => Some(Clicked::InboxFold),
             sidebar::Act::Search => Some(Clicked::Search),
         }
     }
@@ -2357,11 +2301,7 @@ impl State {
     /// The space a column row belongs to: its rule's, or its tab's, asleep or not.
     fn space_of_hit(&self, hit: sidebar::Hit) -> Option<i64> {
         match hit {
-            sidebar::Hit::Space(space) | sidebar::Hit::Doze(space)
-                if space != sidebar::IDLE_FOLD =>
-            {
-                Some(space)
-            }
+            sidebar::Hit::Space(space) | sidebar::Hit::Doze(space) => Some(space),
             sidebar::Hit::Terminal(t) => self
                 .rows
                 .iter()
@@ -2387,16 +2327,20 @@ impl State {
         }
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         let x = (col as usize).checked_sub(left + 1)?;
+        // On qass's tab with the board the titles fold their pane: behind the caret, and the
+        // lower pane's too where a stacked tab draws it on the divider.
+        let caret = fold_leaves(self);
         rects.into_iter().find_map(|(terminal, r)| {
             // Drawn on the row above the pane, two cells in from its corner, as ` name `.
             // The top of the area is row 0, or lower on qass's tab, under its header.
             let top = r.y.checked_sub(1)?;
-            if top != area.y || row as usize != screen::TABS + 1 + top {
+            let folds = caret.is_some_and(|(b, q)| terminal == b || terminal == q);
+            if (top != area.y && !folds) || row as usize != screen::TABS + 1 + top {
                 return None;
             }
             let agent = self.rows.iter().find(|a| a.terminal == terminal)?;
             let room = r.cols.saturating_sub(2);
-            let title = screen::pane_title(agent, false);
+            let title = screen::pane_title(agent, folds);
             let wide = crate::width::width(&title).min(room.checked_sub(2)?);
             (room >= 3 && x > r.x && x <= r.x + wide + 2).then_some(terminal)
         })
@@ -2600,6 +2544,11 @@ impl State {
             .and_then(|space| self.drawn_tree(space))
             .and_then(|layout| self.term_rect_in(&layout, target))
             .unwrap_or(area);
+        // qass's tile is the inside of its box, the cell the hit was counted from.
+        let rect = self
+            .qass_rect()
+            .filter(|_| self.on_qass_screen())
+            .unwrap_or(rect);
         let (cols, rows) = (rect.cols.max(1) as f32, rect.rows.max(1) as f32);
         let (x, y) = (x as f32 + 0.5, y as f32 + 0.5);
         let sides = [
@@ -2619,6 +2568,10 @@ impl State {
     /// or after the last one. A pane let go there leaves its split for a tab of its own; a
     /// tab moves along the bar; a tab of another space comes into this one.
     fn bar_drop(&self, terminal: u32, row: u16, col: u16, handle: bool) -> Option<RowDrop> {
+        // qass's header stands where the bar would: nothing joins its space by a drop there.
+        if self.header_in_strip() {
+            return None;
+        }
         let space = self.space?;
         let (pane_cols, _) =
             screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
@@ -2814,7 +2767,13 @@ impl State {
             _ => None,
         };
         let outline = match drop {
-            Some(RowDrop::Pane(pane, side)) if pane != terminal => {
+            Some(RowDrop::Pane(pane, side))
+                if pane != terminal
+                    && !(handle
+                        && self
+                            .board_carry(terminal, &RowDrop::Pane(pane, side))
+                            .is_some()) =>
+            {
                 self.outline(terminal, pane, side)
             }
             _ => None,
@@ -2845,6 +2804,10 @@ impl State {
             Some(layout) => self.term_rect_in(&layout, hover)?,
             None => area,
         };
+        let rect = self
+            .qass_rect()
+            .filter(|_| self.on_qass_screen())
+            .unwrap_or(rect);
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         Some(screen::DragPaint {
             carried: Vec::new(),
@@ -2896,7 +2859,7 @@ impl State {
             chip: (
                 "\u{25be}".to_string(),
                 crate::theme::space_in(&self.spaces, space),
-                format!("{} ({count})", row.name),
+                format!("{} ({count})", sidebar::chip_name(&row.name)),
             ),
             pointer,
             rule,
@@ -2913,7 +2876,7 @@ impl State {
         side: layout::Move,
     ) -> Option<(usize, usize, usize, usize)> {
         let area = pane_area(self);
-        let mut tree = self.layouts.get(&self.space?)?.clone();
+        let mut tree = self.committed(self.layouts.get(&self.space?)?);
         tree.remove(terminal);
         if tree.zoomed.is_some()
             || tree.has_pending()
@@ -2921,7 +2884,7 @@ impl State {
         {
             return None;
         }
-        // Measured in the tab as the drop leaves it: the pane landing brings its line with it.
+        // Measured in the tab as the drop leaves it: the pane landing brings its rail with it.
         let rect = self.term_rect_in(&tree, terminal)?;
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         Some((
@@ -2948,6 +2911,15 @@ impl State {
             .map(|(_, at)| at)
     }
 
+    /// The most list rows the inbox's edge may be dragged to in this window.
+    fn inbox_room(&self) -> usize {
+        sidebar::inbox_room(
+            &self.column(self.paint_now, 0),
+            screen::column_rows(self.lines as usize),
+            sidebar::current_avatar().as_ref(),
+        )
+    }
+
     /// The pieces the left column is drawn from, at a given clock and animation frame.
     fn column(&self, now_unix: i64, tick: u64) -> sidebar::Column<'_> {
         let (spaces, agents) = self.shown();
@@ -2968,10 +2940,11 @@ impl State {
             drawer: self.drawer_view(),
             usage: Some(&self.usage),
             scroll: self.list_scroll(),
+            inbox: self.inbox,
             icons: crate::icons::on(),
             nav: self.modes.side.as_ref(),
             order: self.agent_view.as_ref(),
-            list: &self.ibx_list,
+            cards: &self.asks.live,
         }
     }
 
@@ -2980,31 +2953,16 @@ impl State {
         sidebar::shown(&self.spaces, &self.rows)
     }
 
-    /// `ctrl-a tab`'s next: the first of what the Inbox counts after the agent the keyboard is on,
-    /// qass's own tab never in it and finished work nobody read left out.
-    fn up_next(&self) -> Option<crate::inbox::Item> {
-        self.inbox_now().next_after(self.focused).cloned()
-    }
-
-    /// The palette as it opens: its "needs you" section lists what the Inbox counts, and only that.
-    fn new_palette(&self, agents: Vec<crate::config::Launcher>) -> Palette {
-        Palette {
-            needs: self.inbox_now().terminals(),
-            ..Palette::with_agents(agents)
-        }
-    }
-
-    /// The status line's next: [`State::up_next`], named.
-    fn next_waiting(&self) -> Option<screen::Next> {
-        let item = self.up_next()?;
-        let env = ibx_env!(self);
-        let (who, short, says) = crate::inbox_pane::next_words(&item, &env);
-        Some(screen::Next {
-            who,
-            short,
-            says,
-            failed: item.kind == crate::inbox::ItemKind::Failed,
-        })
+    /// `ctrl-a tab`'s next: the first of the queue the next row reads, qass never in it.
+    fn up_next(&self) -> Option<u32> {
+        sidebar::queue(
+            self.shown().1,
+            self.focused,
+            &self.seen_done,
+            &self.unseen_finished,
+        )
+        .first()
+        .map(|row| row.terminal)
     }
 
     /// Whether the space on screen is qass's.
@@ -3012,63 +2970,640 @@ impl State {
         self.space.is_some() && self.space == sidebar::qass_space(&self.spaces)
     }
 
-    /// The tree of `space`, as it is kept.
-    fn drawn_tree(&self, space: i64) -> Option<Layout> {
-        self.layouts.get(&space).cloned()
+    /// Whether qass's space is one plain tab, no split and none waiting: only then is its
+    /// terminal in a box. A split is the ordinary tiled pane, whoever it is for.
+    fn qass_single(&self) -> bool {
+        let qass = sidebar::qass_space(&self.spaces);
+        // Its agent in a split, on screen or parked (the board above it), is no box either.
+        let split = self.trees().any(|tree| {
+            tree.leaf_count() > 1
+                && self
+                    .rows
+                    .iter()
+                    .any(|r| Some(r.workspace) == qass && r.agent && tree.contains(r.terminal))
+        });
+        !split
+            && qass
+                .and_then(|space| self.layouts.get(&space))
+                .is_none_or(|l| l.leaf_count() == 1 && !l.has_pending())
     }
 
-    /// Run a change on `space`'s tree, and keep it when it was done.
-    fn change_shown(&mut self, space: i64, change: impl FnOnce(&mut Layout) -> bool) -> bool {
-        let Some(mut tree) = self.layouts.get(&space).cloned() else {
+    /// Whether the pane is qass's screen: qass's space on screen as one tab, and the keyboard
+    /// in its agent or resting on its sleeping tab. A shell opened in that space is not it.
+    fn on_qass_screen(&self) -> bool {
+        if !self.in_qass() || !self.qass_single() {
+            return false;
+        }
+        if self.focused != 0 {
+            let qass = sidebar::qass_space(&self.spaces);
+            return self
+                .rows
+                .iter()
+                .any(|r| r.terminal == self.focused && r.agent && Some(r.workspace) == qass);
+        }
+        self.dim_tab().is_some_and(|tab| {
+            self.dim_tabs()
+                .iter()
+                .any(|t| t.terminal == tab && t.agent.is_some())
+        })
+    }
+
+    /// The rows qass's header takes over `tree`: qass's split tab (the board above qass,
+    /// decision 12) wears it over the whole pane, its panes laid out under it; any other tree,
+    /// a zoomed one, or a pane too small for a header, none. A property of the tree and not of
+    /// where the keyboard is, so qass's panes keep their size wherever the person looks.
+    fn band_over(&self, tree: &Layout) -> usize {
+        let qass = sidebar::qass_space(&self.spaces);
+        let ours = qass.is_some()
+            && self
+                .rows
+                .iter()
+                .any(|r| Some(r.workspace) == qass && r.agent && tree.contains(r.terminal));
+        if !ours || tree.leaf_count() < 2 || tree.zoomed.is_some() {
+            return 0;
+        }
+        let (cols, rows) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        crate::qass_screen::Plan::band(cols as usize, rows as usize).map_or(0, |p| p.header.rows())
+    }
+
+    /// The board page and qass's agent of `tree`, when it is qass's tab with the board: two
+    /// panes, the board page and qass's agent, in either order. Only this tree is laid out by
+    /// its width ([`State::drawn`]).
+    fn board_leaves(&self, tree: &Layout) -> Option<(u32, u32)> {
+        let qass = sidebar::qass_space(&self.spaces);
+        let row = |terminal: u32| self.rows.iter().find(|r| r.terminal == terminal);
+        let is_board = |t: u32| {
+            row(t).is_some_and(|r| r.name.as_deref() == Some(qoop_runtime::idle::BOARD_PANE))
+        };
+        let is_qass = |t: u32| row(t).is_some_and(|r| r.agent && qass == Some(r.workspace));
+        match tree.leaves()[..] {
+            [a, b] if !tree.has_pending() => {
+                match (is_board(a) && is_qass(b), is_board(b) && is_qass(a)) {
+                    (true, _) => Some((a, b)),
+                    (_, true) => Some((b, a)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `tree` is qass's tab with the board ([`State::board_leaves`]).
+    fn board_tree(&self, tree: &Layout) -> bool {
+        self.board_leaves(tree).is_some()
+    }
+
+    /// Whether the board is the first pane of `tree` (the left one, or the top one), as it is
+    /// until the sides are swapped.
+    fn board_first(&self, tree: &Layout) -> bool {
+        self.board_leaves(tree)
+            .is_none_or(|(board, _)| tree.leaves().first() == Some(&board))
+    }
+
+    /// qass's agent on the tab on screen, when that is qass's tab with the board.
+    fn qass_leaf(&self) -> Option<u32> {
+        self.layouts
+            .get(&self.space?)
+            .and_then(|tree| self.board_leaves(tree))
+            .map(|(_, qass)| qass)
+    }
+
+    /// End a card held on the board page: nothing is carried any more, and the page is owed
+    /// the word ([`drain_board_owed`]).
+    fn cancel_board_drag(&mut self) {
+        if let Some(board) = self.board_drag.take() {
+            self.forwarded_press = false;
+            self.drop_hover = None;
+            self.board_owed = Some(board);
+        }
+    }
+
+    /// Whether a one based screen position is on the questions of qass's split tab.
+    fn in_questions(&self, row: u16, col: u16) -> bool {
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        let (Some(pane_row), Some(pane_col)) = (
+            (row as usize).checked_sub(screen::TABS + 1),
+            (col as usize).checked_sub(left + 1),
+        ) else {
             return false;
         };
+        self.qass_split()
+            && self.questions().is_some_and(|side| {
+                let r = side.rect;
+                pane_row >= r.y
+                    && pane_row < r.y + r.rows
+                    && pane_col >= r.x
+                    && pane_col < r.x + r.cols
+            })
+    }
+
+    /// Whether `terminal` is the board page of qass's tab on screen: a press there may carry a
+    /// card onto qass.
+    fn board_pane(&self, terminal: u32) -> bool {
+        self.space
+            .and_then(|space| self.layouts.get(&space))
+            .is_some_and(|tree| {
+                self.board_leaves(tree)
+                    .is_some_and(|(board, _)| board == terminal)
+            })
+    }
+
+    /// Where a press held on the board page is over: `Some(true)` on qass's pane, `Some(false)`
+    /// anywhere else outside the board, `None` on the board itself.
+    fn board_target(&self, board: u32, row: u16, col: u16) -> Option<bool> {
+        let over = self.tile_at_screen(row, col).map(|(t, ..)| t);
+        if over == Some(board) {
+            return None;
+        }
+        Some(over.is_some() && over == self.qass_leaf() && over != self.folded())
+    }
+
+    /// The wheel over the board page of qass's tab, as the page reads it: the board's terminal
+    /// and the report to write, in the tile's own cells. The keyboard may be in qass, so this
+    /// is the board's own screen asked, not the focused one. `None` when the pointer is not on
+    /// the board, or the board runs no page that asked for the mouse (a plain shell there would
+    /// have the report typed at its prompt).
+    fn board_wheel(&self, row: u16, col: u16, up: bool) -> Option<(u32, Vec<u8>)> {
+        let (board, _, (tile_row, tile_col)) = self.tile_at_screen(row, col)?;
+        // A board folded to its strip has no page on screen to scroll.
+        if self.folded() == Some(board) {
+            return None;
+        }
+        let asked = if board == self.focused {
+            self.pane_wants_mouse()
+        } else {
+            self.snapshots
+                .get(&board)
+                .is_some_and(|s| s.modes.mouse_reporting)
+        };
+        let report = mouse_report(if up { 64 } else { 65 }, tile_row, tile_col, true)?;
+        (self.board_pane(board) && asked).then_some((board, report))
+    }
+
+    /// `tree` as it is drawn: qass's tab with the board side by side when the pane is wide
+    /// enough for both and stacked when not, whatever was saved; every other tree as saved.
+    /// Every place that measures a tree measures this, so what is hit, sized and painted is
+    /// what is on screen. Nothing of it is stored.
+    fn drawn(&self, tree: &Layout) -> Layout {
+        let mut shown = tree.clone();
+        if self.board_tree(tree)
+            && let Some(saved) = tree.root_split()
+        {
+            let area = self.tree_area(tree);
+            let questions = self.questions_wanted()
+                && area.rows >= crate::qass_screen::INBOX_MIN_ROWS
+                && tree.zoomed.is_none();
+            let board_first = self.board_first(tree);
+            // The rail's columns are charged whether it shows or not, so a card arriving never
+            // turns the tab over.
+            let reserve = self.rail_reserve(area);
+            let (dir, ratio, gap) = crate::qass_screen::board_shape(
+                area.cols,
+                saved,
+                questions,
+                tree.questions,
+                board_first,
+                reserve,
+            );
+            shown.set_root_split(dir, ratio);
+            shown.gap = gap;
+            shown.gap_second = !board_first;
+            // A pane folded to its tab: the other takes the width, the questions' gap is
+            // weighed against the open pane.
+            if let Some((fold, board)) = self.fold_leaf(tree) {
+                let open = shown.inner(area).cols.saturating_sub(reserve);
+                shown.fold = Some(fold);
+                shown.gap = crate::qass_screen::fold_gap(open, fold != board, questions);
+            } else if self.all_folded(tree)
+                && questions
+                && crate::qass_screen::Plan::holds_inbox(
+                    shown.inner(area).cols.saturating_sub(reserve),
+                    area.rows,
+                )
+            {
+                // Both folded: the questions take the tab.
+                shown.fold_all = true;
+                shown.gap = 0;
+            }
+            // The rail shows while a pane is folded: the board or qass, or the questions (folded
+            // unless beside the board; over its tile they keep their tab, so a card never
+            // moves a pane).
+            shown.rail = 0;
+            if (shown.fold.is_some() || shown.fold_all || shown.gap == 0)
+                && self.band_over(tree) > 0
+            {
+                shown.rail = reserve;
+            }
+        }
+        shown
+    }
+
+    /// qass's tab with the board as the paint needs it: the panes whose titles fold, the one
+    /// folded, and whether qass's top edge carries its folder (only while the header stands in
+    /// the tab bar's rows, and qass is open).
+    fn fold_paint(&self) -> Option<screen::FoldPaint> {
+        let (board, qass) = fold_leaves(self)?;
+        let folded = self.folded();
+        Some(screen::FoldPaint {
+            board,
+            qass,
+            folded,
+            path: self.header_in_strip() && folded != Some(qass),
+        })
+    }
+
+    /// A press on a pane folded to its strip opens it and gives it the keyboard; true when the
+    /// press was that, so it reaches nothing else.
+    fn strip_press(&mut self, terminal: u32) -> bool {
+        if self.open_from_both(terminal) {
+            self.asks.release();
+            self.pending_focus = Some(terminal).filter(|t| *t != self.focused);
+            return true;
+        }
+        if self.folded() != Some(terminal) {
+            return false;
+        }
+        self.qass_ui.fold = None;
+        self.pending_focus = Some(terminal).filter(|t| *t != self.focused);
+        true
+    }
+
+    /// What letting go of the title of `terminal` (a pane's name on its top edge) does: on
+    /// qass's tab with the board a click folds that pane and a drag carries it, or does nothing
+    /// while a pane is folded; any other tab keeps today's click (focus) and drag (carry).
+    fn title_release(&self, terminal: u32, moved: bool) -> TitleAct {
+        let board_tab = fold_leaves(self).is_some_and(|(b, q)| terminal == b || terminal == q);
+        match (board_tab, moved, self.folded().is_some()) {
+            (true, false, _) => TitleAct::Fold,
+            (true, true, true) => TitleAct::Nothing,
+            (_, true, _) => TitleAct::Carry,
+            (false, false, _) => TitleAct::Focus,
+        }
+    }
+
+    /// The leaf folded to its strip on the tab on screen.
+    fn folded(&self) -> Option<u32> {
+        let tree = self.layouts.get(&self.space?)?;
+        self.fold_leaf(tree).map(|(leaf, _)| leaf)
+    }
+
+    /// The leaf of qass's split tab folded to its strip, with the board's leaf: none while the
+    /// tab is zoomed, or when it is not the board tab.
+    fn fold_leaf(&self, tree: &Layout) -> Option<(u32, u32)> {
+        if tree.zoomed.is_some() {
+            return None;
+        }
+        let (board, qass) = self.board_leaves(tree)?;
+        match self.qass_ui.fold {
+            Some(crate::qass_screen::Fold::Board) => Some((board, board)),
+            Some(crate::qass_screen::Fold::Qass) => Some((qass, board)),
+            Some(crate::qass_screen::Fold::Both) => None,
+            // Too small for both: the pane with the keyboard stays, the other rests, so a
+            // resize never moves the keyboard.
+            None if self.cramped(tree, board) => Some(if self.focused == qass {
+                (board, board)
+            } else {
+                (qass, board)
+            }),
+            None => None,
+        }
+    }
+
+    /// qass's tab with the board too small for both: stacked, and the board's tile under the
+    /// board page's three lanes. qass's pane then rests on its tab while the board is open, and
+    /// the board takes the room (one lane at a time). The left column keeps its fold: only its
+    /// owner folds it (`left-sidebar.md`).
+    fn cramped(&self, tree: &Layout, board: u32) -> bool {
+        let Some(saved) = tree.root_split() else {
+            return false;
+        };
+        let area = self.tree_area(tree);
+        let reserve = self.rail_reserve(area);
+        let (dir, ratio, _) = crate::qass_screen::board_shape(
+            area.cols,
+            saved,
+            false,
+            None,
+            self.board_first(tree),
+            reserve,
+        );
+        if dir == layout::Dir::V {
+            return false;
+        }
+        let mut stacked = tree.clone();
+        stacked.set_root_split(dir, ratio);
+        stacked.rail = reserve;
+        stacked
+            .tile_rects(area)
+            .into_iter()
+            .find(|(t, _)| *t == board)
+            .is_some_and(|(_, tile)| {
+                tile.cols < crate::qass_screen::BOARD_MIN_COLS
+                    || tile.rows < crate::qass_screen::BOARD_MIN_ROWS
+            })
+    }
+
+    /// Whether both the board and qass are folded away on `tree`, the questions holding the tab.
+    fn all_folded(&self, tree: &Layout) -> bool {
+        tree.zoomed.is_none()
+            && self.qass_ui.fold == Some(crate::qass_screen::Fold::Both)
+            && self.board_tree(tree)
+    }
+
+    /// With both folded, `terminal` (the board or qass) opens and the other stays folded; true
+    /// when it was that.
+    fn open_from_both(&mut self, terminal: u32) -> bool {
+        if self.qass_ui.fold != Some(crate::qass_screen::Fold::Both) {
+            return false;
+        }
+        let Some((board, qass)) = fold_leaves(self) else {
+            return false;
+        };
+        self.qass_ui.fold = match terminal {
+            t if t == board => Some(crate::qass_screen::Fold::Qass),
+            t if t == qass => Some(crate::qass_screen::Fold::Board),
+            _ => return false,
+        };
+        true
+    }
+
+    /// `tree` with the root it is shown with, to change and keep: what a change on a copy
+    /// starts from, so the tree it puts back holds what the owner saw.
+    fn committed(&self, tree: &Layout) -> Layout {
+        Layout {
+            gap: 0,
+            fold: None,
+            fold_all: false,
+            rail: 0,
+            ..self.drawn(tree)
+        }
+    }
+
+    /// [`State::change_shown`] for a change that moves the divider between qass and the questions:
+    /// with the questions beside the board they keep the board's columns and take the
+    /// difference, so the two panes next to that edge are the ones that change.
+    fn change_absorbing(&mut self, space: i64, change: impl FnOnce(&mut Layout) -> bool) -> bool {
+        let area = pane_area(self);
+        let Some(shown) = self
+            .drawn_tree(space)
+            .filter(|tree| tree.gap > 0 && tree.fold.is_none())
+        else {
+            return self.change_shown(space, change);
+        };
+        let (width, second) = (shown.gap - 1, shown.gap_second);
+        // The pane the questions are cut from is the one that grows or shrinks with the divider.
+        let cols = |tree: &Layout| {
+            tree.root_cols(area)
+                .map(|(first, last)| if second { last } else { first })
+        };
+        self.change_shown(space, |tree| {
+            let before = cols(tree);
+            let done = change(tree);
+            let (Some(before), Some(after)) = (before, cols(tree)) else {
+                return false;
+            };
+            // A width under zero is under the minimum too: the shape refuses it.
+            tree.questions = Some((width + after).saturating_sub(before));
+            done
+        })
+    }
+
+    /// Set the questions' width from the gap `gap_of` reads off the tree as it is drawn, when both
+    /// them and the board keep their minimum. Answers whether it moved.
+    fn questions_to(&mut self, space: i64, gap_of: impl Fn(&Layout) -> Option<usize>) -> bool {
+        let area = pane_area(self);
+        let Some(shown) = self
+            .drawn_tree(space)
+            .filter(|tree| tree.gap > 0 && tree.fold.is_none())
+        else {
+            return false;
+        };
+        let Some(gap) = gap_of(&shown) else {
+            return false;
+        };
+        let Some((first, last)) = shown.root_cols(area) else {
+            return false;
+        };
+        let board = if shown.gap_second { last } else { first };
+        let Some(width) = crate::qass_screen::questions_width(gap, board) else {
+            return false;
+        };
+        if width + 1 == shown.gap {
+            return false;
+        }
+        self.change_shown(space, |tree| {
+            tree.questions = Some(width);
+            true
+        })
+    }
+
+    /// The tree of `space` as it is drawn ([`State::drawn`]).
+    fn drawn_tree(&self, space: i64) -> Option<Layout> {
+        self.layouts.get(&space).map(|tree| self.drawn(tree))
+    }
+
+    /// Run a change on `space`'s tree as the owner sees it: the shown root is written into the
+    /// stored tree first (it is saved with the change), and the saved one put back when the
+    /// change is refused. So a divider drag or a split on qass's tab keeps what is on screen.
+    fn change_shown(&mut self, space: i64, change: impl FnOnce(&mut Layout) -> bool) -> bool {
+        let Some(before) = self.layouts.get(&space).cloned() else {
+            return false;
+        };
+        let (saved, shown_tree) = (before.root_split(), self.drawn(&before));
+        // Folded, the tab shows no divider to change: nothing is changed or saved.
+        if shown_tree.fold.is_some() || shown_tree.fold_all {
+            return false;
+        }
+        let shown = shown_tree.root_split();
+        let permille = |r: f32| (r * 1000.0).round() as i32;
+        let moved = match (saved, shown) {
+            (Some(was), Some(now)) => was.0 != now.0 || permille(was.1) != permille(now.1),
+            _ => false,
+        };
+        let mut tree = before;
+        if moved && let Some((dir, ratio)) = shown {
+            tree.set_root_split(dir, ratio);
+        }
         let done = change(&mut tree);
-        if done {
+        // On qass's tab a change that would turn the page over (a drag past what keeps the
+        // board at its minimum and qass at theirs) or squeeze the open questions back to their
+        // strip is refused whole, so it never saves a root the owner did not draw.
+        let now = self.drawn(&tree);
+        let refused = self.board_tree(&tree)
+            && (now.root_split().map(|r| r.0) != shown.map(|r| r.0)
+                || (shown_tree.gap > 0 && now.gap == 0));
+        if done && !refused {
             self.layouts.insert(space, tree);
+        }
+        done && !refused
+    }
+
+    /// What carrying a pane of qass's tab by its title and letting go on `drop` does: `None`
+    /// for any other carry, `Some(true)` swaps the sides (let go on the outer edge of the other
+    /// pane, the one away from the divider), `Some(false)` keeps the two together.
+    fn board_carry(&self, terminal: u32, drop: &RowDrop) -> Option<bool> {
+        let tree = self.layouts.get(&self.space?)?;
+        let (board, qass) = self.board_leaves(tree)?;
+        if terminal != board && terminal != qass {
+            return None;
+        }
+        match drop {
+            RowDrop::Here => None,
+            RowDrop::Pane(pane, _) if *pane == terminal => None,
+            RowDrop::Pane(pane, side) => {
+                let (dir, _) = self.drawn(tree).root_split()?;
+                let first = tree.leaves().first() == Some(pane);
+                let outer = match (dir, first) {
+                    (layout::Dir::V, true) => layout::Move::Left,
+                    (layout::Dir::V, false) => layout::Move::Right,
+                    (layout::Dir::H, true) => layout::Move::Up,
+                    (layout::Dir::H, false) => layout::Move::Down,
+                };
+                Some(*side == outer)
+            }
+            _ => Some(false),
+        }
+    }
+
+    /// Whether the tab on screen is qass's tab with the board.
+    fn on_board_tab(&self) -> bool {
+        self.space
+            .and_then(|space| self.layouts.get(&space))
+            .is_some_and(|tree| self.board_tree(tree))
+    }
+
+    /// Record qass's tab as it stands (widths and side), so a restart and every other client
+    /// bring it back as it was left. Only this tab: no other tab's resize was ever kept.
+    fn save_split(&mut self, space: i64) {
+        if let Some(tree) = self
+            .layouts
+            .get(&space)
+            .filter(|tree| self.board_tree(tree))
+            .and_then(|tree| tree.to_pane())
+        {
+            self.split_writes.push(tree);
+        }
+    }
+
+    /// Put the board and qass on each other's side, each keeping its columns.
+    fn swap_sides(&mut self, space: i64) -> bool {
+        let area = pane_area(self);
+        let done = self.on_board_tab() && self.change_shown(space, |tree| tree.swap_root(area));
+        if done {
+            self.save_split(space);
         }
         done
     }
 
+    /// Give what `grab` moves its default back: the questions' width for their own edge, and for
+    /// the divider the board's side its larger share too.
+    fn reset_split(&mut self, space: i64, grab: &Grab) {
+        // The rail's width has a default of its own; nothing else moves and nothing is saved.
+        if *grab == Grab::Rail {
+            self.qass_ui.rail = None;
+            return;
+        }
+        let Some(tree) = self.layouts.get(&space).filter(|t| self.board_tree(t)) else {
+            return;
+        };
+        let (dir, _) = self
+            .drawn(tree)
+            .root_split()
+            .unwrap_or((layout::Dir::V, 0.0));
+        let ratio = crate::qass_screen::board_default(dir, self.board_first(tree));
+        let area = pane_area(self);
+        let divider = matches!(grab, Grab::Divider(_));
+        // Either one moving is a reset: a width alone is one under the default ratio.
+        let moved = self.change_shown(space, |tree| {
+            let ratio_moved = divider && tree.set_root_ratio(area, ratio);
+            tree.questions.take().is_some() || ratio_moved
+        });
+        if moved {
+            self.save_split(space);
+        }
+    }
+
+    /// The handle on the divider of qass's tab, when it is drawn: not zoomed, both panes tiled.
+    fn handle(&self) -> Option<crate::qass_screen::Handle> {
+        let tree = self.drawn_tree(self.space?)?;
+        let (_, qass) = self.board_leaves(&tree)?;
+        if tree.zoomed.is_some() || tree.fold.is_some() || tree.fold_all {
+            return None;
+        }
+        let (_, rect) = tree
+            .tile_rects(self.tree_area(&tree))
+            .into_iter()
+            .find(|(t, _)| *t == qass)?;
+        let (dir, _) = tree.root_split()?;
+        crate::qass_screen::handle_of(rect, dir, self.board_first(&tree))
+    }
+
+    /// The handle on the questions' own edge, when they are beside the board and drawn.
+    fn questions_handle(&self) -> Option<crate::qass_screen::Handle> {
+        let tree = self.drawn_tree(self.space?)?;
+        let (x, y, rows) = tree.questions_edge(self.tree_area(&tree))?;
+        crate::qass_screen::edge_handle(x, y, rows)
+    }
+
     /// The area `tree`'s panes are laid out in: its tab's. Every tile, size, click and drag of
-    /// the tab measures from here; an agent's tile then gives its last row to the reserved
-    /// line ([`State::term_rect`]).
+    /// the tab measures from here; an agent's tile then gives its rail's columns to the rail
+    /// ([`State::term_rect`]).
     fn tree_area(&self, tree: &Layout) -> layout::Rect {
         self.tab_area(tree)
     }
 
-    /// Whether `terminal`'s pane in `tile` of `tree` keeps the reserved line under it: on a
-    /// local agent's pane. Never on a shell, another machine's terminal or qass's tab, nor in
-    /// a tile too small to spare the row. The line does not wait on the daemon's question
-    /// cards: the Inbox lists what needs the person from the rows and the cards. Every
-    /// agent pane has it whether or not anything is said there, sized by its own tile and
-    /// never by the focus, so a question arriving or answered, or the keyboard moving, resizes
-    /// nothing.
-    fn has_line(&self, tree: &Layout, terminal: u32, tile: layout::Rect) -> bool {
-        let row = |t: u32| self.rows.iter().find(|r| r.terminal == t);
-        if !row(terminal).is_some_and(|r| r.agent && !crate::mux::is_remote_terminal(r.terminal)) {
-            return false;
+    /// The questions rail at the right of `terminal`'s tile `tile` in `tree`: on a local agent's
+    /// pane, while the daemon keeps question cards. Never on a shell, another machine's terminal
+    /// or qass's tab, nor in a tile too small to spare it. Each agent pane carries its own, sized
+    /// by its own tile and never by the focus, so moving the keyboard resizes nothing. Unfolded,
+    /// its pane takes the columns beside the agent while the agent keeps 60; else the pane opens
+    /// over the agent's cells and the rail keeps its width.
+    fn rail_of(
+        &self,
+        tree: &Layout,
+        terminal: u32,
+        tile: layout::Rect,
+    ) -> Option<crate::tabq::Rail> {
+        if self.asks.unsupported || self.band_over(tree) > 0 {
+            return None;
         }
+        let row = |t: u32| self.rows.iter().find(|r| r.terminal == t);
+        row(terminal).filter(|r| r.agent && !crate::mux::is_remote_terminal(r.terminal))?;
         let qass = sidebar::qass_space(&self.spaces);
-        !tree
+        if tree
             .leaves()
             .into_iter()
             .filter_map(row)
             .any(|r| Some(r.workspace) == qass)
-            && crate::tabq::fits(tile)
-    }
-
-    /// Where `terminal` is drawn and sized in its tile `tile` of `tree`: the tile, less the
-    /// reserved line at its foot when it carries one. The one place a terminal's cells are
-    /// measured, so its size, paint, cursor, clicks and drags agree.
-    fn term_rect(&self, tree: &Layout, terminal: u32, tile: layout::Rect) -> layout::Rect {
-        if self.has_line(tree, terminal, tile) {
-            crate::tabq::split(tile).0
-        } else {
-            tile
+        {
+            return None;
         }
+        let w = crate::tabq::width(tile)?;
+        if self.tabq == Some(terminal) {
+            let open = self.tabq_width(tile, w);
+            if crate::tabq::beside(tile, open) {
+                return Some(crate::tabq::Rail { terminal, w: open });
+            }
+        }
+        Some(crate::tabq::Rail { terminal, w })
     }
 
-    /// `tree`'s terminals and their cells, each tile less its line.
+    /// The unfolded pane's width in `tile`, whose folded rail is `folded` wide: the one he
+    /// chose this session, else [`crate::tabq::OPEN`], as the tile allows.
+    fn tabq_width(&self, tile: layout::Rect, folded: usize) -> usize {
+        crate::tabq::open_width(tile, folded, self.tabq_w.unwrap_or(crate::tabq::OPEN))
+    }
+
+    /// Where `terminal` is drawn and sized in its tile `tile` of `tree`: the tile, less the rail
+    /// at its right when it carries one. The one place a terminal's cells are measured, so its
+    /// size, paint, cursor, clicks and drags agree.
+    fn term_rect(&self, tree: &Layout, terminal: u32, tile: layout::Rect) -> layout::Rect {
+        self.rail_of(tree, terminal, tile)
+            .map_or(tile, |rail| crate::tabq::split(tile, rail).0)
+    }
+
+    /// `tree`'s terminals and their cells, each tile less its rail.
     fn term_rects(&self, tree: &Layout) -> Vec<(u32, layout::Rect)> {
         tree.tile_rects(self.tree_area(tree))
             .into_iter()
@@ -3085,15 +3620,15 @@ impl State {
     }
 
     /// A terminal outside any tree as it is drawn (a tab before its tree): the whole pane in the
-    /// frame every pane stands in, less its line when it is an agent's.
+    /// frame every pane stands in, less its rail when it is an agent's.
     fn lone_rect(&self, terminal: u32) -> layout::Rect {
         let tree = Layout::single(terminal);
         self.term_rect(&tree, terminal, layout::framed(self.tree_area(&tree)))
     }
 
-    /// The reserved lines of the tab on screen, one per agent pane, as the frame paints them.
-    fn tab_lines(&self) -> Vec<crate::tabq::Paint> {
-        if self.focused == 0 {
+    /// The rails of the tab on screen, one per agent pane, as the frame paints them.
+    fn tab_rails(&self) -> Vec<crate::tabq::Paint<'_>> {
+        if self.focused == 0 || self.on_qass_screen() {
             return Vec::new();
         }
         let tree = self
@@ -3102,37 +3637,515 @@ impl State {
             .unwrap_or_else(|| Layout::single(self.focused));
         tree.tile_rects(self.tree_area(&tree))
             .into_iter()
-            .filter(|(terminal, tile)| self.has_line(&tree, *terminal, *tile))
-            .map(|(terminal, tile)| crate::tabq::Paint {
-                rect: crate::tabq::split(tile).1,
-                terminal,
-                // Whatever the Inbox counts about this agent: the line says where to answer.
-                waiting: self
-                    .ibx_list
-                    .items
-                    .iter()
-                    .any(|item| item.terminal == Some(terminal)),
+            .filter_map(|(terminal, tile)| {
+                let rail = self.rail_of(&tree, terminal, tile)?;
+                Some(self.rail_paint_of(rail, tile))
             })
             .collect()
     }
 
-    /// The area `tree`'s tab takes: the pane. The column the Inbox folded (or the ledger's) does
-    /// not count: the Inbox covers the terminals and sizes none of them, so opening and closing
-    /// it reflows nothing (ADR-007).
-    fn tab_area(&self, _tree: &Layout) -> layout::Rect {
-        let (cols, rows) = screen::pane_size_for(
-            self.cols,
-            self.lines,
-            self.collapsed && !self.ibx.folded,
-            0,
-            self.sidebar_width,
+    /// One agent pane's rail in its tile, and its pane when it is the one unfolded.
+    fn rail_paint_of(&self, rail: crate::tabq::Rail, tile: layout::Rect) -> crate::tabq::Paint<'_> {
+        let (term, rect) = crate::tabq::split(tile, rail);
+        // The pane covers its own frame's lines: beside the agent the rail's, over it the
+        // agent's cells'.
+        let framed = |r: layout::Rect| layout::Rect {
+            x: r.x - 1,
+            y: r.y - 1,
+            cols: r.cols + 2,
+            rows: r.rows + 2,
+        };
+        let open = (self.tabq == Some(rail.terminal)).then(|| {
+            // Folded beside the pane, the rail kept its own width: the pane is over the agent,
+            // at its width against the rail.
+            let over = rail.w < crate::tabq::OPEN_MIN;
+            let cells = if over {
+                let w = self.tabq_width(tile, rail.w).min(term.cols);
+                layout::Rect {
+                    x: term.x + term.cols - w,
+                    cols: w,
+                    ..term
+                }
+            } else {
+                rect
+            };
+            crate::tabq::Open {
+                rect: framed(cells),
+                over,
+                asks: &self.asks,
+                focus: self.tabq_focus == Some(self.focused),
+                read: self
+                    .tabq_read
+                    .as_ref()
+                    .filter(|(key, _)| {
+                        self.rows
+                            .iter()
+                            .find(|r| r.terminal == rail.terminal)
+                            .and_then(|r| r.task.as_ref())
+                            .is_some_and(|t| crate::tabq::read_key(t) == *key)
+                    })
+                    .map(|(_, read)| read),
+                task_open: self.tabq_task,
+            }
+        });
+        crate::tabq::Paint {
+            rect,
+            terminal: rail.terminal,
+            cards: &self.asks.live,
+            open,
+        }
+    }
+
+    /// The rail of the tab on screen the pane keys speak to: the unfolded one, else the focused
+    /// pane's, else (the keyboard in a shell) the tab's first agent's.
+    fn tab_rail_paint(&self) -> Option<crate::tabq::Paint<'_>> {
+        let rails = self.tab_rails();
+        let at = rails
+            .iter()
+            .position(|rail| rail.open.is_some())
+            .or_else(|| rails.iter().position(|rail| rail.terminal == self.focused))
+            .unwrap_or(0);
+        rails.into_iter().nth(at)
+    }
+
+    /// `ctrl-a T`: unfold the focused agent pane's rail to its pane with the keyboard in it
+    /// (another unfolded one folds), or fold it back. From a shell, the pane unfolded folds,
+    /// else the tab's first agent's unfolds. False with no rail.
+    fn tabq_toggle(&mut self) -> bool {
+        let focused = self
+            .tab_rails()
+            .iter()
+            .any(|rail| rail.terminal == self.focused)
+            .then_some(self.focused);
+        let Some(terminal) = focused.or_else(|| self.tab_rail_paint().map(|rail| rail.terminal))
+        else {
+            return false;
+        };
+        self.tabq_flip(terminal);
+        true
+    }
+
+    /// Unfold `terminal`'s pane, folding any other, or fold it when it is the one open.
+    fn tabq_flip(&mut self, terminal: u32) {
+        if self.tabq == Some(terminal) {
+            self.tabq_fold();
+        } else {
+            self.tabq = Some(terminal);
+            self.tabq_home = self.tab_home(terminal);
+            self.tabq_focus = Some(self.focused);
+            self.tabq_task = None;
+            self.asks.set_scope(Some(terminal));
+        }
+    }
+
+    /// Where `terminal` stands: its space, the first leaf of its tab (the tab's own terminal)
+    /// and the other panes beside it. `None` once it is gone.
+    fn tab_home(&self, terminal: u32) -> Option<TabHome> {
+        let space = self.rows.iter().find(|r| r.terminal == terminal)?.workspace;
+        let leaves = self
+            .trees()
+            .map(Layout::leaves)
+            .find(|leaves| leaves.contains(&terminal))
+            .unwrap_or_else(|| vec![terminal]);
+        let others = leaves.iter().copied().filter(|t| *t != terminal).collect();
+        Some(TabHome {
+            space,
+            tab: leaves[0],
+            others,
+        })
+    }
+
+    /// The unfolded pane folds once its agent is gone or left the tab it unfolded in: moved to
+    /// another tab or space, or split out to a tab of its own. A pane closing beside it, or a
+    /// new one split in, leaves it open. True when it folded.
+    fn tabq_home_lost(&mut self) -> bool {
+        let Some(terminal) = self.tabq else {
+            return false;
+        };
+        let alive = |t: u32| self.rows.iter().any(|r| r.terminal == t);
+        let held = match (&self.tabq_home, self.tab_home(terminal)) {
+            (Some(was), Some(now)) => {
+                now.space == was.space
+                    && (now.tab == was.tab || !alive(was.tab))
+                    && was
+                        .others
+                        .iter()
+                        .all(|t| now.others.contains(t) || !alive(*t))
+            }
+            _ => false,
+        };
+        if !held {
+            self.tabq_fold();
+        }
+        !held
+    }
+
+    /// A press at a one based screen position, when it is a rail's or the open pane's: in the
+    /// pane, what it hit is answered and the pane has the keyboard; on a folded rail, that
+    /// agent's pane unfolds. `Some(true)` when the panes must be sized again; `None` for a press
+    /// elsewhere, which takes the keyboard out of the pane.
+    fn tabq_click(&mut self, row: u16, col: u16) -> Option<bool> {
+        let (x, y) = self.pane_xy(row, col);
+        let inside = |r: layout::Rect| inside_rect(r, x, y);
+        let rails = self.tab_rails();
+        if rails.is_empty() {
+            return None;
+        }
+        if let Some((rail, open)) = rails
+            .iter()
+            .find_map(|rail| rail.open.map(|open| (rail, open)))
+            && inside(open.rect)
+        {
+            let (view, _) = crate::tabq::pane_view(
+                rail,
+                &open,
+                &self.rows,
+                &self.spaces,
+                sidebar::now_unix(),
+                false,
+            );
+            let hit = crate::asks::hit_at(&view, open.rect, y?, x?);
+            self.tabq_focus = Some(self.focused);
+            if let Some(hit) = hit {
+                self.asks.click(hit);
+            }
+            return Some(false);
+        }
+        if let Some(terminal) = rails
+            .iter()
+            .find(|rail| rail.open.is_none_or(|open| open.over) && inside(rail.rect))
+            .map(|rail| rail.terminal)
+        {
+            self.tabq_flip(terminal);
+            return Some(true);
+        }
+        self.tabq_focus = None;
+        None
+    }
+
+    /// The agent whose folded rail, or whose unfolded pane, is at a one based screen position.
+    fn tabq_at(&self, row: u16, col: u16) -> Option<u32> {
+        let (x, y) = self.pane_xy(row, col);
+        self.tab_rails()
+            .iter()
+            .find(|rail| {
+                rail.open.is_some_and(|open| inside_rect(open.rect, x, y))
+                    || (rail.open.is_none_or(|open| open.over) && inside_rect(rail.rect, x, y))
+            })
+            .map(|rail| rail.terminal)
+    }
+
+    /// Whether a pane cell is on the unfolded pane's left frame line, the one that drags its
+    /// width.
+    fn on_tabq_edge(&self, x: usize, y: usize) -> bool {
+        self.tabq_open().is_some_and(|open| {
+            let r = open.rect;
+            x == r.x && y >= r.y && y < r.y + r.rows
+        })
+    }
+
+    /// The tile of the agent whose pane is unfolded, in the tab on screen.
+    fn tabq_tile(&self) -> Option<layout::Rect> {
+        let terminal = self.tabq?;
+        let tree = self
+            .space
+            .and_then(|space| self.drawn_tree(space))
+            .unwrap_or_else(|| Layout::single(self.focused));
+        tree.tile_rects(self.tree_area(&tree))
+            .into_iter()
+            .find(|(t, _)| *t == terminal)
+            .map(|(_, tile)| tile)
+    }
+
+    /// Give the unfolded pane `w` columns, as its tile allows. True when its width changed.
+    fn tabq_resize_to(&mut self, w: usize) -> bool {
+        let Some(tile) = self.tabq_tile() else {
+            return false;
+        };
+        let Some(folded) = crate::tabq::width(tile) else {
+            return false;
+        };
+        let before = self.tabq_width(tile, folded);
+        let w = crate::tabq::open_width(tile, folded, w);
+        self.tabq_w = Some(w);
+        w != before
+    }
+
+    /// The unfolded pane's left edge dragged to pane column `x`: its right edge stays, its
+    /// width follows. True when it changed.
+    fn tabq_to(&mut self, x: usize) -> bool {
+        let Some(open) = self.tabq_open().map(|open| open.rect) else {
+            return false;
+        };
+        let right = open.x + open.cols - 1;
+        self.tabq_resize_to(right.saturating_sub(x + 1))
+    }
+
+    /// `<` and `>` in the unfolded pane: a step narrower or wider. True when it changed.
+    fn tabq_step(&mut self, wider: bool) -> bool {
+        let Some(now) = self
+            .tabq_open()
+            .map(|open| open.rect.cols.saturating_sub(2))
+        else {
+            return false;
+        };
+        let step = crate::tabq::OPEN_STEP;
+        self.tabq_resize_to(if wider {
+            now + step
+        } else {
+            now.saturating_sub(step)
+        })
+    }
+
+    /// A one based screen position in pane cells, column then row, `None` left of or above
+    /// the pane.
+    fn pane_xy(&self, row: u16, col: u16) -> (Option<usize>, Option<usize>) {
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        (
+            (col as usize).checked_sub(left + 1),
+            (row as usize).checked_sub(screen::TABS + 1),
+        )
+    }
+
+    /// Fold the pane to its rail; the keyboard goes back to the agent.
+    fn tabq_fold(&mut self) {
+        self.tabq = None;
+        self.tabq_home = None;
+        self.tabq_focus = None;
+        self.asks.set_scope(None);
+    }
+
+    /// The open pane of the agent tab on screen.
+    fn tabq_open(&self) -> Option<crate::tabq::Open<'_>> {
+        self.tab_rail_paint().and_then(|rail| rail.open)
+    }
+
+    /// Whether the open pane shows its task part whole, as it is drawn now.
+    fn tabq_task_shown(&self) -> bool {
+        self.tab_rail_paint().is_some_and(|rail| {
+            rail.open.is_some_and(|open| {
+                crate::tabq::pane_view(
+                    &rail,
+                    &open,
+                    &self.rows,
+                    &self.spaces,
+                    sidebar::now_unix(),
+                    false,
+                )
+                .1
+            })
+        })
+    }
+
+    /// Whether the keyboard is in the open pane of the agent tab on screen.
+    fn tabq_focused(&self) -> bool {
+        self.tabq_focus == Some(self.focused) && self.tabq_open().is_some()
+    }
+
+    /// The pane stands in the tab it is open on: the cards it reaches are that agent's while it
+    /// is on screen, and every card's on qass's screen; off screen, or once the focus moved to
+    /// another leaf, it has no keyboard. True when that changed what is drawn.
+    fn tabq_settle(&mut self) -> bool {
+        let folded = self.tabq_home_lost();
+        let shown = self
+            .tab_rail_paint()
+            .filter(|rail| rail.open.is_some())
+            .map(|rail| rail.terminal);
+        let moved = self.asks.scope != shown;
+        self.asks.set_scope(shown);
+        let focus = self
+            .tabq_focus
+            .filter(|leaf| shown.is_some() && *leaf == self.focused);
+        let lost = focus != self.tabq_focus;
+        self.tabq_focus = focus;
+        folded || moved || lost
+    }
+
+    /// The task read the open pane wants and has not asked for: the terminal's own read, which
+    /// carries its open task's events and the card of the item it is on (the steps), and never
+    /// takes the task's id for an item's. Its id names the key it is for.
+    fn tabq_read_request(&mut self) -> Option<ControlRequest> {
+        let rail = self.tab_rail_paint().filter(|rail| rail.open.is_some())?;
+        let terminal = rail.terminal;
+        let task = self
+            .rows
+            .iter()
+            .find(|r| r.terminal == rail.terminal)
+            .and_then(|r| r.task.clone())?;
+        let key = crate::tabq::read_key(&task);
+        if self.tabq_read.as_ref().is_some_and(|(k, _)| *k == key)
+            || self.tabq_asked.as_ref().is_some_and(|(_, k)| *k == key)
+        {
+            return None;
+        }
+        let id = format!(
+            "{TABQ_READ}-{}-{}-{}-{}-{}",
+            key.0,
+            key.1.unwrap_or(0),
+            key.2,
+            key.3,
+            key.4
         );
+        self.tabq_asked = Some((id.clone(), key));
+        Some(ControlRequest::TaskRead {
+            id,
+            board: false,
+            task: None,
+            terminal: Some(terminal),
+            token: None,
+            before: None,
+        })
+    }
+
+    /// The answer to the pane's task read, kept by what it was asked for; an older read's
+    /// answer is dropped.
+    fn tabq_answered(&mut self, response: &ControlResponse) -> bool {
+        let id = response.request_id();
+        if !id.starts_with(TABQ_READ) {
+            return false;
+        }
+        let Some(key) = self
+            .tabq_asked
+            .take_if(|(asked, _)| asked.as_str() == id)
+            .map(|(_, key)| key)
+        else {
+            return true;
+        };
+        // A failed read is kept empty, so it is not asked again until the task moves.
+        let read = crate::tabq::TaskRead::of(key.0, response).unwrap_or_default();
+        self.tabq_read = Some((key, read));
+        true
+    }
+
+    /// The area `tree`'s tab takes: the pane, less qass's header over its split.
+    fn tab_area(&self, tree: &Layout) -> layout::Rect {
+        let (cols, rows) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        // Under qass's header.
+        if self.band_over(tree) > 0
+            && let Some(plan) = crate::qass_screen::Plan::band(cols as usize, rows as usize)
+        {
+            return plan.with_clock(self.clock_rows()).frame;
+        }
         layout::Rect {
             x: 0,
             y: 0,
             cols: cols as usize,
             rows: rows as usize,
         }
+    }
+
+    /// Whether the pane is qass's split screen: qass's header over the board and qass's
+    /// terminal, the keyboard in one of them.
+    fn qass_split(&self) -> bool {
+        self.focused != 0
+            && self
+                .space
+                .and_then(|space| self.layouts.get(&space))
+                .is_some_and(|tree| tree.contains(self.focused) && self.band_over(tree) > 0)
+    }
+
+    /// Whether qass's header is on screen, over its box or over its split.
+    fn qass_header(&self) -> bool {
+        self.on_qass_screen() || self.qass_split()
+    }
+
+    /// Whether qass's full header stands in the tab bar's rows: its screen is up and the header
+    /// is the full one. The bar is neither painted nor clicked then (the paint reads the same
+    /// plan through `qass_screen_of`).
+    fn header_in_strip(&self) -> bool {
+        self.qass_header()
+            && self
+                .qass_plan()
+                .is_some_and(|p| p.header == crate::qass_screen::Header::Box)
+    }
+
+    /// The inside of qass's terminal box, in pane cells: what its pty is sized to, whether or
+    /// not it is on screen, so looking at qass does not reflow it. `None` when the pane is
+    /// too small to frame.
+    fn qass_rect(&self) -> Option<layout::Rect> {
+        self.qass_plan().map(|plan| plan.inner)
+    }
+
+    /// qass's screen laid out in the pane: its header, the inbox when it is open, and the
+    /// terminal's box.
+    fn qass_plan(&self) -> Option<crate::qass_screen::Plan> {
+        let (cols, rows) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        if self.qass_split() {
+            return crate::qass_screen::Plan::band(cols as usize, rows as usize).map(|plan| {
+                crate::qass_screen::Plan {
+                    side: self.questions(),
+                    ..plan.with_clock(self.clock_rows())
+                }
+            });
+        }
+        crate::qass_screen::Plan::new(
+            cols as usize,
+            rows as usize,
+            self.qass_ui.zoomed,
+            self.qass_ui.inbox,
+        )
+        .map(|plan| plan.with_clock(self.clock_rows()))
+    }
+
+    /// qass's page as home, and the keyboard in the inbox only while the inbox is shown.
+    /// Every entry to qass's space folds the board onto the rail and starts with the questions
+    /// down; the questions brought up by hand go once the last card is answered and its word
+    /// seen; the keyboard never stays in a folded pane. Leaving qass's screen, the zoom or a
+    /// window too small for the inbox takes the keyboard back from it, and an answer still
+    /// being held with it; on qass's split tab it goes to qass's terminal, not to the board.
+    /// True when the panes must be sized again.
+    fn asks_settle(&mut self) -> bool {
+        let mut resize = false;
+        // Every way in (the sidebar, the space keys, ctrl-a Q, the first render) passes here.
+        // Nothing is written while the screen stays on qass's space, so a fold chosen on the
+        // page holds until he leaves it.
+        if self.space != self.qass_ui.seen {
+            self.qass_ui.seen = self.space;
+            if self.space.is_some() && self.space == sidebar::qass_space(&self.spaces) {
+                let board = Some(crate::qass_screen::Fold::Board);
+                resize = self.qass_ui.fold != board || self.asks.raised;
+                self.qass_ui.fold = board;
+                self.asks.raised = false;
+            }
+        }
+        if self.asks.raised && self.asks.waiting() == 0 && !self.asks.busy() {
+            self.asks.raised = false;
+        }
+        // The keyboard, there or on its way, goes to the open pane: a folded one cannot take
+        // it. A move meant for the folded pane opens it first, so this never fights him.
+        let leaves = self
+            .space
+            .and_then(|space| self.layouts.get(&space))
+            .and_then(|tree| self.fold_leaf(tree).zip(self.board_leaves(tree)));
+        if let Some(((folded, _), (board, qass))) = leaves
+            && self.pending_focus.unwrap_or(self.focused) == folded
+        {
+            self.pending_focus = Some(if folded == board { qass } else { board });
+        }
+        if self.asks.focus && !self.asks_focused() {
+            self.asks.release();
+            if self.qass_split() {
+                self.qass_next();
+            }
+        }
+        // The same for the schedules: the keyboard never stays in a panel that is not shown.
+        if self.clock.focus && !self.clock_focused() {
+            let shown = self.clock.shown();
+            self.clock.release();
+            resize |= shown != self.clock.shown();
+            if self.qass_split() {
+                self.qass_next();
+            }
+        }
+        resize
+    }
+
+    /// The keyboard to qass's terminal of the tab on screen, next: what leaving the questions
+    /// of qass's split tab does, wherever the keyboard was before them.
+    fn qass_next(&mut self) {
+        self.pending_focus = self.qass_chat().filter(|t| *t != self.focused);
     }
 
     /// qass's terminal in the tab on screen.
@@ -3165,6 +4178,229 @@ impl State {
             .typed_at
             .get(&qass)
             .is_none_or(|at| at.elapsed().as_secs() >= quiet.unsigned_abs())
+    }
+
+    /// Whether the keyboard is in the question inbox: open, shown and given the keys.
+    fn asks_focused(&self) -> bool {
+        self.asks.focus
+            && (self.qass_ui.inbox || self.qass_split())
+            && self.qass_header()
+            && self.qass_plan().is_some_and(|p| p.side.is_some())
+    }
+
+    /// The rows the schedules panel wants in this pane: none while it is not shown.
+    fn clock_rows(&self) -> usize {
+        let (cols, _) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        self.clock.rows_wanted(cols as usize)
+    }
+
+    /// Whether the keyboard is in the schedules panel: shown and given the keys.
+    fn clock_focused(&self) -> bool {
+        self.clock.focus
+            && self.clock.shown()
+            && self.qass_header()
+            && self.qass_plan().is_some_and(|p| p.clock.is_some())
+    }
+
+    /// The folder a new schedule starts from: where the owner was before qass's screen (qass's
+    /// own folder is no one's work), else the folder this client was started in.
+    fn clock_folder(&self) -> String {
+        self.qass_back
+            .and_then(|t| self.rows.iter().find(|r| r.terminal == t))
+            .and_then(|r| r.cwd.clone())
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|dir| dir.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether the questions want to be on screen: he brought them up (`ctrl-a i`, the rail's
+    /// tab or the count) while cards waited, until the last is answered and its word seen; or
+    /// he asked for them with nothing waiting (the handled ones). A card never brings them: it
+    /// lights the rail's tab and the lamp.
+    fn questions_wanted(&self) -> bool {
+        self.qass_ui.inbox || (self.asks.raised && (self.asks.waiting() > 0 || self.asks.busy()))
+    }
+
+    /// Where the questions are drawn on qass's split tab, in pane cells: the column cut from
+    /// the board when the tab shows them beside it (with the board's frame rows above and
+    /// under, where its edge is drawn), else over the board's tile when asked for and the
+    /// tile holds them. `None` elsewhere, zoomed, or when they have nothing to show.
+    fn questions(&self) -> Option<crate::qass_screen::Side> {
+        let tree = self.drawn_tree(self.space?)?;
+        if tree.zoomed.is_some() || tree.leaf_count() < 2 || self.band_over(&tree) == 0 {
+            return None;
+        }
+        if tree.fold_all {
+            let area = self.tree_area(&tree);
+            return Some(crate::qass_screen::Side {
+                rect: layout::Rect {
+                    x: area.x + tree.rail,
+                    cols: area.cols.saturating_sub(tree.rail),
+                    ..area
+                },
+                replaces: true,
+            });
+        }
+        let (board, before) = self.cut(&tree)?;
+        if tree.gap > 0 {
+            let edge = 1;
+            // Beside the tile the gap was cut from, on the side away from it: after it, or
+            // before it when the gap stands before.
+            let x = if before {
+                board.x - tree.gap
+            } else {
+                board.x + board.cols + edge
+            };
+            return Some(crate::qass_screen::Side {
+                rect: layout::Rect {
+                    x,
+                    y: board.y.saturating_sub(1),
+                    cols: tree.gap - edge,
+                    rows: board.rows + 2,
+                },
+                replaces: false,
+            });
+        }
+        // No room beside it (a stacked tab, or a board too narrow): over that tile, by the same
+        // rule as beside.
+        (self.questions_wanted() && crate::qass_screen::Plan::holds_inbox(board.cols, board.rows))
+            .then_some(crate::qass_screen::Side {
+                rect: board,
+                replaces: true,
+            })
+    }
+
+    /// The tile of qass's split tab the questions' gap is cut from, and whether the gap
+    /// stands before it (its left edge) rather than after it: the board's.
+    fn cut(&self, tree: &Layout) -> Option<(layout::Rect, bool)> {
+        let (board, qass) = self.board_leaves(tree)?;
+        // With a pane folded, the open one, on the edge facing the folded one.
+        let (leaf, before) = match tree.fold {
+            Some(fold) => (
+                if fold == board { qass } else { board },
+                tree.leaves().first() == Some(&fold),
+            ),
+            None => (board, tree.gap_second),
+        };
+        let rect = tree
+            .tile_rects(self.tree_area(tree))
+            .into_iter()
+            .find(|(t, _)| *t == leaf)?
+            .1;
+        Some((rect, before))
+    }
+
+    /// qass's rail, in pane cells, while a pane is folded: where its tabs stand and which panes
+    /// they are, in screen order. The questions' tab is there while they are not beside the board.
+    fn rail_paint(&self) -> Option<screen::RailPaint> {
+        let tree = self.drawn_tree(self.space?)?;
+        if !self.qass_split()
+            || tree.rail == 0
+            || tree.zoomed.is_some()
+            || tree.leaf_count() < 2
+            || self.band_over(&tree) == 0
+        {
+            return None;
+        }
+        let (board, qass) = self.board_leaves(&tree)?;
+        let area = self.tree_area(&tree);
+        let panes = [
+            (tree.fold == Some(board) || tree.fold_all).then_some(crate::rail::Pane::Board),
+            (tree.gap == 0 && !tree.fold_all).then_some(crate::rail::Pane::Questions),
+            (tree.fold == Some(qass) || tree.fold_all).then_some(crate::rail::Pane::Qass),
+        ];
+        panes
+            .iter()
+            .any(Option::is_some)
+            .then_some(screen::RailPaint {
+                x: area.x + 1,
+                y: area.y,
+                rows: area.rows,
+                w: tree.rail - crate::rail::EDGE,
+                panes,
+            })
+    }
+
+    /// The columns the rail takes off the first pane while it shows: its tabs, the edge line and
+    /// the blank column. The dragged width, else the one the pane's columns give, kept so qass's
+    /// split still has both panes at their minimum.
+    fn rail_reserve(&self, area: layout::Rect) -> usize {
+        let room = crate::qass_screen::rail_room(area.cols);
+        let tabs = self
+            .qass_ui
+            .rail
+            .unwrap_or_else(|| crate::rail::default_width(area.cols));
+        crate::rail::clamp(tabs, room) + crate::rail::EDGE
+    }
+
+    /// The pane whose tab is at a one based screen position, when it is on the rail.
+    fn rail_tab_at(&self, row: u16, col: u16) -> Option<crate::rail::Pane> {
+        let rail = self.rail_paint()?;
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        let x = (col as usize).checked_sub(left + 1)?;
+        let y = (row as usize).checked_sub(screen::TABS + 1)?;
+        if x < rail.x || x >= rail.x + rail.w {
+            return None;
+        }
+        let tabs = rail.tabs();
+        let at = crate::rail::tab_at(tabs.len(), y.checked_sub(rail.y)?)?;
+        tabs.get(at).copied()
+    }
+
+    /// The terminal a board or qass tab opens.
+    fn rail_leaf(&self, pane: crate::rail::Pane) -> Option<u32> {
+        let (board, qass) = self.board_leaves(self.layouts.get(&self.space?)?)?;
+        match pane {
+            crate::rail::Pane::Board => Some(board),
+            crate::rail::Pane::Qass => Some(qass),
+            crate::rail::Pane::Questions => None,
+        }
+    }
+
+    /// Whether a pane cell is on the rail's edge line, the one that drags its width.
+    /// The edge and the open pane's frame line beside it, which is the line the rail shows.
+    fn on_rail_edge(&self, x: usize, y: usize) -> bool {
+        self.rail_paint().is_some_and(|r| {
+            (r.x + r.w..=r.x + r.w + 1).contains(&x) && y >= r.y && y < r.y + r.rows
+        })
+    }
+
+    /// Set the tabs' width from the pane cell the edge was dragged to. True when it moved.
+    fn rail_to(&mut self, x: usize) -> bool {
+        let Some(rail) = self.rail_paint() else {
+            return false;
+        };
+        let area = pane_area(self);
+        let width = x.saturating_sub(rail.x);
+        // The board keeps its minimum after the rail, or the tab would turn over.
+        let mut room = crate::qass_screen::rail_room(area.cols);
+        if let Some(tree) = self.drawn_tree(self.space.unwrap_or_default())
+            && let Some((first, last)) = tree.root_cols(area)
+        {
+            let board = if tree.gap_second { last } else { first };
+            room = room
+                .min(board.saturating_sub(crate::qass_screen::BOARD_MIN_COLS + crate::rail::EDGE));
+        }
+        let width = crate::rail::clamp(width, room);
+        if width == rail.w {
+            return false;
+        }
+        self.qass_ui.rail = Some(width);
+        true
+    }
+
+    /// Whether qass's mark on its screen moves: it is working and its screen is up.
+    fn qass_working(&self) -> bool {
+        let qass = sidebar::qass_space(&self.spaces);
+        self.qass_header()
+            && self
+                .rows
+                .iter()
+                .any(|r| Some(r.workspace) == qass && r.agent && r.state == "working")
     }
 
     /// The tab after the focused one, wrapping, within the space on screen.
@@ -3623,16 +4859,19 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
         MenuKind::New { .. } => vec![
             ("agent".to_string(), String::new()),
             ("terminal".to_string(), String::new()),
-            ("agent in a worktree".to_string(), "task first".to_string()),
         ],
         MenuKind::Agents {
             agents, earlier, ..
         } => agents
             .iter()
             .map(|a| {
-                // The command is whole: the menu wraps a long one inside its box.
+                // A long command is cut, so the box stays a box and not the width of the
+                // screen: the name already says which line it is.
                 let right = if a.command == a.name {
                     String::new()
+                } else if crate::width::width(&a.command) > MENU_COMMAND {
+                    let cut = crate::width::text(&a.command, MENU_COMMAND - 1);
+                    format!("{}\u{2026}", cut.trim_end())
                 } else {
                     a.command.clone()
                 };
@@ -3641,7 +4880,14 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
             .chain([("other command".to_string(), String::new())])
             .chain(earlier.iter().map(|row| {
                 let title = row.title.as_deref().unwrap_or("untitled");
-                let title = title.to_string();
+                let title = if crate::width::width(title) > MENU_TITLE {
+                    format!(
+                        "{}\u{2026}",
+                        crate::width::text(title, MENU_TITLE - 1).trim_end()
+                    )
+                } else {
+                    title.to_string()
+                };
                 let at = row.updated_at.or(row.started_at).unwrap_or(0) / 1000;
                 let age = crate::asks::age_short(crate::sidebar::now_unix() - at);
                 (title, format!("{} {age}", row.agent))
@@ -3666,6 +4912,10 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
     }
 }
 
+/// The most columns an `[agents]` command takes on the right of the agents list.
+const MENU_COMMAND: usize = 30;
+/// The most columns an earlier conversation's title takes in the agents list.
+const MENU_TITLE: usize = 44;
 /// Earlier conversations the agents list offers at most; a list longer than the window
 /// scrolls with the pick.
 const EARLIER: usize = 50;
@@ -4105,11 +5355,6 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             return MenuSend::Nothing;
         }
         MenuKind::New { space, name } => {
-            // The box asks for the task first, then starts the agent in a new worktree here.
-            if item == 2 {
-                open_new_agent(state, Some(space));
-                return MenuSend::Nothing;
-            }
             if item == 0 {
                 state.menu_kind = MenuKind::Agents {
                     space,
@@ -5013,6 +6258,26 @@ fn wheel_list(state: &mut State, row: u16, col: u16, up: bool) -> bool {
     }
     let column_rows = screen::column_rows(state.lines as usize);
     let column = state.column(state.paint_now, 0);
+    // Over the inbox the wheel is the inbox's: its list scrolls, its tab row walks the tabs.
+    match state.column_hit(row).map(|(hit, _)| hit) {
+        Some(sidebar::Hit::Next(_)) => {
+            let at = sidebar::inbox_wheeled(
+                &column,
+                column_rows,
+                sidebar::current_avatar().as_ref(),
+                up,
+            );
+            let moved = at != state.inbox.scroll;
+            state.inbox.scroll = at;
+            return moved;
+        }
+        Some(sidebar::Hit::Tabs) if !state.inbox.folded => {
+            state.inbox.tab = state.inbox.tab.step(up);
+            state.inbox.scroll = 0;
+            return true;
+        }
+        _ => {}
+    }
     let at = sidebar::wheeled(
         &column,
         column_rows,
@@ -5024,6 +6289,21 @@ fn wheel_list(state: &mut State, row: u16, col: u16, up: bool) -> bool {
     let moved = next != state.list_scroll;
     state.list_scroll = next;
     moved
+}
+
+/// Where the wheel leaves the column's list once a click puts the keyboard on `picked`. A row
+/// of the tree was on screen to be clicked, so the list stays where the wheel left it; an
+/// inbox item names an agent whose row may be scrolled out, so the wheel's place is let go
+/// and the list follows it there.
+fn clicked_scroll(
+    scroll: Option<(u32, usize)>,
+    picked: u32,
+    hit: Option<sidebar::Hit>,
+) -> Option<(u32, usize)> {
+    match (scroll, hit) {
+        (Some((_, at)), Some(sidebar::Hit::Terminal(_))) => Some((picked, at)),
+        _ => None,
+    }
 }
 
 fn scroll_focus(state: &mut State, up: bool, step: usize) {
@@ -6220,9 +7500,7 @@ fn toggle_doze(state: &mut State, space: i64) {
 /// The space a row of the column belongs to.
 fn side_space(state: &State, pick: sidebar::Pick) -> Option<i64> {
     match pick {
-        sidebar::Pick::Space(id) => Some(id),
-        sidebar::Pick::Doze(id) if id != sidebar::IDLE_FOLD => Some(id),
-        sidebar::Pick::Doze(_) => None,
+        sidebar::Pick::Space(id) | sidebar::Pick::Doze(id) => Some(id),
         sidebar::Pick::Terminal(t) => state
             .rows
             .iter()
@@ -6433,9 +7711,6 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
                 }
             }
             Some(sidebar::Pick::Space(id)) => sleep_space(state, id, request),
-            Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)) => {
-                state.message = Some("enter lists the idle and the asleep".to_string());
-            }
             Some(sidebar::Pick::Doze(_)) => {
                 state.message = Some("already asleep, enter lists them".to_string());
             }
@@ -6444,9 +7719,6 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
         ModeKey::Byte(b'w') => match (pick, space) {
             (Some(sidebar::Pick::Terminal(t)), Some(space)) if state.is_asleep(t) => {
                 wake(state, space, t, request);
-            }
-            (Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)), _) => {
-                state.message = Some("enter lists the idle and the asleep".to_string());
             }
             (Some(sidebar::Pick::Space(id) | sidebar::Pick::Doze(id)), _) => {
                 wake_space(state, id, request)
@@ -6467,22 +7739,6 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
         ModeKey::Byte(b'N') => {
             state.menu_kind = MenuKind::Plus;
             state.menu = Some(0);
-        }
-        // The priority list has no space to fold: `h` and `l` close and open its one fold, and
-        // the keys that fold a space say where the spaces are.
-        ModeKey::Byte(b'f' | b' ') if state.view == sidebar::View::Priority => {
-            state.message = Some("ctrl-a g shows the tree to fold a space".to_string());
-        }
-        ModeKey::Byte(b'h') | ModeKey::Left if state.view == sidebar::View::Priority => {
-            if state.doze_open.remove(&sidebar::IDLE_FOLD) {
-                let items = side_items(state);
-                side_stand(state, &items, Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)));
-            } else {
-                state.message = Some("ctrl-a g shows the tree to fold a space".to_string());
-            }
-        }
-        ModeKey::Byte(b'l') | ModeKey::Right if state.view == sidebar::View::Priority => {
-            state.doze_open.insert(sidebar::IDLE_FOLD);
         }
         ModeKey::Byte(b'f' | b' ') => {
             if let Some(space) = space
@@ -6546,6 +7802,31 @@ fn enter_resize(state: &mut State) {
 fn equalize(state: &mut State) {
     if let Some(space) = state.space {
         state.change_shown(space, Layout::equalize);
+        state.save_split(space);
+    }
+}
+
+/// Widen or narrow the questions column by a step, stopping at the questions' minimum and at the
+/// board's. `qass`'s own width does not change: the board gives or takes the columns.
+fn questions_key(state: &mut State, wider: bool) {
+    let Some(space) = state.space else {
+        return;
+    };
+    let area = pane_area(state);
+    let step = crate::qass_screen::QUESTIONS_STEP;
+    let moved = state.questions_to(space, |tree| {
+        let (first, last) = tree.root_cols(area)?;
+        let board = if tree.gap_second { last } else { first };
+        Some(if wider {
+            (tree.gap + step).min(board.saturating_sub(crate::qass_screen::BOARD_MIN_COLS))
+        } else {
+            tree.gap
+                .saturating_sub(step)
+                .max(crate::qass_screen::QUESTIONS_MIN + 1)
+        })
+    });
+    if moved {
+        state.save_split(space);
     }
 }
 
@@ -6573,11 +7854,24 @@ fn resize_key(state: &mut State, bytes: &[u8]) -> ModeOutcome {
         };
         if let Some((mv, step)) = nudge {
             if let Some(space) = state.space {
-                state.change_shown(space, |layout| layout.nudge(area, mv, step));
+                state.change_absorbing(space, |layout| layout.nudge(area, mv, step));
+                state.save_split(space);
             }
         } else {
             match key {
                 ModeKey::Byte(b'=') => equalize(state),
+                // On qass's tab only, and only while the questions are beside the board: they
+                // get wider or narrower, the board's side and qass's staying as they are.
+                ModeKey::Byte(key @ (b'<' | b'>')) if state.on_board_tab() => {
+                    questions_key(state, key == b'>');
+                }
+                // On qass's tab only: the board and qass change sides. Elsewhere it is no
+                // key of this mode, as before.
+                ModeKey::Byte(b's') if state.on_board_tab() => {
+                    if let Some(space) = state.space {
+                        state.swap_sides(space);
+                    }
+                }
                 ModeKey::Esc | ModeKey::Byte(b'\r' | b'\n' | b'q' | b'e') => {
                     state.modes.resizing = false;
                     let rest = &bytes[at + used..];
@@ -7103,6 +8397,9 @@ fn start_yank(
 
 /// The pane's size in cells, which is what a sleeping tab's screen is cut to.
 fn pane_cells(state: &State) -> (u16, u16) {
+    if let Some(inner) = state.qass_rect().filter(|_| state.on_qass_screen()) {
+        return (inner.cols as u16, inner.rows as u16);
+    }
     screen::pane_size_for(
         state.cols,
         state.lines,
@@ -7361,16 +8658,16 @@ enum Clicked {
     App,
     /// The foot's `offline`: the news that the hub is not reached.
     HubDown,
-    /// The Needs you header of the column, or a question that names no agent: the Inbox.
-    Inbox,
-    /// A machine on the computers line: its own screen.
-    Computer(usize),
+    /// A tab of the inbox, or a count on its folded row.
+    InboxTab(sidebar::InboxTab),
+    /// The inbox's caret.
+    InboxFold,
     Fold(i64),
     /// The row a space's sleeping agents fold to: list them, or fold them again.
     Doze(i64),
     View,
     Collapse,
-    /// The pet in the foot: qass's ledger, or back, as `ctrl-a Q` does.
+    /// The pet in the foot: qass, or back, as `ctrl-a Q` does.
     Qass,
     /// The `watch` word beside the pet: qass's watching turned over.
     QassWatch,
@@ -7558,6 +8855,13 @@ where
         armed: None,
         drawer: None,
         list_scroll: None,
+        tabq: None,
+        tabq_focus: None,
+        tabq_task: None,
+        tabq_read: None,
+        tabq_asked: None,
+        tabq_home: None,
+        tabq_w: None,
         closing: None,
         close_begun: false,
         rows: Vec::new(),
@@ -7598,7 +8902,9 @@ where
         message: Some(CONNECTING.to_string()),
         hint: notice,
         pending_focus: None,
+        qass_back: None,
         qass_asked: None,
+        qass_ui: Default::default(),
         // Read once as soon as the loop runs.
         asks: crate::asks::Pane::new(),
         clock: crate::schedules::Pane::new(),
@@ -7629,7 +8935,8 @@ where
         done: false,
 
         view: sidebar::View::default(),
-        ibx_list: crate::inbox::Inbox::default(),
+        inbox: sidebar::Inbox::default(),
+        inbox_drag: None,
 
         shut: sidebar::Shut::new(),
         doze_open: sidebar::Shut::new(),
@@ -7639,16 +8946,6 @@ where
         prefix_pending: false,
 
         answer: None,
-        ibx: crate::inbox_pane::Pane::new(),
-        hand: crate::answers::HandInput {
-            dir: crate::inbox_pane::hand_dir(),
-            ..Default::default()
-        },
-        ibx_cards: Vec::new(),
-        ibx_ctx: crate::inbox::Context::default(),
-        ibx_held: None,
-        ibx_day: 0,
-        beside: Default::default(),
 
         usage: sidebar::Usage::new(),
 
@@ -7684,6 +8981,8 @@ where
         link: LinkClick::default(),
         agent_view: None,
         plugin_links: false,
+        board_drag: None,
+        board_owed: None,
         last_press: None,
         toast: None,
         anchor: None,
@@ -7880,7 +9179,6 @@ where
     // Work that blocks (reading /proc, reading a transcript) runs on the blocking pool and
     // comes back here, so the keyboard never waits on a disk. One sample at a time.
     let (blocking_tx, mut blocking_rx) = tokio::sync::mpsc::unbounded_channel::<Blocked>();
-    state.beside.blocking = Some(blocking_tx.clone());
     // A plugin's agent view, for the spaces tree: asked off the render path.
     let view_watch = {
         let tx = blocking_tx.clone();
@@ -8008,6 +9306,14 @@ where
             if !state.in_qass() {
                 state.last.keep(state.focused);
             }
+            // The questions pane of the tab on screen, settled before the paint, so the frame and a
+            // click read the cards it stands over.
+            if state.tabq_settle() {
+                dirty = true;
+            }
+            if let Some(read) = state.tabq_read_request() {
+                wr.write_all(&client::encode_control_seq(&read, &mut control_seq)?).await?;
+            }
             if dirty && presented.elapsed() >= FRAME {
                 // Once per change and at most once a frame, so fast switching is told once; with
                 // the cells a tab is laid out in, which plugin layouts are drawn in.
@@ -8043,8 +9349,6 @@ where
                 // and the hit testing below, and its time remembered for the
                 // clicks that land between paints.
                 state.refresh_chat();
-                state.refresh_ibx();
-                let inbox_view = state.ibx_view();
                 let mut frame = state.frame();
                 // The carried row on the rows of this very frame, its clock and all.
                 let drag = state.drag_paint(frame.now_unix);
@@ -8094,10 +9398,6 @@ where
                 {
                     screen::paint_answer(&frame, answer, &mut painted);
                 }
-                // The Inbox covers the pane the same way, last: it owns the pane while open.
-                if let Some(view) = inbox_view.as_ref() {
-                    screen::paint_inbox(&frame, view, &mut painted);
-                }
                 // The borrow ends here: the clock is copied out before the
                 // state is touched again below.
                 let paint_now = frame.now_unix;
@@ -8129,7 +9429,6 @@ where
                     || state.menu.is_some()
                     || state.reading.is_some()
                     || state.answer.is_some()
-                    || state.ibx.open
                     || state.focus;
                 let resized = state.img_size != (state.cols, state.lines);
                 let anchored = state.anchor.is_some() || suppressed;
@@ -8197,7 +9496,7 @@ where
             // repaint the same cell.
             let moving = if motion && screen::left_for(state.cols, state.collapsed, state.sidebar_width) > 0 {
                 let rows = sidebar::moves(&state.column(0, 0), state.collapsed);
-                if state.drawer_moving() { Some(sidebar::Motion::Spin) } else { rows }
+                if state.drawer_moving() || state.qass_working() { Some(sidebar::Motion::Spin) } else { rows }
             } else {
                 None
             };
@@ -8244,13 +9543,19 @@ where
                 tokio::time::Instant::from_std(toast.until)
             });
 
+            // The keyboard is in the inbox only while the inbox is shown: leaving qass's
+            // screen, the zoom or a window too small for it takes the keyboard back, and an
+            // answer still being held with it.
+            if state.asks_settle()
+                && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+            {
+                wr.write_all(&resize).await?;
+            }
             if state.pending_focus.is_some() {
                 drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
             }
             // A write to send, and the moment a notice is let go. `None` with nothing to do.
-            let asks_at = [
-                state.ibx.wake_at(std::time::Instant::now()),
-            ]
+            let asks_at = [state.asks.wake_at(), state.clock.wake_at()]
                 .into_iter()
                 .flatten()
                 .min()
@@ -8266,8 +9571,10 @@ where
                     }
                     drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                     earlier_again(&mut state);
-                    drain_beside(&mut state, &mut control_seq, &mut wr).await?;
                     if sidebar::refresh_files() {
+                        dirty = true;
+                    }
+                    if state.qass_header() && state.qass_ui.refresh(sidebar::now_unix()) {
                         dirty = true;
                     }
                     if state.update.due(std::time::Instant::now()) {
@@ -8504,15 +9811,6 @@ where
                                     palette::Item::NewAgent(program) => {
                                         state.prompt = Some(agent_name(state.space, program));
                                     }
-                                    palette::Item::NewWork => {
-                                        let here = state.space;
-                                        open_new_agent(&mut state, here);
-                                    }
-                                    palette::Item::Ledger => {
-                                        open_ledger(&mut state);
-                                        drain_beside(&mut state, &mut control_seq, &mut wr).await?;
-                                    }
-                                    palette::Item::Computer(machine) => open_computer(&mut state, machine),
                                     palette::Item::NewSpace => {
                                         state.prompt = Some(Prompt::new(Naming::Space, ""));
                                     }
@@ -8705,18 +10003,6 @@ where
                         if let ModeOutcome::Passthrough(rest) = outcome {
                             feed = Some(rest);
                         }
-                    } else if state.ibx.open
-                        && !keys.prefix_pending()
-                        && !keys.mouse_pending()
-                        && !is_report_head(&bytes)
-                    {
-                        // The Inbox owns the keyboard while it is open, and hands back the
-                        // prefix, the mouse and a detach.
-                        dirty = true;
-                        feed = run_inbox_keys(
-                            &mut state, &bytes, keys.prefix(), &mut control_seq, &mut seqs, &mut wr,
-                        )
-                        .await?;
                     } else if state.answer.is_some() {
                         // An open answer owns the keyboard: it scrolls and closes, and a stray
                         // key does nothing rather than type into the agent behind it.
@@ -8758,6 +10044,74 @@ where
                                 feed = Some(rest);
                             }
                         }
+                    } else if state.tabq_focused()
+                        && !keys.prefix_pending()
+                        && !keys.mouse_pending()
+                        && !is_report_head(&bytes)
+                    {
+                        // An agent tab's open pane owns the keyboard while it is given it, and
+                        // hands back the prefix, the mouse and what is not its own.
+                        dirty = true;
+                        let taken = tabq_keys(&mut state, &bytes, keys.prefix());
+                        if taken.resize
+                            && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                        {
+                            wr.write_all(&resize).await?;
+                        }
+                        if let Some(terminal) = taken.jump
+                            && let Some(bytes) =
+                                focus(&mut state, terminal, &mut control_seq, &mut seqs)?
+                        {
+                            wr.write_all(&bytes).await?;
+                        }
+                        feed = taken.feed;
+                    } else if state.asks_focused()
+                        && !keys.prefix_pending()
+                        && !keys.mouse_pending()
+                        && !is_report_head(&bytes)
+                    {
+                        // The question inbox owns the keyboard while it is given it, and
+                        // hands back the prefix, the mouse and what is not its own.
+                        dirty = true;
+                        let taken = asks_keys(&mut state, &bytes, keys.prefix());
+                        if taken.resize
+                            && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                        {
+                            wr.write_all(&resize).await?;
+                        }
+                        if let Some(terminal) = taken.jump
+                            && let Some(bytes) =
+                                focus(&mut state, terminal, &mut control_seq, &mut seqs)?
+                        {
+                            wr.write_all(&bytes).await?;
+                        }
+                        drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                        if let Some((terminal, line)) = &taken.paste {
+                            paste_talk(&mut state, *terminal, line, &mut seqs, &mut wr).await?;
+                        }
+                        feed = taken.feed;
+                    } else if state.clock_focused()
+                        && !keys.prefix_pending()
+                        && !keys.mouse_pending()
+                        && !is_report_head(&bytes)
+                    {
+                        // The schedules own the keyboard while they are given it, and hand
+                        // back the prefix, the mouse and what is not theirs.
+                        dirty = true;
+                        let taken = clock_keys(&mut state, &bytes, keys.prefix());
+                        if taken.resize
+                            && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                        {
+                            wr.write_all(&resize).await?;
+                        }
+                        if let Some(terminal) = taken.jump
+                            && let Some(bytes) =
+                                focus(&mut state, terminal, &mut control_seq, &mut seqs)?
+                        {
+                            wr.write_all(&bytes).await?;
+                        }
+                        drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                        feed = taken.feed;
                     } else {
                         feed = Some(bytes);
                     }
@@ -8783,26 +10137,7 @@ where
                         if action.moves_on() && state.message.take().is_some() {
                             dirty = true;
                         }
-                        // Over the Inbox the mouse is its own, never the terminal's under it.
-                        if state.ibx.open
-                            && let Some(taken) = inbox_mouse(&mut state, &action)
-                        {
-                            dirty = true;
-                            finish_inbox(&mut state, taken, &mut control_seq, &mut seqs, &mut wr)
-                                .await?;
-                            continue;
-                        }
                         match action {
-                            Action::Input(bytes) if state.ibx_view().is_some() => {
-                                // Typed in the same read as the key that opened the Inbox: its.
-                                dirty = true;
-                                // The decoder already took the prefix and the mouse out of these
-                                // bytes, so there is nothing to hand back.
-                                let _ = run_inbox_keys(
-                                    &mut state, &bytes, keys.prefix(), &mut control_seq, &mut seqs, &mut wr,
-                                )
-                                .await?;
-                            }
                             Action::Input(bytes) => {
                                 // Typed in the same read as the key that opened a mode,
                                 // as in `ctrl-a [ k`: the mode's, like everything after it.
@@ -8929,15 +10264,91 @@ where
                                 // A new press ends whatever gesture came before: a
                                 // release swallowed elsewhere (the palette, a divider
                                 // drag) must not leave the program owed one.
+                                state.cancel_board_drag();
                                 state.forwarded_press = false;
+                                drain_board_owed(&mut state, &mut seqs, &mut wr).await?;
                                 drop_carry(&mut state);
                                 state.row_press = None;
+                                state.inbox_drag = None;
                                 // A click lands on the live pane, never on the
                                 // list: the list closes under it and the press
                                 // itself runs the ordinary path below.
                                 if state.focus {
                                     close_focus(&mut state);
                                     dirty = true;
+                                }
+                                // The question inbox and the chip that opens it answer their own
+                                // clicks; a click in qass's terminal takes the keyboard back.
+                                // The schedules answer their own clicks; a click on one takes the
+                                // keyboard from the questions.
+                                if let Some(click) = state.clock_click(row, col) {
+                                    state.asks.release();
+                                    state.clock.focus = true;
+                                    let before = state.clock_rows();
+                                    let out = match click {
+                                        Some(hit) => state.clock.click(hit),
+                                        None => crate::schedules::Out::Stay,
+                                    };
+                                    let taken = clock_out(&mut state, out, before);
+                                    if taken.resize
+                                        && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                                    {
+                                        wr.write_all(&resize).await?;
+                                    }
+                                    if let Some(terminal) = taken.jump
+                                        && let Some(bytes) =
+                                            focus(&mut state, terminal, &mut control_seq, &mut seqs)?
+                                    {
+                                        wr.write_all(&bytes).await?;
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
+                                match state.ask_click(row, col) {
+                                    Some(AskClick::Toggle) => {
+                                        if asks_toggle(&mut state)
+                                            && let Some(resize) =
+                                                size_terminals(&mut state, &mut seqs)?
+                                        {
+                                            wr.write_all(&resize).await?;
+                                        }
+                                        drain_pending_focus(
+                                            &mut state,
+                                            &mut control_seq,
+                                            &mut seqs,
+                                            &mut wr,
+                                            &mut dirty,
+                                        )
+                                        .await?;
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    Some(AskClick::Inbox(hit)) => {
+                                        state.asks.focus = true;
+                                        state.asks.click(hit);
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    Some(AskClick::InboxBlank) => {
+                                        state.asks.focus = true;
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    Some(AskClick::Fold) => {
+                                        if questions_fold(&mut state)
+                                            && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                                        {
+                                            wr.write_all(&resize).await?;
+                                        }
+                                        drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    Some(AskClick::Chat) if state.asks.focus => {
+                                        state.asks.release();
+                                        dirty = true;
+                                    }
+                                    Some(AskClick::Chat) | None => {}
                                 }
                                 // The divider first: a press there arms a drag
                                 // and consumes the press whole, so it never
@@ -8952,6 +10363,35 @@ where
                                 let clicked = state.clicked(row, col);
                                 let asked_about = put_question_down(&mut state, clicked);
 
+                                // A tab on the rail opens its pane (the questions' tab was
+                                // answered above), and the press never reaches anything else.
+                                if !shift
+                                    && let Some(terminal) = state.rail_tab_at(row, col).and_then(|pane| state.rail_leaf(pane))
+                                    && state.strip_press(terminal)
+                                {
+                                    if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
+                                        wr.write_all(&resize).await?;
+                                    }
+                                    drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                                    dirty = true;
+                                    continue;
+                                }
+                                // The agent tab's questions rail and its open pane are their own: a
+                                // press there reaches no pane and puts down a selection; on the
+                                // rail it unfolds the pane, in the pane it answers what it hit.
+                                if !shift && let Some((resize, moved)) = tabq_press(&mut state, row, col, &mut control_seq, &mut seqs)? {
+                                    if let Some(bytes) = moved {
+                                        wr.write_all(&bytes).await?;
+                                    }
+                                    if state.selection.take().is_some() {
+                                        dirty = true;
+                                    }
+                                    if resize && let Some(resize) = size_terminals(&mut state, &mut seqs)? {
+                                        wr.write_all(&resize).await?;
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
                                 // A pane's name on the top edge of the panes is its handle: held,
                                 // it carries the pane like a row of the column (to the tab bar
                                 // for a tab of its own); let go where it went down, it is a click
@@ -8997,7 +10437,16 @@ where
                                             wr.write_all(&bytes).await?;
                                             dirty = true;
                                         }
-                                        continue;
+                                        // The board page of qass's tab takes its first press
+                                        // too: a card is grabbed and carried in one gesture,
+                                        // with the keyboard most often in qass.
+                                        if !(state.board_pane(terminal)
+                                            && state.focused == terminal
+                                            && state.pane_wants_mouse()
+                                            && !shift)
+                                        {
+                                            continue;
+                                        }
                                     }
                                     // A press on a group or tool row of a chat opens or closes it.
                                     if chat_press(&mut state, terminal, tile_row, shift) {
@@ -9023,6 +10472,9 @@ where
                                             send_to_pane(&mut state, &mut seqs, &mut wr, bytes)
                                                 .await?;
                                             state.forwarded_press = true;
+                                            if state.board_pane(terminal) {
+                                                state.board_drag = Some(terminal);
+                                            }
                                         }
                                     } else {
                                         // A second press on the same cell within half a
@@ -9103,10 +10555,11 @@ where
                                     // let go where it went down it is a click, moved
                                     // first it is a drag to another space or a pane.
                                     Some(Clicked::Terminal(picked)) if in_column => {
-                                        // The row was on screen to be clicked, so the list
-                                        // stays where the wheel left it.
-                                        state.list_scroll =
-                                            state.list_scroll.map(|(_, at)| (picked, at));
+                                        state.list_scroll = clicked_scroll(
+                                            state.list_scroll,
+                                            picked,
+                                            state.column_hit(row).map(|(hit, _)| hit),
+                                        );
                                         let name = matches!(
                                             state.column_hit(row),
                                             Some((sidebar::Hit::Terminal(_), true))
@@ -9360,12 +10813,14 @@ where
                                         dirty = true;
                                     }
                                     Some(Clicked::Qass) => {
-                                        if ledger_toggle(&mut state)
-                                            && let Some(resize) = size_terminals(&mut state, &mut seqs)?
-                                        {
-                                            wr.write_all(&resize).await?;
+                                        if let Some(bytes) = qass_press(
+                                            &mut state,
+                                            &mut control_seq,
+                                            &mut seqs,
+                                            &blocking_tx,
+                                        )? {
+                                            wr.write_all(&bytes).await?;
                                         }
-                                        drain_beside(&mut state, &mut control_seq, &mut wr).await?;
                                         dirty = true;
                                     }
                                     Some(Clicked::QassWatch) => {
@@ -9393,16 +10848,32 @@ where
                                         }
                                         dirty = true;
                                     }
-                                    Some(Clicked::Inbox) => {
-                                        open_inbox(&mut state);
+                                    Some(Clicked::InboxTab(tab)) => {
+                                        state.inbox.tab = state.inbox.picked(tab);
+                                        state.inbox.scroll = 0;
+                                        state.inbox.folded = false;
                                         dirty = true;
                                     }
-                                    // A machine on the computers line: its own screen.
-                                    Some(Clicked::Computer(machine)) => {
-                                        open_computer(&mut state, machine);
+                                    Some(Clicked::InboxFold) => {
+                                        state.inbox.folded = !state.inbox.folded;
                                         dirty = true;
                                     }
-                                    None => {}
+                                    // The title away from its words is the inbox's edge:
+                                    // held, it drags the inbox taller or shorter.
+                                    None => {
+                                        if in_column
+                                            && !state.collapsed
+                                            && !state.inbox.folded
+                                            && state.inbox_room() > 0
+                                            && matches!(
+                                                state.column_hit(row),
+                                                Some((sidebar::Hit::Title, _))
+                                            )
+                                        {
+                                            let rows = state.inbox.rows.min(state.inbox_room());
+                                            state.inbox_drag = Some((row, rows));
+                                        }
+                                    }
                                 }
                             }
                             Action::Drag { row, col, shift } => {
@@ -9417,12 +10888,19 @@ where
                                 if state.overlay_open() {
                                     drop_carry(&mut state);
                                 }
+                                let folded = state.folded().is_some();
                                 if let Some(press) = state.row_press.as_mut() {
                                     if press.dead {
                                         continue;
                                     }
                                     press.moved |=
                                         row != press.at.0 || col.abs_diff(press.at.1) > 2;
+                                    // A pane's title dragged while a pane is folded: no divider
+                                    // to swap by, so the gesture is swallowed, no hint, no chip.
+                                    if press.moved && folded && matches!(press.source, Source::Pane(_)) {
+                                        press.dead = true;
+                                        continue;
+                                    }
                                     if press.moved {
                                         // The chip rides with the pointer, so every motion
                                         // of a carried row is a paint.
@@ -9430,6 +10908,17 @@ where
                                         let source = press.source;
                                         let drop = state.drop_target(source, row, col);
                                         state.message = Some(drop_hint(&state, source, drop));
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
+                                // The held title moves the inbox's edge with the pointer.
+                                if let Some((from, rows)) = state.inbox_drag {
+                                    let want = (rows as i64 + i64::from(row) - i64::from(from))
+                                        .clamp(1, state.inbox_room().max(1) as i64)
+                                        as usize;
+                                    if want != state.inbox.rows {
+                                        state.inbox.rows = want;
                                         dirty = true;
                                     }
                                     continue;
@@ -9450,6 +10939,27 @@ where
                                         dirty = true;
                                     }
                                     continue;
+                                }
+                                // A card held on the board page: qass's pane lights up while
+                                // the pointer is over it. The keyboard gone elsewhere ends it.
+                                if let Some(board) = state.board_drag {
+                                    if state.focused != board {
+                                        state.cancel_board_drag();
+                                        drain_board_owed(&mut state, &mut seqs, &mut wr).await?;
+                                        dirty = true;
+                                    } else {
+                                        let on_qass = state.board_target(board, row, col) == Some(true);
+                                        let hover = on_qass
+                                            .then(|| state.qass_leaf())
+                                            .flatten();
+                                        if hover != state.drop_hover {
+                                            state.drop_hover = hover;
+                                            state.message = hover.map(|_| {
+                                                "release: qass starts the held card".to_string()
+                                            });
+                                            dirty = true;
+                                        }
+                                    }
                                 }
                                 let Some((pane_row, pane_col)) = state.in_pane(row, col).or_else(|| {
                                     state
@@ -9479,6 +10989,10 @@ where
                                 if state.focus {
                                     close_focus(&mut state);
                                     dirty = true;
+                                }
+                                // The inbox's edge is let go where it is.
+                                if state.inbox_drag.take().is_some() {
+                                    continue;
                                 }
                                 // A held row comes up: a drop where it went, or the click it
                                 // was. A click on the name of the agent already under the
@@ -9521,6 +11035,27 @@ where
                                         Source::Pane(terminal) => (terminal, true),
                                         Source::Space { .. } => continue,
                                     };
+                                    // On qass's tab with the board the title is the fold: a click
+                                    // folds, a drag carries (and does nothing while folded).
+                                    let act = if handle {
+                                        state.title_release(terminal, press.moved)
+                                    } else if press.moved {
+                                        TitleAct::Carry
+                                    } else {
+                                        TitleAct::Focus
+                                    };
+                                    if act == TitleAct::Fold || act == TitleAct::Nothing {
+                                        state.message = None;
+                                        if act == TitleAct::Fold
+                                            && title_fold(&mut state, terminal)
+                                            && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                                        {
+                                            wr.write_all(&resize).await?;
+                                        }
+                                        drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                                        dirty = true;
+                                        continue;
+                                    }
                                     if press.moved {
                                         state.message = None;
                                         let drop = state.drop_target(press.source, row, col);
@@ -9585,9 +11120,36 @@ where
                                     dirty = true;
                                     continue;
                                 }
-                                if state.modes.split_drag.take().is_some() {
+                                if let Some(grab) = state.modes.split_drag.take() {
+                                    // A rail's or a pane's width is this session's: nothing is written.
+                                    if let Some(space) = state.space.filter(|_| !matches!(grab, Grab::Rail | Grab::Tabq)) {
+                                        state.save_split(space);
+                                    }
                                     dirty = true;
                                     continue;
+                                }
+                                // A card held on the board page and let go outside it: the
+                                // page is told where, never handed a release on its edge.
+                                drain_board_owed(&mut state, &mut seqs, &mut wr).await?;
+                                if let Some(board) = state.board_drag {
+                                    // A board no longer the one on screen (qass gone, the tree
+                                    // changed) is owed the let go, never a release.
+                                    if !state.board_pane(board) {
+                                        state.cancel_board_drag();
+                                        drain_board_owed(&mut state, &mut seqs, &mut wr).await?;
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    state.board_drag = None;
+                                    state.drop_hover = None;
+                                    if let Some(on_qass) = state.board_target(board, row, col) {
+                                        state.forwarded_press = false;
+                                        state.message = None;
+                                        send_to_terminal(board, &mut seqs, &mut wr, board_drop(on_qass))
+                                            .await?;
+                                        dirty = true;
+                                        continue;
+                                    }
                                 }
                                 let inside = state.in_pane(row, col).or_else(|| {
                                     state
@@ -9629,6 +11191,20 @@ where
                                 }
                             }
                             Action::Wheel { row, col, up, shift } => {
+                                // Over the questions, the wheel is theirs: never the board's
+                                // under them.
+                                if state.in_questions(row, col) {
+                                    continue;
+                                }
+                                // The board page of qass's tab scrolls under the wheel with the
+                                // keyboard anywhere: its lanes are the page's to move.
+                                if !state.focus
+                                    && !shift
+                                    && let Some((board, bytes)) = state.board_wheel(row, col, up)
+                                {
+                                    send_to_terminal(board, &mut seqs, &mut wr, bytes).await?;
+                                    continue;
+                                }
                                 let Some((pane_row, pane_col)) = state.in_pane(row, col) else {
                                     // Over the column, which is where a question is drawn
                                     // and where scrolling moves it out of view.
@@ -9881,8 +11457,6 @@ where
                                 dirty = true;
                             }
                             Action::Collapse => {
-                                // The person's own fold: the Inbox no longer unfolds it.
-                                state.ibx.folded = false;
                                 state.collapsed = !state.collapsed;
                                 // The pane's width changed with the column, and a child
                                 // that is not told reflows its output against a width it no
@@ -9915,23 +11489,44 @@ where
                                     dirty = true;
                                 }
                             }
-                            // The Inbox over the pane, from any tab. qass's page stays `qoop qass page`.
+                            // qass in its own space, or back from it. Its page stays
+                            // `qoop qass page`.
                             Action::Asks => {
-                                if inbox_toggle(&mut state)
+                                if asks_toggle(&mut state)
                                     && let Some(resize) = size_terminals(&mut state, &mut seqs)?
                                 {
                                     wr.write_all(&resize).await?;
                                 }
+                                drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                                 dirty = true;
                             }
-                            // qass's ledger over the pane; `t` in it opens its own terminal.
-                            Action::Qass => {
-                                if ledger_toggle(&mut state)
+                            Action::Clock => {
+                                if clock_toggle(&mut state)
                                     && let Some(resize) = size_terminals(&mut state, &mut seqs)?
                                 {
                                     wr.write_all(&resize).await?;
                                 }
-                                drain_beside(&mut state, &mut control_seq, &mut wr).await?;
+                                drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                                dirty = true;
+                            }
+                            Action::Fold => {
+                                if fold_key(&mut state)
+                                    && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                                {
+                                    wr.write_all(&resize).await?;
+                                }
+                                drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                                dirty = true;
+                            }
+                            Action::Qass => {
+                                if let Some(bytes) = qass_press(
+                                    &mut state,
+                                    &mut control_seq,
+                                    &mut seqs,
+                                    &blocking_tx,
+                                )? {
+                                    wr.write_all(&bytes).await?;
+                                }
                                 dirty = true;
                             }
 
@@ -9987,7 +11582,7 @@ where
                                 dirty |= chat_row_key(&mut state);
                             }
                             Action::Palette => {
-                                state.palette = Some(state.new_palette(crate::config::agents()));
+                                state.palette = Some(Palette::with_agents(crate::config::agents()));
                                 // The plugin host is asked off the render path; its rows land when it answers.
                                 let tx = blocking_tx.clone();
                                 tokio::task::spawn_blocking(move || {
@@ -9997,20 +11592,14 @@ where
                             }
                             // The first of the next row's queue, the way a click on that row
                             // goes there. Standing on a finished agent reads it, so the next
-                            // press finds the one after: what the Inbox counts, oldest first.
-                            // A card qass wrote, or one about no agent, is answered in the Inbox.
+                            // press finds the one after: wants, then failed, then done.
                             Action::UpNext => {
-                                match state.up_next() {
-                                    Some(item) if item.opens_inbox() => {
-                                        open_inbox(&mut state);
-                                        state.ibx.select(item.slot);
-                                    }
-                                    Some(item) => {
-                                        if let Some(picked) = item.terminal
-                                            && let Some(bytes) = focus(
-                                                &mut state, picked, &mut control_seq, &mut seqs,
-                                            )?
-                                        {
+                                let next = state.up_next();
+                                match next {
+                                    Some(picked) => {
+                                        if let Some(bytes) = focus(
+                                            &mut state, picked, &mut control_seq, &mut seqs,
+                                        )? {
                                             wr.write_all(&bytes).await?;
                                         }
                                     }
@@ -10293,7 +11882,7 @@ where
                 n = rd.read(&mut read) => {
                     let n = n?;
                     if n == 0 {
-                        return daemon_closed(&state.update, state.focused, Vec::new());
+                        return daemon_closed(&state.update, state.focused, state.asks.unsent());
                     }
                     inbuf.extend_from_slice(&read[..n]);
                     let mut refresh = false;
@@ -10409,6 +11998,8 @@ where
                                 if matches!(message, Incoming::Event(EventMessage::Resync)) {
                                     state.asks.stale = true;
                                     state.clock.stale = true;
+                                    // A task read lost with the link is asked again.
+                                    state.tabq_asked = None;
                                 }
                                 // What changed is not in the message on purpose, so the
                                 // answer comes from the one place that has it. A resync
@@ -10443,12 +12034,8 @@ where
                                     }
                                 }
                             },
-                            // The board moved: read again when it is shown. A result shown:
-                            // nothing the index draws.
-                            Incoming::Event(EventMessage::TasksChanged) => {
-                                state.beside.board.stale = true;
-                            }
-                            Incoming::Event(EventMessage::ShowsChanged) => {}
+                            // The board's news and a result shown: nothing the index draws.
+                            Incoming::Event(EventMessage::TasksChanged | EventMessage::ShowsChanged) => {}
                             // The schedules' list is read again; the panel is what draws it.
                             Incoming::Event(EventMessage::SchedulesChanged) => state.clock.stale = true,
                             // The chat view asks for the page again when it shows this terminal.
@@ -10494,28 +12081,11 @@ where
                                         wr.write_all(&resize).await?;
                                     }
                                 }
-                                // What the Inbox asked: its answers, and the cards read again
-                                // once one was written.
-                                {
-                                    let env = ibx_env!(state);
-                                    if state.ibx.answered(&response, &env) {
-                                        state.asks.stale = true;
-                                        dirty = true;
-                                    }
-                                }
-                                // The board read, for the Inbox's second view and the ledger.
-                                if state.beside.board.answered(&response) {
+                                if state.tabq_answered(&response) {
                                     dirty = true;
                                 }
-                                for (m, remote) in &mut state.beside.boards {
-                                    if remote.answered_to(&crate::board::read_id(*m), &response) {
-                                        dirty = true;
-                                    }
-                                }
-                                drain_inbox(&mut state, &mut seqs, &mut control_seq, &mut wr).await?;
                                 if state.asks.answered(&response) {
                                     dirty = true;
-                                    state.cards_changed_ibx();
                                     // The last card going takes questions he brought up out
                                     // beside the board: the board is sized again, qass not.
                                     if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
@@ -10690,7 +12260,6 @@ where
                     if let Some(read) = state.clock.read_request() {
                         wr.write_all(&client::encode_control_seq(&read, &mut control_seq)?).await?;
                     }
-                    drain_beside(&mut state, &mut control_seq, &mut wr).await?;
                 }
                 // A held escape that nothing completed: it was a key. Released into the
                 // filter, and the stdin arm is woken to type it through the ordinary path.
@@ -10735,13 +12304,20 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
-                    // The answers on hold: counted down, and sent once their time is up.
-                    state.refresh_ibx();
-                    let env = ibx_env!(state);
-                    if state.ibx.tick(&env) {
-                        dirty = true;
+                    let (mut sends, mut moved) = state.asks.tick(std::time::Instant::now());
+                    let (clock_sends, clock_moved) = state.clock.tick(std::time::Instant::now());
+                    sends.extend(clock_sends);
+                    moved |= clock_moved;
+                    for request in sends {
+                        wr.write_all(&client::encode_control_seq(&request, &mut control_seq)?).await?;
                     }
-                    drain_inbox(&mut state, &mut seqs, &mut control_seq, &mut wr).await?;
+                    if moved {
+                        dirty = true;
+                        // The last answer's word let go: the questions may leave the board's side.
+                        if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
+                            wr.write_all(&resize).await?;
+                        }
+                    }
                 }
                 // A close that has not finished in [`CLOSE_PATIENCE`] is not going to.
                 // Said once, with what is left, rather than left as a row that never
@@ -10978,29 +12554,6 @@ where
         }
     }
     .await;
-
-    // What is still on hold is sent now, whichever way the interface left (a detach, a hangup,
-    // a kill): an answer the person gave is not lost to the three seconds. Best effort.
-    state.refresh_ibx();
-    {
-        let env = ibx_env!(state);
-        state.ibx.flush(&env);
-    }
-    if state.ibx.owes() {
-        let _ = drain_inbox(&mut state, &mut seqs, &mut control_seq, &mut wr).await;
-        let _ = wr.flush().await;
-        // The mux runs in this process and carries a remote's answer: it has left only once the
-        // far daemon answered, so that is waited for (bounded), not guessed.
-        settle_answers(
-            &mut state,
-            &mut rd,
-            &mut connection,
-            &mut inbuf,
-            EXIT_SETTLE,
-        )
-        .await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
 
     // Off in the reverse order, and before leaving the alternate screen: a terminal left
     // in mouse reporting mode sends escape sequences into whatever the person runs next.
@@ -12006,6 +13559,11 @@ fn pane_area(state: &State) -> layout::Rect {
 /// tiling tree for this space.
 fn focused_rect(state: &State) -> layout::Rect {
     let area = pane_area(state);
+    // qass's lone screen draws its own box; a pane too small for one stands in the frame
+    // every pane has, so leaving it for another tab resizes nothing.
+    if state.focused != 0 && state.on_qass_screen() {
+        return state.qass_rect().unwrap_or_else(|| layout::framed(area));
+    }
     if state.focused == 0 {
         return area;
     }
@@ -12203,6 +13761,13 @@ fn drop_hint(state: &State, source: Source, drop: Option<RowDrop>) -> String {
     if drop.is_none() && state.over_other_machine(terminal) {
         return "a tab stays on its computer".to_string();
     }
+    if handle && let Some(swap) = drop.as_ref().and_then(|d| state.board_carry(terminal, d)) {
+        return if swap {
+            "swap qass and the board".to_string()
+        } else {
+            "qass and the board stay together: drop on the outer edge to swap them".to_string()
+        };
+    }
     match drop {
         Some(RowDrop::Here) => "already here".to_string(),
         Some(RowDrop::SpaceSlot { .. }) => ANYWHERE.to_string(),
@@ -12282,6 +13847,20 @@ fn drop_row(
         state.message = Some("a sleeping tab stays in its space, wake it first".to_string());
         return None;
     };
+    // A pane of qass's tab carried by its title only swaps the board and qass, or stays.
+    if handle && let Some(swap) = state.board_carry(terminal, &drop) {
+        match (swap, state.space) {
+            (true, Some(space)) => {
+                state.swap_sides(space);
+            }
+            _ => {
+                state.message = Some(
+                    "qass and the board stay together: drop on the outer edge to swap them".into(),
+                );
+            }
+        }
+        return None;
+    }
     let (space, beside, at) = match drop {
         RowDrop::Here | RowDrop::SpaceSlot { .. } => return None,
         RowDrop::Space(space) if space == from => return None,
@@ -12294,7 +13873,7 @@ fn drop_row(
     };
     if let Some((pane, side)) = beside {
         // Tried on a copy: a drop with no room for the pane changes nothing.
-        let mut tree = state.layouts.get(&space)?.clone();
+        let mut tree = state.committed(state.layouts.get(&space)?);
         tree.remove(terminal);
         if tree.zoomed.is_some() || tree.has_pending() {
             state.message = Some("unzoom, or let the split on its way land, first".to_string());
@@ -12650,6 +14229,27 @@ fn visible_set(state: &State) -> Vec<u32> {
     }
 }
 
+/// Apply a deferred focus through the subscribing path: subscribe, move the
+/// keyboard, resize, all in one write. Both wake arms share it, so a focus
+/// deferred on an idle daemon applies on the next keystroke as well as on the
+/// next daemon message: until then the keyboard sits in the wrong terminal
+/// while the screen already shows the new one.
+/// Tell a board page its held card was let go, when that is owed.
+async fn drain_board_owed(
+    state: &mut State,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+) -> std::io::Result<()> {
+    if let Some(board) = state
+        .board_owed
+        .take()
+        .filter(|board| state.rows.iter().any(|r| r.terminal == *board))
+    {
+        send_to_terminal(board, seqs, wr, board_drop(false)).await?;
+    }
+    Ok(())
+}
+
 async fn drain_pending_focus(
     state: &mut State,
     control_seq: &mut u32,
@@ -12657,6 +14257,7 @@ async fn drain_pending_focus(
     wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
     dirty: &mut bool,
 ) -> std::io::Result<()> {
+    drain_board_owed(state, seqs, wr).await?;
     if let Some(next) = state.pending_focus.take()
         && let Some(bytes) = move_focus(state, next, control_seq, seqs)?
     {
@@ -12711,10 +14312,16 @@ fn zoom_flip(
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<(bool, Option<BytesMut>)> {
     let space = state.space;
-    let changed = match space.and_then(|s| state.layouts.get_mut(&s)) {
+    let mut changed = match space.and_then(|s| state.layouts.get_mut(&s)) {
         Some(layout) => layout.toggle_zoom(),
         None => false,
     };
+    // One tab has nothing to zoom, except qass's screen: its header goes and the terminal
+    // box takes the whole pane.
+    if !changed && state.on_qass_screen() && state.qass_rect().is_some() {
+        state.qass_ui.zoomed = !state.qass_ui.zoomed;
+        changed = true;
+    }
     if !changed {
         return Ok((false, None));
     }
@@ -12867,7 +14474,9 @@ fn size_terminals(
     state: &mut State,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
-    // The whole pane (less its line), for a tab outside any tree; a tree's panes by its own area.
+    // A pane unfolded for an agent that left its tab folds first, so it is sized as it is drawn.
+    state.tabq_home_lost();
+    // The whole pane (less its rail), for a tab outside any tree; a tree's panes by its own area.
     let size = |r: layout::Rect| (r.cols as u16, r.rows as u16);
     let asleep: std::collections::BTreeSet<u32> = state
         .rows
@@ -12890,15 +14499,22 @@ fn size_terminals(
         .flatten()
         .chain(state.layouts.values())
     {
-        let tiles = state.term_rects(tree);
-        // A pane the zoom hides keeps its size.
+        let drawn = state.drawn(tree);
+        let tiles = state.term_rects(&drawn);
+        // A pane folded to its strip keeps its size, as a zoom's hidden panes do.
         for leaf in tree.leaves() {
-            if !tiles.iter().any(|(t, _)| *t == leaf) {
+            if drawn.fold == Some(leaf) || drawn.fold_all || !tiles.iter().any(|(t, _)| *t == leaf)
+            {
                 want.remove(&leaf);
                 zoomed_away.insert(leaf);
             }
         }
-        want.extend(tiles.into_iter().map(|(t, r)| (t, size(r))));
+        want.extend(
+            tiles
+                .into_iter()
+                .filter(|(t, _)| drawn.fold != Some(*t) && !drawn.fold_all)
+                .map(|(t, r)| (t, size(r))),
+        );
     }
     want.retain(|t, _| !asleep.contains(t));
     // Off screen and left for later: everything while a divider or the panel is being
@@ -12916,6 +14532,20 @@ fn size_terminals(
         .filter(|t| !visible.contains(t) && (dragging || crate::mux::is_remote_terminal(*t)))
         .collect();
     want.retain(|t, _| !later.contains(t));
+    // qass's agent is the size of its box's inside wherever the keyboard is, so looking at
+    // it does not reflow it; the owner's agents keep the whole pane.
+    if let Some(inner) = state.qass_rect().filter(|_| state.qass_single()) {
+        let qass = sidebar::qass_space(&state.spaces);
+        for row in state
+            .rows
+            .iter()
+            .filter(|r| Some(r.workspace) == qass && r.agent)
+        {
+            if let Some(wanted) = want.get_mut(&row.terminal) {
+                *wanted = size(inner);
+            }
+        }
+    }
     if state.focused != 0 {
         want.insert(state.focused, size(focused_rect(state)));
     }
@@ -12937,22 +14567,43 @@ fn size_terminals(
     Ok((!out.is_empty()).then_some(out))
 }
 
+/// Whether pane cell (`x`, `y`) is inside `r`; `None` (off the pane) is not.
+fn inside_rect(r: layout::Rect, x: Option<usize>, y: Option<usize>) -> bool {
+    x.zip(y)
+        .is_some_and(|(x, y)| x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows)
+}
+
+/// A press on a questions rail or the open pane ([`State::tabq_click`]), the keyboard moved
+/// first to the agent it belongs to, so the lit frame, the keys and `g` all speak for the pane
+/// that unfolds: its answer, and what moving the focus writes. `None` for a press elsewhere.
+fn tabq_press(
+    state: &mut State,
+    row: u16,
+    col: u16,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<Option<(bool, Option<BytesMut>)>> {
+    // The open pane's left edge is held to drag its width ([`State::split_press`]).
+    if let (Some(x), Some(y)) = state.pane_xy(row, col)
+        && state.on_tabq_edge(x, y)
+    {
+        return Ok(None);
+    }
+    let moved = match state.tabq_at(row, col) {
+        Some(agent) if agent != state.focused => focus(state, agent, control_seq, seqs)?,
+        _ => None,
+    };
+    Ok(state.tabq_click(row, col).map(|resize| (resize, moved)))
+}
+
 fn focus(
     state: &mut State,
     to: u32,
     control_seq: &mut u32,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
-    // Going to an agent puts the Inbox away, and unfolds the column it folded.
-    let unfolded = close_inbox(state);
     forget_return(state);
-    let moved = move_focus(state, to, control_seq, seqs)?;
-    if unfolded && let Some(resize) = size_terminals(state, seqs)? {
-        let mut all = moved.unwrap_or_default();
-        all.extend_from_slice(&resize);
-        return Ok(Some(all));
-    }
-    Ok(moved)
+    move_focus(state, to, control_seq, seqs)
 }
 
 /// The person put the keyboard somewhere themselves: a focused tab that went away is no
@@ -12974,9 +14625,24 @@ fn move_focus(
     if to == 0 || to == state.focused {
         return Ok(None);
     }
-    // A new place for the keyboard puts the Inbox away (the column it folded is unfolded
-    // before the terminals are sized, at the end).
-    close_inbox(state);
+    // The keyboard going into a pane folded to its strip opens it (sized at the end).
+    let folded = state
+        .space
+        .and_then(|space| state.layouts.get(&space))
+        .and_then(|tree| state.fold_leaf(tree));
+    if folded.is_some_and(|(leaf, _)| leaf == to) {
+        state.qass_ui.fold = None;
+    } else if state.open_from_both(to) {
+        state.asks.release();
+    }
+    // A card held on the board is let go once the keyboard leaves the board: the press it
+    // came from belongs to a pane that is no longer in front, and the page is told so.
+    let let_go = state.board_drag.filter(|board| *board != to);
+    if let_go.is_some() {
+        state.board_drag = None;
+        state.drop_hover = None;
+        state.forwarded_press = false;
+    }
     // The keyboard is in a live tab now, not resting on a sleeping one.
     state.dim = 0;
     let from = state.focused;
@@ -12998,9 +14664,12 @@ fn move_focus(
         .find(|r| r.terminal == to)
         .map(|r| r.workspace)
         .or(state.space);
-    // Into qass: the start asked for has arrived.
+    // Into qass from the owner's own work: remembered for `ctrl-a Q` to go back to.
     if state.in_qass() && was_space != state.space {
+        state.qass_back = Some(from).filter(|t| *t != 0);
+        // A start asked for has arrived.
         state.qass_asked = None;
+        state.qass_ui.refresh(sidebar::now_unix());
     }
     // A tab outside the tree on screen brings its own tree, and the one it
     // replaces is parked for the way back.
@@ -13060,6 +14729,17 @@ fn move_focus(
     if let Some(sync) = sync_subs(state, control_seq)? {
         out.extend_from_slice(&sync);
     }
+    if let Some(board) = let_go.filter(|board| state.rows.iter().any(|r| r.terminal == *board)) {
+        out.extend_from_slice(&client::encode_command_to(
+            board,
+            &ClientWire::Input {
+                bytes: board_drop(false),
+                from_terminal: None,
+                from_token: None,
+            },
+            seqs.entry(board).or_default(),
+        )?);
+    }
     // The keyboard moved: the pane it left hears it lost the focus and the one it came to
     // hears it gained it, each only if its program asked, the way tmux tells its panes.
     // A pane whose screen this client has not seen yet cannot be asked, and is not told.
@@ -13113,8 +14793,8 @@ fn wants_focus_events(snapshot: Option<&SnapshotWire>) -> bool {
     snapshot.is_some_and(|s| s.modes.focus_events)
 }
 
-/// Where the keyboard goes when qass's space, on screen, has nothing left in it: the owner's
-/// first tab. Never left in a space no list shows.
+/// Where the keyboard goes when qass's space, on screen, has nothing left in it: back where
+/// it was before qass, else the owner's first tab. Never left in a space no list shows.
 fn out_of_qass(state: &State, rows: &[AgentRow]) -> Option<u32> {
     let qass = sidebar::qass_space(&state.spaces);
     // On its way there counts: a focus picked before the space list said which is qass's.
@@ -13126,603 +14806,635 @@ fn out_of_qass(state: &State, rows: &[AgentRow]) -> Option<u32> {
     {
         return None;
     }
-    rows.iter()
-        .find(|r| Some(r.workspace) != qass && r.state != "sleeping" && !state.is_pane(r.terminal))
-        .map(|r| r.terminal)
+    state
+        .qass_back
+        .filter(|t| rows.iter().any(|r| r.terminal == *t))
+        .or_else(|| {
+            rows.iter()
+                .find(|r| {
+                    Some(r.workspace) != qass && r.state != "sleeping" && !state.is_pane(r.terminal)
+                })
+                .map(|r| r.terminal)
+        })
 }
 
-/// `ctrl-a i`: open the Inbox over the pane from any tab and give it the keyboard, or put it
-/// away when its list is showing. A place over it (qass's ledger) goes back to the list: the key
-/// means "show me the Inbox", never "close whatever is up". True when the agents column was
-/// unfolded again, so the terminals must be sized.
-fn inbox_toggle(state: &mut State) -> bool {
-    if state.ibx.open && state.ibx.place.is_none() {
-        return close_inbox(state);
-    }
-    open_inbox(state);
-    false
+/// What `ctrl-a Q` did: moved the keyboard (with the bytes that move sends), found no qass to
+/// show and wants `qoop qass` run, or moved to a qass without the board above it and wants
+/// `qoop qass` run to put the board back.
+enum QassStep {
+    Moved(Option<BytesMut>),
+    Start,
+    Board(Option<BytesMut>),
 }
 
-/// Open the Inbox. Below [`crate::inbox_pane::INBOX_FOLDS_BELOW`] columns the agents column folds to its strip
-/// while it is open: the cards take the room, and what they say is never cut. The terminals
-/// are not sized for it (the Inbox covers them), so opening and closing reflows nothing.
-fn open_inbox(state: &mut State) {
-    // One thing has the keyboard at a time.
-    state.answer = None;
-    if state.focus {
-        close_focus(state);
+/// `ctrl-a Q` and a click on the pet: [`qass_toggle`], and `qoop qass` run in the background
+/// when it found no qass to show. Answers the bytes to send to the daemon, if the keyboard moved.
+fn qass_press(
+    state: &mut State,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    blocking_tx: &tokio::sync::mpsc::UnboundedSender<Blocked>,
+) -> io::Result<Option<BytesMut>> {
+    let (moved, ask) = match qass_toggle(state, control_seq, seqs)? {
+        QassStep::Moved(moved) => (moved, false),
+        QassStep::Start => (None, true),
+        QassStep::Board(moved) => (moved, true),
+    };
+    if ask {
+        let tx = blocking_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(Blocked::Qass(start_qass()));
+        });
     }
-    state.refresh_ibx();
-    state.ibx.open();
-    if state.cols < crate::inbox_pane::INBOX_FOLDS_BELOW
-        && !state.collapsed
-        && screen::left_for(state.cols, true, state.sidebar_width) > 0
-    {
-        state.collapsed = true;
-        state.ibx.folded = true;
-    }
+    Ok(moved)
 }
 
-/// Put the Inbox away, and unfold the column it folded. True when it did, so the terminals
-/// must be sized again (a size is sent only to a terminal whose size changed).
-fn close_inbox(state: &mut State) -> bool {
-    if !state.ibx.open {
-        return false;
-    }
-    state.ibx.close();
-    std::mem::take(&mut state.ibx.folded) && std::mem::replace(&mut state.collapsed, false)
-}
-
-/// What the Inbox did with some keys or a click, for the loop that owns the keyboard.
+/// What the question inbox did with some keys, for the loop that owns the keyboard.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct InboxKeys {
-    /// What is not the Inbox's, for the ordinary path.
+struct AskKeys {
+    /// What is not the inbox's, for the ordinary path.
     feed: Option<Vec<u8>>,
-    /// Go to this terminal's tab.
-    jump: Option<u32>,
-    /// The agents column came back: the terminals must be sized again.
+    /// The layout changed: qass's terminal must be sized again.
     resize: bool,
-    /// A line to talk a card through, pasted into qass's input once its tab is shown.
+    /// Go to this agent's tab.
+    jump: Option<u32>,
+    /// Paste this line, unsent, into this terminal (qass's).
     paste: Option<(u32, String)>,
-    /// The paste is a line to qass that is sent, not a draft left for the person to read.
-    send_line: bool,
-    /// Requests a place made for the daemon.
-    requests: Vec<ControlRequest>,
 }
 
-impl InboxKeys {
-    /// Take in what a later part of the same read asked as well.
-    fn absorb(&mut self, more: InboxKeys) {
-        self.resize |= more.resize;
-        self.jump = self.jump.or(more.jump);
-        self.paste = self.paste.take().or(more.paste);
-        self.send_line |= more.send_line;
-        self.requests.extend(more.requests);
-        if let Some(feed) = more.feed {
-            self.feed.get_or_insert_with(Vec::new).extend(feed);
+/// Keys typed while an agent pane's open pane has the keyboard: the inbox's own (1-9, enter,
+/// j k, r, m, x), `s` folds or opens the task part, `esc` folds the pane and gives the keyboard
+/// back to the agent, `g` gives it back with the pane left open beside it (folded when it is
+/// over the agent's tile), `q` hands the open card to qass to decide, `<` `>` narrow and widen the
+/// pane. Tab and `o` (qass's chat) are not the tab's.
+fn tabq_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
+    use crate::asks::Out;
+    let mut taken = AskKeys::default();
+    let agent = state.tab_rail_paint().map(|rail| rail.terminal);
+    if !state.asks.typing() {
+        match bytes {
+            b"s" => {
+                state.tabq_task = Some(!state.tabq_task_shown());
+                return taken;
+            }
+            b"q" => {
+                state.asks.hand_to_qass();
+                return taken;
+            }
+            // A step narrower or wider, the agent beside it sized again.
+            b"<" | b">" => {
+                taken.resize = state.tabq_step(bytes == b">");
+                return taken;
+            }
+            b"o" | b"\t" => return taken,
+            b"g" => {
+                // Over the agent's tile the pane folds, or the keys would go to a hidden agent.
+                if state.tabq_open().is_some_and(|open| open.over) {
+                    state.tabq_fold();
+                } else {
+                    state.tabq_focus = None;
+                }
+                taken.jump = agent;
+                return taken;
+            }
+            _ => {}
         }
     }
-}
-
-/// Show a place beside the Inbox over the pane and give it the keyboard, as the Inbox is
-/// opened: one thing has the keyboard at a time, and below 100 columns the agents column folds.
-/// `from_inbox`: putting the place away goes back to the Inbox.
-fn open_place(state: &mut State, place: crate::places::Place, from_inbox: bool) {
-    if !state.ibx.open {
-        state.answer = None;
-        if state.focus {
-            close_focus(state);
+    match state.asks.key(bytes, prefix) {
+        Out::Closed => {
+            state.tabq_fold();
+            taken.resize = true;
+            taken.jump = agent;
         }
-        state.refresh_ibx();
-        state.ibx.open();
-        if state.cols < crate::inbox_pane::INBOX_FOLDS_BELOW
-            && !state.collapsed
-            && screen::left_for(state.cols, true, state.sidebar_width) > 0
-        {
-            state.collapsed = true;
-            state.ibx.folded = true;
+        Out::Jump(_) => {
+            state.tabq_focus = None;
+            taken.jump = agent;
         }
+        Out::Pass(bytes) => taken.feed = Some(bytes),
+        Out::Stay | Out::ToChat | Out::ToQass(_) | Out::Talk(_) => {}
     }
-    state.ibx.open_place(place, from_inbox);
+    taken
 }
 
-/// `ctrl-a Q` and a click on the pet: qass's ledger over the pane, or put away when it is up.
-/// True when the agents column was unfolded again, so the terminals must be sized.
-fn ledger_toggle(state: &mut State) -> bool {
-    if state.ibx.open && matches!(state.ibx.place, Some(crate::places::Place::Ledger(_))) {
-        return close_inbox(state);
-    }
-    open_ledger(state);
-    false
-}
-
-/// The ledger, with what it shows read again: the schedules, what qass did today, the board
-/// (for what is doing), and the rules file.
-fn open_ledger(state: &mut State) {
-    state.clock.stale = true;
-    state.beside.acts_stale = true;
-    state.beside.board.stale = true;
-    state.beside.rules = crate::places::rules_read();
-    let from_inbox = state.ibx.open && state.ibx.place.is_none();
-    let draft = std::mem::take(&mut state.ibx.ask_draft);
-    open_place(
-        state,
-        crate::places::Place::Ledger(crate::ledger::Ledger::with_draft(draft)),
-        from_inbox,
-    );
-}
-
-/// A computer's own screen.
-fn open_computer(state: &mut State, machine: usize) {
-    let from_inbox = state.ibx.open && state.ibx.place.is_none();
-    open_place(
-        state,
-        crate::places::Place::Computer(crate::places::Computer::new(machine)),
-        from_inbox,
-    );
-}
-
-/// The box that starts a new agent, in `default` (the space on screen) when it is one it offers.
-fn open_new_agent(state: &mut State, default: Option<i64>) {
-    let from_inbox = state.ibx.open && state.ibx.place.is_none();
-    state.beside.offers = crate::answers::worktree_agents(
-        &installed_agents()
-            .into_iter()
-            .map(|l| (l.name, l.command))
-            .collect::<Vec<_>>(),
-    );
-    let env = ibx_env!(state);
-    let new = crate::places::NewWork::open(&env, default);
-    open_place(state, crate::places::Place::New(new), from_inbox);
-}
-
-/// What a place beside the Inbox asked of the client.
-fn place_out(state: &mut State, out: crate::places::PlaceOut, taken: &mut InboxKeys) {
-    use crate::places::PlaceOut;
-    match out {
-        PlaceOut::Stay | PlaceOut::Closed | PlaceOut::Jump(_) => {}
-        PlaceOut::Watch => {
-            if let Some(on) = sidebar::flip_watching() {
-                state.beside.asked += 1;
-                taken.requests.push(ControlRequest::QassWatch {
-                    id: format!("qass-watch-p{}", state.beside.asked),
-                    on: Some(on),
-                });
-            }
-        }
-        PlaceOut::StartQass => {
-            let asked = state
-                .qass_asked
-                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(15));
-            if asked {
-                state.message = Some(QASS_ON_ITS_WAY.to_string());
-            } else {
-                state.qass_asked = Some(std::time::Instant::now());
-                state.message = Some(QASS_OPENING.to_string());
-                state.beside.start_qass = true;
-            }
-        }
-        PlaceOut::Questions => {
-            state.ibx.open();
-            state.ibx.filter = true;
-        }
-        PlaceOut::Retry(machine) => {
-            // Any ask of a machine rings its link, and a link that is not up tries at once: a
-            // read of its schedules carried to it is the cheapest one there is.
-            let Some(space) = state
-                .spaces
-                .iter()
-                .find(|w| crate::mux::machine_of(w.id) == machine)
-                .map(|w| w.id)
-            else {
-                return;
-            };
-            state.beside.asked += 1;
-            taken
-                .requests
-                .push(retry_request(space, machine, state.beside.asked));
-            let name = crate::places::machine_name(&state.spaces, machine);
-            say(state, format!("trying {name} again"));
-        }
-        PlaceOut::Ask(text) => match state.hand.qass {
-            Some((qass, _)) if state.qass_at_rest(qass) => {
-                taken.paste = Some((qass, text));
-                taken.send_line = true;
-                say(state, "sent to qass".to_string());
-            }
-            Some(_) => {
-                state.ibx.keep_ask(text);
-                say(
-                    state,
-                    "qass is busy or waits on you: your line is kept, send it when it is free"
-                        .to_string(),
-                );
-            }
-            None => say(state, "qass is not running: s starts it".to_string()),
+/// Keys typed while the inbox has the keyboard.
+fn asks_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
+    use crate::asks::Out;
+    let mut taken = AskKeys::default();
+    let out = match state.asks.key(bytes, prefix) {
+        Out::Talk(card) => match crate::asks::talk_target(&card, &state.rows, &state.spaces) {
+            Some(tab) => Out::Jump(tab),
+            None => Out::ToQass(crate::asks::talk_line(&card)),
         },
-        PlaceOut::Start { line, space, name } => {
-            state.beside.asked += 1;
-            let id = 1_000_000_000 + state.beside.asked;
-            let mut ask = start_agent_terminal(state, id, &line, space, None);
-            if let ControlRequest::CreateTerminal { name: tab, .. } = &mut ask {
-                *tab = Some(name.clone());
-            }
-            let ask = match space {
-                Some(space) => follow_elsewhere(state, space, ask),
-                None => ask,
-            };
-            taken.requests.push(ask);
-            say(state, format!("starting {name}"));
-            taken.resize = close_inbox(state);
-        }
-    }
-}
-
-/// The ask a retry of `machine` sends: a read of the schedules, carried to that machine through
-/// one of its spaces. The machine's number is in the id; the answer to it is taken in silence.
-fn retry_request(space: i64, machine: usize, n: u64) -> ControlRequest {
-    ControlRequest::Via {
-        id: format!("{RETRY_ID}{machine}-{n}"),
-        workspace: space,
-        request: Box::new(ControlRequest::ScheduleRead {
-            id: format!("{RETRY_ID}read-{machine}-{n}"),
-        }),
-    }
-}
-
-/// The prefix of the id of a retry of a computer.
-const RETRY_ID: &str = "retry-";
-
-/// What an [`crate::inbox_pane::Out`] asks of the client.
-fn inbox_out(state: &mut State, out: crate::inbox_pane::Out) -> InboxKeys {
-    use crate::inbox_pane::Out;
-    let mut taken = InboxKeys::default();
+        out => out,
+    };
     match out {
         Out::Stay => {}
-        Out::NewAgent => open_new_agent(state, state.space),
-        Out::Place(out) => place_out(state, out, &mut taken),
-        Out::Closed => taken.resize = close_inbox(state),
-        Out::Jump(terminal) => taken.jump = Some(terminal),
-        Out::Talk(card) => match crate::asks::talk_target(&card, &state.rows, &state.spaces) {
-            Some(tab) => taken.jump = Some(tab),
-            None => match state.qass_chat() {
-                Some(qass) if state.qass_at_rest(qass) => {
-                    taken.jump = Some(qass);
-                    taken.paste = Some((qass, crate::asks::talk_line(&card)));
+        Out::ToQass(_) if state.qass_chat().is_none() => state.asks.say("qass is not running"),
+        out @ (Out::ToChat | Out::ToQass(_)) => {
+            state.asks.release();
+            if state.qass_split() {
+                state.qass_next();
+            }
+            // Where the inbox stands in the chat's place there is no chat to go back to.
+            if state
+                .qass_plan()
+                .and_then(|p| p.side)
+                .is_some_and(|side| side.replaces)
+            {
+                state.qass_ui.inbox = false;
+                state.asks.raised = false;
+            }
+            // The talk line waits on qass's input for his words, or, while qass is busy or he
+            // types there, stands on the notice row for him to read.
+            if let Out::ToQass(line) = out
+                && let Some(qass) = state.qass_chat()
+            {
+                if state.qass_at_rest(qass) {
+                    taken.paste = Some((qass, line));
+                } else {
+                    say(state, line);
                 }
-                Some(_) => say(state, crate::asks::talk_line(&card)),
-                None => say(state, "qass is not running".to_string()),
-            },
-        },
+            }
+        }
+        Out::Closed => {
+            state.qass_ui.inbox = false;
+            state.asks.raised = false;
+            if state.qass_split() {
+                state.qass_next();
+            }
+            state.asks.release();
+            taken.resize = true;
+        }
+        Out::Jump(terminal) => {
+            state.asks.release();
+            taken.jump = Some(terminal);
+        }
+        Out::Talk(_) => {}
         Out::Pass(rest) => taken.feed = Some(rest),
     }
     taken
 }
 
-/// Keys typed while the Inbox has the keyboard.
-fn inbox_keys(state: &mut State, bytes: &[u8], prefix: u8) -> InboxKeys {
-    let env = ibx_env!(state);
-    let out = state.ibx.key(bytes, prefix, &env);
-    let mut taken = inbox_out(state, out);
-    // What follows a command in the same read is not lost: the Inbox takes it up again while it
-    // still has the keyboard (a box that just opened reads the paste after the key that opened
-    // it), and what is left goes to the ordinary path once it does not (after a jump, the
-    // prefix or a detach), the brackets of a paste put back.
-    while state.ibx.has_rest() {
-        if !state.ibx.open || taken.jump.is_some() || taken.feed.is_some() {
-            let rest = state.ibx.take_rest();
-            taken.feed.get_or_insert_with(Vec::new).extend(rest);
-            break;
+/// What a click in the pane means for the question inbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AskClick {
+    /// The `[ N questions ]` chip on qass's header.
+    Toggle,
+    /// Something the inbox drew.
+    Inbox(crate::asks::Hit),
+    /// The inbox, where it drew nothing to press.
+    InboxBlank,
+    /// qass's own terminal: the keyboard goes back to the chat, and the click goes on.
+    Chat,
+    /// The open questions' title on qass's split tab: fold them back to their strip.
+    Fold,
+}
+
+/// What letting go of a pane's title does ([`State::title_release`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TitleAct {
+    /// Fold that pane to its strip: a click on the title of the board or qass on their tab.
+    Fold,
+    /// Carry the pane where it was let go (today's title drag).
+    Carry,
+    /// Put the keyboard in that pane (today's click on a title).
+    Focus,
+    /// Nothing: a drag on a title while a pane is folded, which has no divider to swap by.
+    Nothing,
+}
+
+impl State {
+    /// Where a one based screen position is among qass's screen and its inbox, when it is
+    /// on either. Asked of the same painter that drew them, so a click lands on what was shown.
+    fn ask_click(&self, row: u16, col: u16) -> Option<AskClick> {
+        if !self.qass_header() {
+            return None;
         }
-        let env = ibx_env!(state);
-        let out = state.ibx.resume(prefix, &env);
-        let more = inbox_out(state, out);
-        taken.absorb(more);
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        let pane_col = (col as usize).checked_sub(left + 1)?;
+        let frame = self.frame();
+        let (plan, screen) =
+            screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false)?;
+        // The full header's rows count from the screen's first row (its first ones stand in the
+        // tab bar's); the one line header's are pane rows.
+        let header_row = match plan.header {
+            crate::qass_screen::Header::Box => (row as usize).checked_sub(1),
+            _ => (row as usize).checked_sub(screen::TABS + 1),
+        };
+        if let Some(chip) = screen.chip()
+            && header_row == Some(chip.row)
+            && (chip.x0..chip.x1).contains(&pane_col)
+        {
+            return Some(AskClick::Toggle);
+        }
+        let pane_row = (row as usize).checked_sub(screen::TABS + 1)?;
+        // The questions' tab on the rail: a click opens them, as the chip does.
+        if self.rail_tab_at(row, col) == Some(crate::rail::Pane::Questions) {
+            return Some(AskClick::Toggle);
+        }
+        let side = plan.side?;
+        let inside = |r: layout::Rect| {
+            pane_row >= r.y && pane_row < r.y + r.rows && pane_col >= r.x && pane_col < r.x + r.cols
+        };
+        if inside(side.rect) {
+            let ctx = crate::asks::Ctx {
+                rows: &self.rows,
+                spaces: &self.spaces,
+                now_unix: frame.now_unix,
+                fade: false,
+                board_above: frame.tiles.len() >= 2,
+                tab: None,
+            };
+            let view = crate::asks::view(&self.asks, &ctx, side.rect.cols, side.rect.rows);
+            return Some(
+                match crate::asks::hit_at(&view, side.rect, pane_row, pane_col) {
+                    Some(crate::asks::Hit::Fold) => AskClick::Fold,
+                    Some(hit) => AskClick::Inbox(hit),
+                    None => AskClick::InboxBlank,
+                },
+            );
+        }
+        (!side.replaces && inside(plan.frame)).then_some(AskClick::Chat)
     }
+
+    /// What a one based screen position is in the schedules panel, when it is in it: the
+    /// thing it drew there, else (`Some(None)`) a blank cell of it. Asked of the same painter
+    /// that drew them, so a click lands on what was shown.
+    fn clock_click(&self, row: u16, col: u16) -> Option<Option<crate::schedules::Hit>> {
+        if !self.qass_header() || !self.clock.shown() {
+            return None;
+        }
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        let pane_col = (col as usize).checked_sub(left + 1)?;
+        let pane_row = (row as usize).checked_sub(screen::TABS + 1)?;
+        let frame = self.frame();
+        let (plan, _) = screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false)?;
+        let rect = plan.clock?.rect;
+        let inside = pane_row >= rect.y
+            && pane_row < rect.y + rect.rows
+            && pane_col >= rect.x
+            && pane_col < rect.x + rect.cols;
+        inside.then(|| {
+            let ctx = screen::clock_ctx(&frame, false);
+            let view = crate::schedules::view(&self.clock, &ctx, rect.cols, rect.rows);
+            crate::schedules::hit_at(&view, rect, pane_row, pane_col)
+        })
+    }
+}
+
+/// What the schedules panel did with some keys, for the loop that owns the keyboard.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClockKeys {
+    /// What is not the panel's, for the ordinary path.
+    feed: Option<Vec<u8>>,
+    /// The layout changed: qass's terminal must be sized again.
+    resize: bool,
+    /// Go to this terminal's tab.
+    jump: Option<u32>,
+}
+
+/// Keys typed while the schedules have the keyboard.
+fn clock_keys(state: &mut State, bytes: &[u8], prefix: u8) -> ClockKeys {
+    let before = state.clock_rows();
+    let out = state.clock.key(bytes, prefix);
+    clock_out(state, out, before)
+}
+
+/// What a key or a click on the schedules asks of the client. `before` is the rows the panel
+/// wanted before it, so a form opening or the list changing sizes the terminals again.
+fn clock_out(state: &mut State, out: crate::schedules::Out, before: usize) -> ClockKeys {
+    use crate::schedules::Out;
+    let mut taken = ClockKeys::default();
+    match out {
+        Out::Stay => {}
+        Out::Back => {
+            state.clock.release();
+            if state.qass_split() {
+                state.qass_next();
+            }
+        }
+        Out::Jump(terminal) if state.rows.iter().any(|r| r.terminal == terminal) => {
+            state.clock.release();
+            taken.jump = Some(terminal);
+        }
+        Out::Jump(terminal) => state.clock.say(format!("tab {terminal} is closed")),
+        Out::Add => {
+            let folder = state.clock_folder();
+            state.clock.open_form(folder);
+            let holds = |s: &State| {
+                s.qass_plan()
+                    .is_some_and(|p| p.clock.is_some_and(|c| c.rect.rows >= s.clock_rows()))
+            };
+            if !holds(state) {
+                state.clock.form = None;
+                state.message = Some(no_room(state, "the schedule form", holds));
+            }
+        }
+        Out::Pass(rest) => taken.feed = Some(rest),
+    }
+    taken.resize = state.clock_rows() != before;
     taken
 }
 
-/// A press, a drag, a release or the wheel over the Inbox: its own, never the terminal's
-/// under it. `None` for a place outside it (the agents column, which answers its own).
-fn inbox_mouse(state: &mut State, action: &Action) -> Option<InboxKeys> {
-    let (row, col) = match *action {
-        Action::Click { row, col, .. } | Action::Wheel { row, col, .. } => (row, col),
-        // A drag or a release belongs to a gesture begun elsewhere while one is on (a row
-        // carried, a divider pulled); otherwise it is the Inbox's and goes nowhere.
-        Action::Drag { row, col, .. } | Action::Release { row, col, .. } => {
-            if state.row_press.is_some()
-                || state.sidebar_drag.is_some()
-                || state.modes.split_drag.is_some()
-            {
-                return None;
-            }
-            (row, col)
-        }
-        _ => return None,
-    };
-    // Stepped aside for a box or a question: the clicks are theirs.
-    state.ibx_view()?;
-    let (cols, rows) = state.ibx_size();
-    let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
-    let (r, c) = (
-        (row as usize).checked_sub(1)?,
-        (col as usize).checked_sub(left + 1)?,
-    );
-    if r >= rows || c >= cols {
-        return None;
+/// `ctrl-a C`: open the schedules panel and give it the keyboard; with it shown and the
+/// keyboard in the chat, give it the keyboard; with the keyboard in it, give it back. True
+/// when the layout changed, so qass's terminal must be sized again.
+fn clock_toggle(state: &mut State) -> bool {
+    if !state.qass_header() {
+        state.message = Some(crate::keys::named(
+            "the schedules are on qass's screen: ctrl-a Q",
+        ));
+        return false;
     }
-    let mut taken = InboxKeys::default();
-    match *action {
-        Action::Click { .. } => {
-            let hit = state
-                .ibx_view()
-                .and_then(|view| crate::inbox_pane::hit_at(&view, r, c));
-            if let Some(hit) = hit {
-                let env = ibx_env!(state);
-                let out = state.ibx.click(hit, &env);
-                taken = inbox_out(state, out);
-            }
+    if state.clock_focused() {
+        let shown = state.clock.shown();
+        state.clock.release();
+        if state.qass_split() {
+            state.qass_next();
         }
-        Action::Wheel { up, .. } => state.ibx.scroll(!up),
-        _ => {}
+        return shown != state.clock.shown();
     }
-    Some(taken)
+    let was = state.clock.shown();
+    state.clock.raised = true;
+    state.clock.stale = true;
+    // The panel must have a place in this pane, or there is nothing to give the keyboard to.
+    if state.qass_plan().is_none_or(|p| p.clock.is_none()) {
+        state.clock.raised = false;
+        state.message = Some(no_room(state, "the schedules", |s| {
+            s.qass_plan().is_some_and(|p| p.clock.is_some())
+        }));
+        return false;
+    }
+    state.asks.release();
+    state.clock.focus = true;
+    !was
 }
 
-/// Ask what the places beside the Inbox need: the board while it shows (or the ledger counts
-/// what is doing on it), what qass did today while its ledger shows, and `qoop qass` when Start
-/// qass was pressed.
-async fn drain_beside(
+/// `ctrl-a i`, or a click on the chip: open the inbox and give it the keyboard; with it open
+/// and the keyboard in the chat, give it the keyboard; with the keyboard in it, put it away.
+/// True when the layout changed, so qass's terminal must be sized again.
+fn asks_toggle(state: &mut State) -> bool {
+    if !state.qass_header() {
+        state.message = Some("the questions are on qass's screen: ctrl-a Q".to_string());
+        return false;
+    }
+    // One panel has the keyboard at a time.
+    state.clock.release();
+    if state.qass_split() {
+        return questions_toggle(state);
+    }
+    let holds = |state: &State| {
+        let (cols, rows) = screen::pane_size_for(
+            state.cols,
+            state.lines,
+            state.collapsed,
+            0,
+            state.sidebar_width,
+        );
+        crate::qass_screen::Plan::holds_inbox(cols as usize, rows as usize)
+    };
+    if !holds(state) {
+        state.message = Some(no_room(state, "the questions", holds));
+        return false;
+    }
+    if !state.qass_ui.inbox || state.qass_ui.zoomed {
+        state.qass_ui.zoomed = false;
+        state.qass_ui.inbox = true;
+        state.asks.focus = true;
+        state.asks.stale = true;
+        return true;
+    }
+    if state.asks.focus {
+        state.qass_ui.inbox = false;
+        state.asks.release();
+        return true;
+    }
+    state.asks.focus = true;
+    false
+}
+
+/// Why `what` does not open: the pane too narrow and the key that folds the agents column,
+/// when `holds` says the pane would hold it with the column folded; else too small (its
+/// rows are short, or even the folded column leaves too few columns).
+fn no_room(state: &mut State, what: &str, holds: impl Fn(&State) -> bool) -> String {
+    let folding = !state.collapsed && {
+        state.collapsed = true;
+        let fits = holds(state);
+        state.collapsed = false;
+        fits
+    };
+    crate::keys::named(&if folding {
+        format!("the pane is too narrow for {what}; ctrl-a b folds the column")
+    } else {
+        format!("the pane is too small for {what}")
+    })
+}
+
+/// [`asks_toggle`] on qass's split tab, where a card only lights the rail's tab: shown, the
+/// keyboard goes in; with the keyboard in, they are put away and the keyboard goes to qass's
+/// terminal; not shown, they are brought up: while cards wait until the last is answered,
+/// with nothing waiting the handled ones until put away.
+fn questions_toggle(state: &mut State) -> bool {
+    // The questions take the keyboard and may cover the board: a card held there is let go.
+    state.cancel_board_drag();
+    if state.questions().is_some() {
+        if !state.asks.focus {
+            state.asks.focus = true;
+            return false;
+        }
+        return questions_fold(state);
+    }
+    if state.asks.waiting() > 0 {
+        state.asks.raised = true;
+    } else {
+        state.qass_ui.inbox = true;
+    }
+    if state.questions().is_none() {
+        state.message = Some(no_room(state, "the questions", |s| s.questions().is_some()));
+        state.qass_ui.inbox = false;
+        state.asks.raised = false;
+        return false;
+    }
+    state.asks.focus = true;
+    state.asks.stale = true;
+    true
+}
+
+/// The questions put away to the rail's tab, the keyboard back to qass's terminal: what
+/// `ctrl-a i` does with them open and in hand, and their title's click.
+fn questions_fold(state: &mut State) -> bool {
+    if state.questions().is_none() {
+        return false;
+    }
+    state.asks.release();
+    state.qass_ui.inbox = false;
+    state.asks.raised = false;
+    // The keyboard goes back to the pane it came from (the board or qass), else to qass.
+    if fold_leaves(state).is_none_or(|(board, qass)| ![board, qass].contains(&state.focused)) {
+        state.qass_next();
+    }
+    true
+}
+
+/// The board and qass's leaves of the tab on screen, when it is qass's tab with the board
+/// and not zoomed: where a fold means something.
+fn fold_leaves(state: &State) -> Option<(u32, u32)> {
+    let tree = state
+        .space
+        .and_then(|space| state.layouts.get(&space))
+        .filter(|tree| tree.zoomed.is_none())?;
+    state.board_leaves(tree)
+}
+
+/// `ctrl-a T` on qass's split tab: a pane folded is opened, the keyboard staying where it
+/// is; else the pane with the keyboard folds (the questions as `ctrl-a i` puts them away).
+/// True when the layout changed.
+fn fold_key(state: &mut State) -> bool {
+    // On an agent's tab, its questions rail unfolds and folds.
+    if state.tabq_toggle() {
+        return true;
+    }
+    let Some((board, qass)) = fold_leaves(state) else {
+        state.message = Some(crate::keys::named(
+            "the board is on qass's screen: ctrl-a Q",
+        ));
+        return false;
+    };
+    if let Some(was) = state.qass_ui.fold.take() {
+        // Too small for both, the pane it opens takes the keyboard: the one with it is shown.
+        if state.folded().is_some() {
+            state.pending_focus = Some(match was {
+                crate::qass_screen::Fold::Qass => qass,
+                _ => board,
+            });
+        }
+        return true;
+    }
+    if state.asks_focused() {
+        return questions_fold(state);
+    }
+    match state.focused {
+        f if f == board => fold_pane(state, crate::qass_screen::Fold::Board),
+        f if f == qass => fold_pane(state, crate::qass_screen::Fold::Qass),
+        _ => false,
+    }
+}
+
+/// Fold the board or qass's terminal to its strip (one at a time, so the other opens): a
+/// card held on the board is let go, and the keyboard leaves the pane for the other.
+fn fold_pane(state: &mut State, fold: crate::qass_screen::Fold) -> bool {
+    let Some((board, qass)) = fold_leaves(state) else {
+        return false;
+    };
+    state.cancel_board_drag();
+    // The other pane already folded: both are, and the questions take the tab with the keyboard.
+    let (gone, other) = match fold {
+        crate::qass_screen::Fold::Board => (board, qass),
+        crate::qass_screen::Fold::Qass => (qass, board),
+        crate::qass_screen::Fold::Both => return false,
+    };
+    if matches!(
+        (state.qass_ui.fold, fold),
+        (
+            Some(crate::qass_screen::Fold::Board),
+            crate::qass_screen::Fold::Qass
+        ) | (
+            Some(crate::qass_screen::Fold::Qass),
+            crate::qass_screen::Fold::Board
+        )
+    ) {
+        state.qass_ui.fold = Some(crate::qass_screen::Fold::Both);
+        state.qass_ui.inbox = true;
+        state.asks.focus = true;
+        state.asks.stale = true;
+        return true;
+    }
+    state.qass_ui.fold = Some(fold);
+    if state.focused == gone {
+        state.pending_focus = Some(other);
+    }
+    true
+}
+
+/// A click on the title of the board or qass on their tab: that pane folds.
+fn title_fold(state: &mut State, terminal: u32) -> bool {
+    match fold_leaves(state) {
+        Some((board, _)) if terminal == board => fold_pane(state, crate::qass_screen::Fold::Board),
+        Some((_, qass)) if terminal == qass => fold_pane(state, crate::qass_screen::Fold::Qass),
+        _ => false,
+    }
+}
+
+/// `ctrl-a Q`. In qass's space: back where the keyboard was before it, else the first awake
+/// space. Elsewhere: qass's tab when it is listed, else `qoop qass` (it wakes or starts
+/// qass, and its own `focus` brings it here), asked once until it answers.
+fn qass_toggle(
     state: &mut State,
     control_seq: &mut u32,
-    wr: &mut (impl AsyncWriteExt + Unpin),
-) -> io::Result<()> {
-    use crate::places::Place;
-    let shown = state.ibx.open;
-    let ledger = shown && matches!(state.ibx.place, Some(Place::Ledger(_)));
-    let board = ledger || (shown && state.ibx.board && state.ibx.place.is_none());
-    if board && state.beside.board.read == crate::board::Read::Unread {
-        state.beside.board.stale = true;
-    }
-    if board && let Some(read) = state.beside.board.request() {
-        wr.write_all(&client::encode_control_seq(&read, control_seq)?)
-            .await?;
-    }
-    // The Board turned to another computer: its board is read through `Via`, and again on a
-    // 30 s tick while it shows.
-    let computer = state.ibx.computer;
-    if shown
-        && state.ibx.board
-        && state.ibx.place.is_none()
-        && computer != 0
-        && let Some(via) = crate::places::space_on(&state.spaces, computer)
-    {
-        let due = state
-            .beside
-            .board_asked
-            .is_none_or(|(m, at)| m != computer || at.elapsed() >= ACTS_EVERY);
-        let remote = state.beside.boards.entry(computer).or_default();
-        if due {
-            if remote.read == crate::board::Read::Reading {
-                remote.read = crate::board::Read::Unread;
-            }
-            remote.stale = true;
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<QassStep> {
+    if state.in_qass() {
+        let back = state
+            .qass_back
+            .take()
+            .filter(|t| state.shown().1.iter().any(|r| r.terminal == *t));
+        if let Some(back) = back {
+            return focus(state, back, control_seq, seqs).map(QassStep::Moved);
         }
-        if let Some(read) = remote.request_via(&crate::board::read_id(computer), Some(via)) {
-            state.beside.board_asked = Some((computer, std::time::Instant::now()));
-            wr.write_all(&client::encode_control_seq(&read, control_seq)?)
-                .await?;
-        }
+        let (spaces, _) = state.shown();
+        let Some(space) = spaces
+            .iter()
+            .find(|w| !w.asleep)
+            .or(spaces.first())
+            .map(|w| w.id)
+        else {
+            state.message = Some("qass is the only space open".to_string());
+            return Ok(QassStep::Moved(None));
+        };
+        return enter_space(state, space, control_seq, seqs).map(QassStep::Moved);
     }
-    // Read again on a 30 s tick while the ledger shows, as the board page was.
-    if ledger
-        && state
-            .beside
-            .acts_asked
-            .is_some_and(|at| at.elapsed() >= ACTS_EVERY)
-    {
-        state.beside.acts_stale = true;
-    }
-    if ledger && std::mem::take(&mut state.beside.acts_stale) {
-        state.beside.acts_asked = Some(std::time::Instant::now());
-        let since = crate::inbox_pane::day_start(&mut state.ibx_day, sidebar::now_unix());
-        wr.write_all(&client::encode_control_seq(
-            &ControlRequest::QassActs {
-                id: ACTS_ID.to_string(),
-                since,
-            },
-            control_seq,
-        )?)
-        .await?;
-    }
-    // The board page `qoop qass` used to open above qass: the Inbox shows the board now, so the
-    // split it made is closed, once per terminal this interface has seen. Whenever an interface
-    // finds one, not only on the first start: a sleeping old pane gets its page typed back on
-    // wake and is caught then. Only that exact split: a board page the person opened is theirs.
-    for terminal in old_board_panes(&state.rows, &state.spaces, &state.split_seen) {
-        if state.beside.closed_boards.insert(terminal) {
-            // Unique per attempt: the daemon replays a repeated id without closing anything.
-            state.beside.asked += 1;
-            let close = ControlRequest::CloseTerminal {
-                id: format!("{BOARD_CLOSE_ID}{terminal}-{}", state.beside.asked),
-                terminal,
-            };
-            wr.write_all(&client::encode_control_seq(&close, control_seq)?)
-                .await?;
-        }
-    }
-    if std::mem::take(&mut state.beside.start_qass)
-        && let Some(tx) = state.beside.blocking.clone()
-    {
-        tokio::task::spawn_blocking(move || {
-            let _ = tx.send(Blocked::Qass(start_qass()));
-        });
-    }
-    Ok(())
-}
-
-/// The most the interface waits, on its way out, for the answers it sent last.
-const EXIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// After the answers still on hold were sent on the way out: read until the daemon (or the mux,
-/// for another computer's) has answered each, at most `within`. An answer for a remote machine
-/// has not left this process before that.
-async fn settle_answers(
-    state: &mut State,
-    rd: &mut (impl AsyncReadExt + Unpin),
-    connection: &mut Connection,
-    inbuf: &mut BytesMut,
-    within: std::time::Duration,
-) {
-    let end = std::time::Instant::now() + within;
-    let mut read = vec![0u8; 64 * 1024];
-    while state.ibx.awaiting() {
-        let left = end.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            return;
-        }
-        match tokio::time::timeout(left, rd.read(&mut read)).await {
-            Ok(Ok(n)) if n > 0 => {
-                inbuf.extend_from_slice(&read[..n]);
-                let Ok(messages) = connection.drain(inbuf) else {
-                    return;
-                };
-                for message in messages {
-                    if let Incoming::Control(response) = message {
-                        let env = ibx_env!(state);
-                        state.ibx.answered(&response, &env);
-                    }
-                }
-            }
-            _ => return,
-        }
-    }
-}
-
-/// The prefix of the id an old board pane is closed under.
-const BOARD_CLOSE_ID: &str = "board-close-";
-
-/// The board page `qoop qass` opened above qass before the Board moved into the Inbox: the
-/// exact split it made, qoop's own page (`program` is `qoop`) in a pane named `board`, on the
-/// left of a tab at 700 thousandths with qass's agent in the rest of it, in the real qass space
-/// on this computer (the first so named, as the daemon finds it). A pane the person opened
-/// themselves (`qoop task board --page` in a split or a tab of their own, even one called
-/// `board`), a shell, a space renamed `qass` or another computer's pane is never taken for it.
-fn old_board_panes(
-    rows: &[AgentRow],
-    spaces: &[qoop_runtime::control::WorkspaceRow],
-    splits: &[qoop_runtime::control::Pane],
-) -> Vec<u32> {
-    use qoop_runtime::control::{Pane, SplitDir};
-    let Some(qass) = sidebar::qass_space(spaces).filter(|id| crate::mux::machine_of(*id) == 0)
-    else {
-        return Vec::new();
-    };
-    let row = |t: u32| rows.iter().find(|r| r.terminal == t);
-    splits
+    // Its agent, awake, a pane under the board or a tab of its own. A shell left in its space
+    // is not qass, and a sleeping tab is woken by `qoop qass`, which finds qass by its folder.
+    let qass = sidebar::qass_space(&state.spaces);
+    let tab = state
+        .rows
         .iter()
-        .filter_map(|tree| match tree {
-            Pane::Split {
-                dir: SplitDir::V,
-                permille: 700,
-                first,
-                second,
-                ..
-            } => match **first {
-                Pane::Leaf { terminal } => Some((terminal, second.leaves())),
-                _ => None,
-            },
-            _ => None,
-        })
-        .filter(|(board, rest)| {
-            row(*board).is_some_and(|r| {
-                !r.agent
-                    && r.name.as_deref() == Some(qoop_runtime::idle::BOARD_PANE)
-                    && r.program.as_deref() == Some("qoop")
-                    && r.workspace == qass
-                    && !crate::mux::is_remote_terminal(r.terminal)
-            }) && rest
-                .iter()
-                .any(|t| row(*t).is_some_and(|r| r.agent && r.workspace == qass))
-        })
-        .map(|(board, _)| board)
-        .collect()
-}
-
-/// How often what qass did is read again while its ledger shows.
-const ACTS_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// The id what qass did today is read under.
-const ACTS_ID: &str = "ledger-acts";
-
-/// Send what the Inbox owes: requests for the daemon, a reply or a key typed into an agent.
-async fn drain_inbox(
-    state: &mut State,
-    seqs: &mut std::collections::BTreeMap<u32, u32>,
-    control_seq: &mut u32,
-    wr: &mut (impl AsyncWriteExt + Unpin),
-) -> io::Result<()> {
-    let sends = state.ibx.take();
-    for request in &sends.requests {
-        wr.write_all(&client::encode_control_seq(request, control_seq)?)
-            .await?;
-    }
-    for typed in sends.typed {
-        if typed.paste {
-            let text = String::from_utf8_lossy(&typed.bytes).to_string();
-            paste_into(typed.terminal, &text, seqs, wr, &mut state.typed_at).await?;
-        } else {
-            send_to_terminal(typed.terminal, seqs, wr, typed.bytes).await?;
+        .find(|r| Some(r.workspace) == qass && r.agent && r.state != "sleeping")
+        .map(|r| r.terminal);
+    let asked = state
+        .qass_asked
+        .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(15));
+    if let Some(tab) = tab {
+        // Without the board in its tab, `qoop qass` puts it back.
+        let lacks = !asked && !board_over(state, tab);
+        let moved = focus(state, tab, control_seq, seqs)?;
+        if lacks {
+            state.qass_asked = Some(std::time::Instant::now());
+            return Ok(QassStep::Board(moved));
         }
+        return Ok(QassStep::Moved(moved));
     }
-    Ok(())
+    if asked {
+        state.message = Some(QASS_ON_ITS_WAY.to_string());
+        return Ok(QassStep::Moved(None));
+    }
+    state.qass_asked = Some(std::time::Instant::now());
+    state.message = Some(QASS_OPENING.to_string());
+    Ok(QassStep::Start)
 }
 
-/// Keys for the Inbox, and what they ask: the column sized again, an agent shown, a line pasted,
-/// what is owed sent. What is not the Inbox's is returned for the ordinary path.
-async fn run_inbox_keys(
-    state: &mut State,
-    bytes: &[u8],
-    prefix: u8,
-    control_seq: &mut u32,
-    seqs: &mut std::collections::BTreeMap<u32, u32>,
-    wr: &mut (impl AsyncWriteExt + Unpin),
-) -> io::Result<Option<Vec<u8>>> {
-    let taken = inbox_keys(state, bytes, prefix);
-    finish_inbox(state, taken, control_seq, seqs, wr).await
-}
-
-/// What the Inbox asked of the client, done: see [`run_inbox_keys`].
-async fn finish_inbox(
-    state: &mut State,
-    taken: InboxKeys,
-    control_seq: &mut u32,
-    seqs: &mut std::collections::BTreeMap<u32, u32>,
-    wr: &mut (impl AsyncWriteExt + Unpin),
-) -> io::Result<Option<Vec<u8>>> {
-    if taken.resize
-        && let Some(resize) = size_terminals(state, seqs)?
-    {
-        wr.write_all(&resize).await?;
-    }
-    if let Some(terminal) = taken.jump
-        && let Some(bytes) = focus(state, terminal, control_seq, seqs)?
-    {
-        wr.write_all(&bytes).await?;
-    }
-    if let Some((terminal, line)) = &taken.paste {
-        paste_talk(state, *terminal, line, seqs, wr).await?;
-        if taken.send_line {
-            send_to_terminal(*terminal, seqs, wr, b"\r".to_vec()).await?;
-        }
-    }
-    for request in &taken.requests {
-        wr.write_all(&client::encode_control_seq(request, control_seq)?)
-            .await?;
-    }
-    drain_inbox(state, seqs, control_seq, wr).await?;
-    drain_beside(state, control_seq, wr).await?;
-    Ok(taken.feed)
+/// Whether qass's terminal `qass` has the board in its tab: a pane named so in the tree it
+/// is in ([`qoop_runtime::idle::has_board`]).
+fn board_over(state: &State, qass: u32) -> bool {
+    let panes = state
+        .trees()
+        .find(|tree| tree.leaves().contains(&qass))
+        .map(|tree| tree.leaves())
+        .unwrap_or_default();
+    qoop_runtime::idle::has_board(
+        state.rows.iter().filter(|r| panes.contains(&r.terminal)),
+        qass,
+    )
 }
 
 /// Put a space on screen, and the keyboard in one of its terminals.
@@ -13816,6 +15528,7 @@ fn peek(
 /// output painting under this space's tab bar, and left `ctrl-a x` closing it. Nothing on
 /// screen said any of that was happening.
 fn unfocus(state: &mut State, why: &str, control_seq: &mut u32) -> io::Result<Option<BytesMut>> {
+    state.cancel_board_drag();
     park_all(state);
     state.focused = 0;
     state.forget_screen();
@@ -13889,12 +15602,6 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         state.modes.refetching = false;
     }
     match response {
-        // What qass did today, for its ledger.
-        ControlResponse::QassActs { id, acts } if id == ACTS_ID => {
-            state.beside.acts = Some(acts);
-            state.beside.acts_failed = None;
-            *dirty = true;
-        }
         ControlResponse::AgentSessions {
             id,
             reading,
@@ -14178,17 +15885,17 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             sidebar::qass_last(&mut state.spaces, &mut state.rows);
             // The index came first and the client opened before it knew which space is
             // qass's: an interface never opens inside it on its own.
-            if first_list && let Some(out) = out_of_qass(state, &state.rows) {
+            if first_list
+                && state.qass_back.is_none()
+                && let Some(out) = out_of_qass(state, &state.rows)
+            {
                 state.pending_focus = Some(out);
             }
             // A fold outlives nothing it folded: a space that went away takes its fold
             // with it, so a later space reusing the id does not start folded.
             let live: sidebar::Shut = state.spaces.iter().map(|s| s.id).collect();
             state.shut.retain(|id| live.contains(id));
-            // The priority list's own fold is kept under a key no space has.
-            state
-                .doze_open
-                .retain(|id| *id == sidebar::IDLE_FOLD || live.contains(id));
+            state.doze_open.retain(|id| live.contains(id));
             // The space on screen went to sleep: the screen moves on to the next awake
             // space and the keyboard to its first tab. With none awake anywhere there is
             // nothing to move to, and the interface detaches instead.
@@ -14346,20 +16053,11 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         // A name given at start, put on the conversation unasked: nobody pressed anything,
         // so a refusal (a remote too old to name a session) is not said. The tab keeps it.
         ControlResponse::Failed { id, .. } if id.starts_with("title-") => {}
-        // A question's answer refused: the Inbox says what became of it, where the next answer
-        // replaces it. Not on the status row as well, where an old refusal would outlive the
-        // answer that went.
-        ControlResponse::Failed { id, .. } if id.starts_with(crate::inbox_pane::ID) => {}
-        // An old board pane another interface closed first, and a retry of a computer: the link
-        // state on screen says how each went, not a refusal on the status row.
+        // A question's answer refused, or the pane's task read: the questions pane says what
+        // became of it, where the next answer replaces it. Not on the status row as well, where
+        // an old refusal would outlive the answer that went.
         ControlResponse::Failed { id, .. }
-            if id.starts_with(BOARD_CLOSE_ID) || id.starts_with(RETRY_ID) => {}
-        // What qass did today could not be read: the ledger says so in words.
-        ControlResponse::Failed { id, reason } if id == ACTS_ID => {
-            let old = qoop_runtime::control::too_old_for(&reason, Some("QassActs"));
-            state.beside.acts_failed = Some((reason, old));
-            *dirty = true;
-        }
+            if id.starts_with(crate::asks::WRITE_ID) || id.starts_with(TABQ_READ) => {}
         ControlResponse::Failed { id, reason }
             if id.starts_with("sleep-") || id.starts_with("wake-") =>
         {
@@ -14601,17 +16299,6 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // daemon of somebody else's, and no network.
             // qass finishes a turn on every event it handles: only its asking is news.
             let qass = sidebar::qass_space(&state.spaces);
-            // What the loop below asks of a hand to qass is asked of the list that just came,
-            // not of the one before it.
-            crate::inbox_pane::update_hand(
-                &mut state.hand,
-                &state.spaces,
-                &agents,
-                &state.ibx_cards,
-                &state.ibx.no_hands,
-                sidebar::watching(),
-                sidebar::now_unix(),
-            );
             for row in &agents {
                 let before = state.was.get(&row.terminal).cloned();
                 let is_qass = Some(row.workspace) == qass;
@@ -14630,11 +16317,8 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 let rung_before = row.status.is_some()
                     && row.stop.is_some()
                     && state.rung.get(&row.terminal) == row.stop.as_ref();
-                // A question handed to qass waits on qass, not on the person: the Inbox does
-                // not count it, so nothing is said for it either.
                 let wants_someone = match shown {
-                    "blocked" => !crate::answers::handed(row, &state.hand),
-                    "failed" => true,
+                    "blocked" | "failed" => true,
                     "done" => !is_qass && !(row.status.is_some() && (looking || rung_before)),
                     _ => false,
                 };
@@ -14731,7 +16415,6 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 .collect();
             state.rows = agents;
             sidebar::qass_last(&mut state.spaces, &mut state.rows);
-            state.rows_changed_ibx();
             follow_adopted(state);
             name_sessions(state, request);
             // A space being closed waits for this: the daemon counts store rows and the
@@ -14872,7 +16555,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 .take_if(|(asked, ..)| *asked == id)
                 .filter(|(_, t, ..)| *t == terminal)
                 .and_then(|(_, _, pane, side)| {
-                    let mut tree = state.layouts.get(&workspace)?.clone();
+                    let mut tree = state.committed(state.layouts.get(&workspace)?);
                     tree.insert_beside(pane, terminal, side, pane_area(state))
                         .then_some(tree)
                 });
@@ -15669,17 +17352,6 @@ mod tests {
         assert_eq!(drag.rule, Some((foot2, 1)));
     }
 
-    /// What was copied is said whole while it is short and as a count past 40 columns: the text
-    /// is never cut to an ellipsis.
-    #[test]
-    fn a_long_copy_says_how_many_characters_and_never_cuts_the_text() {
-        assert_eq!(short_copied("hello"), "hello");
-        assert_eq!(short_copied("a\nb\nc"), "3 lines");
-        let long = "word ".repeat(12);
-        assert_eq!(short_copied(&long), "59 characters");
-        assert!(!short_copied(&long).contains('\u{2026}'));
-    }
-
     /// Saying something shows it on the notice row and as the small box, until the
     /// box's clock runs out.
     #[test]
@@ -15921,8 +17593,6 @@ mod tests {
     fn the_priority_list_drops_into_a_space_not_a_place() {
         let mut s = drag_state();
         s.view = sidebar::View::Priority;
-        // The idle ones are folded to one row until it is opened.
-        s.doze_open.insert(sidebar::IDLE_FOLD);
         let rows = s.column_rows_now();
         let at = rows
             .iter()
@@ -15933,159 +17603,6 @@ mod tests {
             s.drop_target(Source::Agent(4), row, 3),
             Some(RowDrop::Space(1))
         );
-    }
-
-    /// The priority list's fold row ("N idle") opens by a click and by enter under the keyboard,
-    /// survives a new list of spaces, and is nobody's space: no key acts on it as on a rule.
-    #[test]
-    fn the_priority_fold_opens_by_a_click_and_by_enter_and_is_nobodys_space() {
-        use sidebar::Hit;
-        let mut s = drag_state();
-        s.view = sidebar::View::Priority;
-        let mut request = 0u64;
-        let shown = |s: &State| {
-            s.column_rows_now()
-                .iter()
-                .any(|(_, h)| *h == Some(Hit::Terminal(4)))
-        };
-        assert!(!shown(&s), "the idle agent is folded away");
-        let fold = row_of(&s, Hit::Doze(sidebar::IDLE_FOLD), false);
-        let row = (fold + screen::SIDEBAR_TOP) as u16;
-        assert!(matches!(
-            s.clicked(row, 3),
-            Some(Clicked::Doze(sidebar::IDLE_FOLD))
-        ));
-        assert_eq!(s.space_of_hit(Hit::Doze(sidebar::IDLE_FOLD)), None);
-        toggle_doze(&mut s, sidebar::IDLE_FOLD);
-        assert!(shown(&s), "a click lists the idle");
-        // A new list of spaces (the same ones) keeps it open.
-        let spaces = s.spaces.clone();
-        let mut dirty = false;
-        apply(
-            &mut s,
-            ControlResponse::Workspaces {
-                id: "spaces".into(),
-                workspaces: spaces,
-            },
-            &mut request,
-            &mut dirty,
-        );
-        assert!(s.doze_open.contains(&sidebar::IDLE_FOLD) && shown(&s));
-        toggle_doze(&mut s, sidebar::IDLE_FOLD);
-        assert!(!shown(&s));
-        // The keyboard stands on it like on any row; enter lists, and nothing of a space's own
-        // keys reaches the daemon from it.
-        enter_side(&mut s, false);
-        let items = side_items(&s);
-        side_stand(
-            &mut s,
-            &items,
-            Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)),
-        );
-        for key in [&b"s"[..], b"w", b"n", b"x"] {
-            mode_input(&mut s, key, 0x01, &mut request);
-            assert!(
-                s.modes.outbox.is_empty(),
-                "{key:?} sent {:?}",
-                s.modes.outbox
-            );
-            let items = side_items(&s);
-            side_stand(
-                &mut s,
-                &items,
-                Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)),
-            );
-        }
-        mode_input(&mut s, b"\r", 0x01, &mut request);
-        assert!(
-            shown(&s) && s.modes.side.is_some(),
-            "enter lists them and stays"
-        );
-    }
-
-    /// A menu and a card on one agent, with another agent between them: the keyboard in the
-    /// column steps through every row once with `j` and never loops back.
-    #[test]
-    fn j_reaches_every_pick_of_the_priority_list_once() {
-        let mut s = state();
-        s.view = sidebar::View::Priority;
-        let menu = || {
-            serde_json::from_value(serde_json::json!({
-                "question": "Go on?", "seal": 1,
-                "options": [{"key": "1", "label": "Yes"}, {"key": "2", "label": "No"}],
-            }))
-            .expect("menu")
-        };
-        let mut rows = vec![
-            waiting_row(1, 1, "blocked", 100),
-            waiting_row(2, 1, "blocked", 150),
-            waiting_row(3, 1, "working", 50),
-            waiting_row(4, 1, "idle", 20),
-        ];
-        rows[0].menu = Some(menu());
-        rows[1].menu = Some(menu());
-        let mut card = ask_card(1, "claude");
-        card.card = "Q1".to_string();
-        s.rows = rows;
-        s.ibx_cards = vec![card];
-        s.refresh_ibx();
-        assert_eq!(
-            s.inbox_now().items.len(),
-            3,
-            "the menu, the other menu, the card"
-        );
-        let mut request = 0;
-        enter_side(&mut s, false);
-        let items = side_items(&s);
-        assert_eq!(
-            items,
-            [
-                sidebar::Pick::Terminal(1),
-                sidebar::Pick::Terminal(2),
-                sidebar::Pick::Terminal(3),
-                sidebar::Pick::Doze(sidebar::IDLE_FOLD),
-            ]
-        );
-        side_stand(&mut s, &items, items.first().copied());
-        let mut seen = vec![side_pick(&s).unwrap()];
-        for _ in 0..items.len() + 2 {
-            mode_input(&mut s, b"j", 0x01, &mut request);
-            let at = side_pick(&s).unwrap();
-            if seen.last() != Some(&at) {
-                seen.push(at);
-            }
-        }
-        assert_eq!(seen, items, "every pick once, in order, ending on the last");
-    }
-
-    /// In the priority list there is no space to fold: `l` and `h` open and close its one fold,
-    /// `h` with the fold closed and `f` on an agent say where the spaces are, and nothing is sent.
-    #[test]
-    fn h_and_l_close_and_open_the_priority_fold_and_f_points_to_the_tree() {
-        let mut s = drag_state();
-        s.view = sidebar::View::Priority;
-        let mut request = 0;
-        enter_side(&mut s, false);
-        let items = side_items(&s);
-        side_stand(&mut s, &items, Some(sidebar::Pick::Terminal(2)));
-        mode_input(&mut s, b"f", 0x01, &mut request);
-        assert_eq!(
-            s.message.as_deref(),
-            Some("ctrl-a g shows the tree to fold a space")
-        );
-        s.message = None;
-        mode_input(&mut s, b"h", 0x01, &mut request);
-        assert_eq!(
-            s.message.as_deref(),
-            Some("ctrl-a g shows the tree to fold a space"),
-            "closed already"
-        );
-        mode_input(&mut s, b"l", 0x01, &mut request);
-        assert!(s.doze_open.contains(&sidebar::IDLE_FOLD));
-        mode_input(&mut s, b"h", 0x01, &mut request);
-        assert!(!s.doze_open.contains(&sidebar::IDLE_FOLD));
-        assert_eq!(side_pick(&s), Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)));
-        assert!(s.shut.is_empty() && s.modes.outbox.is_empty());
     }
 
     /// A carried row paints: its rows dim, its chip follows the pointer, and the place it
@@ -17228,7 +18745,9 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            qass_back: None,
             qass_asked: None,
+            qass_ui: Default::default(),
             asks: Default::default(),
             clock: crate::schedules::Pane::new(),
             typed_at: Default::default(),
@@ -17257,10 +18776,9 @@ mod tests {
             creating: 0,
             done: false,
 
-            // The tests of the tree and of its keys read the tree; the priority list, the
-            // default of a real client, has tests of its own.
-            view: sidebar::View::Tree,
-            ibx_list: crate::inbox::Inbox::default(),
+            view: sidebar::View::default(),
+            inbox: sidebar::Inbox::default(),
+            inbox_drag: None,
 
             shut: sidebar::Shut::new(),
             doze_open: sidebar::Shut::new(),
@@ -17270,13 +18788,6 @@ mod tests {
             prefix_pending: false,
 
             answer: None,
-            ibx: crate::inbox_pane::Pane::new(),
-            hand: crate::answers::HandInput::default(),
-            ibx_cards: Vec::new(),
-            ibx_ctx: crate::inbox::Context::default(),
-            ibx_held: None,
-            ibx_day: 0,
-            beside: Default::default(),
 
             usage: sidebar::Usage::new(),
 
@@ -17308,6 +18819,8 @@ mod tests {
             link: LinkClick::default(),
             agent_view: None,
             plugin_links: false,
+            board_drag: None,
+            board_owed: None,
             last_press: None,
             toast: None,
             anchor: None,
@@ -17367,6 +18880,13 @@ mod tests {
             armed: None,
             drawer: None,
             list_scroll: None,
+            tabq: None,
+            tabq_focus: None,
+            tabq_task: None,
+            tabq_read: None,
+            tabq_asked: None,
+            tabq_home: None,
+            tabq_w: None,
         }
     }
 
@@ -18804,7 +20324,9 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            qass_back: None,
             qass_asked: None,
+            qass_ui: Default::default(),
             asks: Default::default(),
             clock: crate::schedules::Pane::new(),
             typed_at: Default::default(),
@@ -18833,10 +20355,9 @@ mod tests {
             reading: None,
             creating: 0,
 
-            // The tests of the tree and of its keys read the tree; the priority list, the
-            // default of a real client, has tests of its own.
-            view: sidebar::View::Tree,
-            ibx_list: crate::inbox::Inbox::default(),
+            view: sidebar::View::default(),
+            inbox: sidebar::Inbox::default(),
+            inbox_drag: None,
 
             shut: sidebar::Shut::new(),
             doze_open: sidebar::Shut::new(),
@@ -18846,13 +20367,6 @@ mod tests {
             prefix_pending: false,
 
             answer: None,
-            ibx: crate::inbox_pane::Pane::new(),
-            hand: crate::answers::HandInput::default(),
-            ibx_cards: Vec::new(),
-            ibx_ctx: crate::inbox::Context::default(),
-            ibx_held: None,
-            ibx_day: 0,
-            beside: Default::default(),
 
             usage: sidebar::Usage::new(),
 
@@ -18884,6 +20398,8 @@ mod tests {
             link: LinkClick::default(),
             agent_view: None,
             plugin_links: false,
+            board_drag: None,
+            board_owed: None,
             last_press: None,
             toast: None,
             anchor: None,
@@ -18918,6 +20434,13 @@ mod tests {
             armed: None,
             drawer: None,
             list_scroll: None,
+            tabq: None,
+            tabq_focus: None,
+            tabq_task: None,
+            tabq_read: None,
+            tabq_asked: None,
+            tabq_home: None,
+            tabq_w: None,
         }
     }
 
@@ -18941,6 +20464,13 @@ mod tests {
             armed: None,
             drawer: None,
             list_scroll: None,
+            tabq: None,
+            tabq_focus: None,
+            tabq_task: None,
+            tabq_read: None,
+            tabq_asked: None,
+            tabq_home: None,
+            tabq_w: None,
             closing: None,
             close_begun: false,
             rows: vec![agent(1, 1, "zsh", "idle"), agent(2, 1, "claude", "working")],
@@ -18976,7 +20506,9 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            qass_back: None,
             qass_asked: None,
+            qass_ui: Default::default(),
             asks: Default::default(),
             clock: crate::schedules::Pane::new(),
             typed_at: Default::default(),
@@ -19005,10 +20537,9 @@ mod tests {
             focus_fetch: false,
             reading: None,
 
-            // The tests of the tree and of its keys read the tree; the priority list, the
-            // default of a real client, has tests of its own.
-            view: sidebar::View::Tree,
-            ibx_list: crate::inbox::Inbox::default(),
+            view: sidebar::View::default(),
+            inbox: sidebar::Inbox::default(),
+            inbox_drag: None,
 
             shut: sidebar::Shut::new(),
             doze_open: sidebar::Shut::new(),
@@ -19018,13 +20549,6 @@ mod tests {
             prefix_pending: false,
 
             answer: None,
-            ibx: crate::inbox_pane::Pane::new(),
-            hand: crate::answers::HandInput::default(),
-            ibx_cards: Vec::new(),
-            ibx_ctx: crate::inbox::Context::default(),
-            ibx_held: None,
-            ibx_day: 0,
-            beside: Default::default(),
 
             usage: sidebar::Usage::new(),
 
@@ -19056,6 +20580,8 @@ mod tests {
             link: LinkClick::default(),
             agent_view: None,
             plugin_links: false,
+            board_drag: None,
+            board_owed: None,
             last_press: None,
             toast: None,
             anchor: None,
@@ -21685,10 +23211,7 @@ mod tests {
         let ratio = |state: &State| state.layouts[&1].root_split().map(|(_, r)| r);
         let resize = |state: &mut State, to: f32| {
             let layout = state.layouts.get_mut(&1).expect("shown");
-            let crate::layout::Node::Split { ratio, .. } = &mut layout.root else {
-                panic!("a split");
-            };
-            *ratio = to;
+            assert!(layout.set_root_split(crate::layout::Dir::V, to));
         };
         resize(&mut state, 0.3);
         apply(
@@ -21843,6 +23366,27 @@ mod tests {
             label: label.to_string(),
             at_unix: 0,
         }
+    }
+
+    /// A click on a tree row keeps the wheel's place; a click on an inbox item lets the list
+    /// follow the agent it opens, whose row may be scrolled out of the window.
+    #[test]
+    fn an_inbox_click_lets_the_list_follow_the_agent_it_opens() {
+        let wheeled = Some((1, 12));
+        assert_eq!(
+            clicked_scroll(wheeled, 7, Some(sidebar::Hit::Terminal(7))),
+            Some((7, 12))
+        );
+        // Let go, not kept for the agent it was on: back there, the list follows the keys.
+        assert_eq!(
+            clicked_scroll(wheeled, 7, Some(sidebar::Hit::Next(Some(7)))),
+            None,
+            "the list follows the opened agent"
+        );
+        assert_eq!(
+            clicked_scroll(None, 7, Some(sidebar::Hit::Terminal(7))),
+            None
+        );
     }
 
     #[test]
@@ -22445,7 +23989,7 @@ mod tests {
     #[test]
     fn a_divider_drag_sizes_both_tiles_once_per_frame() {
         let mut state = tiled_state();
-        // Room for nine columns off a pane.
+        // Room for nine columns off a pane; the wider one grows a rail of its own.
         state.cols = 100;
         let rect = focused_rect(&state);
         let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
@@ -22473,7 +24017,7 @@ mod tests {
         seqs.iter().map(|(t, n)| (*t, *n)).collect()
     }
 
-    /// Where `terminal` is drawn and sized in space 1's tab: its tile less its line.
+    /// Where `terminal` is drawn and sized in space 1's tab: its tile less its rail.
     fn layout_rect(state: &State, terminal: u32) -> layout::Rect {
         state
             .term_rect_in(&state.layouts[&1], terminal)
@@ -22505,35 +24049,6 @@ mod tests {
         );
     }
 
-    /// Opening the Inbox or the ledger below 100 columns folds the agents column, and the
-    /// terminals under it are not sized for that: a card read or a schedule read (which size
-    /// the terminals) sends nothing while it is folded open, and nothing once it is put away.
-    #[test]
-    fn the_inbox_folding_the_column_sizes_no_terminal() {
-        let mut state = tiled_state();
-        state.cols = 90;
-        state.lines = 30;
-        let mut seqs = std::collections::BTreeMap::new();
-        size_terminals(&mut state, &mut seqs).unwrap();
-        let before = (state.sized.clone(), sent(&seqs));
-        for ledger in [false, true] {
-            if ledger {
-                assert!(!ledger_toggle(&mut state));
-            } else {
-                open_inbox(&mut state);
-            }
-            assert!(state.ibx.folded && state.collapsed, "the column folded");
-            assert!(
-                size_terminals(&mut state, &mut seqs).unwrap().is_none(),
-                "a read sized the terminals under the Inbox"
-            );
-            assert_eq!((state.sized.clone(), sent(&seqs)), before);
-            assert!(close_inbox(&mut state), "the column unfolded");
-            assert!(size_terminals(&mut state, &mut seqs).unwrap().is_none());
-            assert_eq!((state.sized.clone(), sent(&seqs)), before);
-        }
-    }
-
     /// A tab not on screen, parked or in another space, is sized to the whole pane, the
     /// way it will be drawn when it comes back; a sleeping row has no process to size.
     #[test]
@@ -22544,7 +24059,7 @@ mod tests {
         state.rows.push(agent(5, 2, "claude", "sleeping"));
         let mut seqs = std::collections::BTreeMap::new();
         size_terminals(&mut state, &mut seqs).unwrap();
-        // Each an agent: the pane in its frame, less the reserved line under it.
+        // Each an agent: the pane in its frame, less the rail it carries there.
         let area = state.lone_rect(3);
         let whole = (area.cols as u16, area.rows as u16);
         assert_eq!(state.sized.get(&3), Some(&whole));
@@ -22769,11 +24284,9 @@ mod tests {
             panic!("a lone pane carries the label in its corner");
         };
         let pane = layout::framed(pane_area(&s));
-        // The agent's screen ends two rows above the pane's foot: its reserved line and the
-        // rule above it stand below it.
         assert_eq!(
             (x, y),
-            (pane.x + 2, pane.y + pane.rows - 2),
+            (pane.x + 2, pane.y + pane.rows),
             "after the bottom left corner"
         );
         assert!(label.contains("save"), "{label:?}");
@@ -23926,16 +25439,133 @@ mod tests {
         state
     }
 
-    /// The daemon's tree of the split `qoop qass` made: the board on the left, qass's agent (5)
-    /// in the rest, at 700 thousandths.
-    fn qass_board_split(board: u32) -> qoop_runtime::control::Pane {
-        qoop_runtime::control::Pane::Split {
-            dir: qoop_runtime::control::SplitDir::V,
-            permille: 700,
-            questions: 0,
-            first: Box::new(qoop_runtime::control::Pane::Leaf { terminal: board }),
-            second: Box::new(qoop_runtime::control::Pane::Leaf { terminal: 5 }),
+    /// qass without the board in its tab is shown at once, and `qoop qass` is asked once to
+    /// put the board back; with a board pane, even one woken as a shell (its wake types the
+    /// page), nothing is asked, so nothing types the page twice.
+    #[test]
+    fn ctrl_a_capital_q_puts_the_board_back_above_qass() {
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        for program in ["qoop", "zsh"] {
+            let mut state = qass_state();
+            state
+                .rows
+                .iter_mut()
+                .find(|r| r.terminal == 4)
+                .unwrap()
+                .program = Some(program.into());
+            assert!(state.is_pane(5), "qass is the pane under the board");
+            assert!(
+                matches!(
+                    qass_toggle(&mut state, &mut seq, &mut seqs).unwrap(),
+                    QassStep::Moved(_)
+                ),
+                "{program}"
+            );
+            assert_eq!(state.focused, 5);
         }
+        let mut state = qass_state();
+        state.parked.clear();
+        state.rows.retain(|r| r.terminal != 4);
+        assert!(matches!(
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap(),
+            QassStep::Board(_)
+        ));
+        assert_eq!((state.focused, state.space), (5, Some(9)));
+        // Back, and again at once: the board is on its way, asked for once.
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(matches!(
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap(),
+            QassStep::Moved(_)
+        ));
+    }
+
+    /// `ctrl-a Q` shows qass and goes back to the very tab it left; no list of the owner's
+    /// spaces or agents holds qass, and `ctrl-a s` steps over its space.
+    #[test]
+    fn ctrl_a_capital_q_goes_to_qass_and_back() {
+        let mut state = qass_state();
+        let (spaces, rows) = state.shown();
+        assert_eq!(spaces.iter().map(|w| w.id).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(rows.iter().map(|r| r.terminal).collect::<Vec<_>>(), [1, 3]);
+        let column = state.column(0, 0);
+        assert!(column.spaces.iter().all(|w| w.name != "qass"));
+        assert!(column.agents.iter().all(|r| r.terminal != 5));
+        assert_eq!(state.next_space(true), Some(3));
+        assert_eq!(state.next_space(false), Some(3));
+
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        state.space = Some(3);
+        state.focused = 3;
+        assert!(matches!(
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap(),
+            QassStep::Moved(_)
+        ));
+        assert_eq!((state.focused, state.space), (5, Some(9)));
+        assert!(state.in_qass());
+        // From qass, the space keys land on the owner's first or last space.
+        assert_eq!(state.next_space(true), Some(1));
+        assert_eq!(state.next_space(false), Some(3));
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert_eq!((state.focused, state.space), (3, Some(3)));
+    }
+
+    /// A click on the pet and `ctrl-a Q` are one function: the first press shows qass, the
+    /// second goes back to the very tab it left.
+    #[test]
+    fn pressing_the_pet_opens_qass_and_pressing_again_closes_it() {
+        let mut state = qass_state();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(!state.in_qass());
+        assert!(
+            qass_press(&mut state, &mut seq, &mut seqs, &tx)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!((state.focused, state.space), (5, Some(9)));
+        assert!(state.in_qass());
+        qass_press(&mut state, &mut seq, &mut seqs, &tx).unwrap();
+        assert_eq!((state.focused, state.space), (1, Some(1)));
+        assert!(!state.in_qass());
+    }
+
+    /// A click on a pet cell is read by `clicked` as the qass press and enters qass through
+    /// the same helper as the key; a click beside the pet is not.
+    #[test]
+    fn a_click_on_the_pet_reaches_qass_through_clicked() {
+        let pet = qoop_runtime::avatar::Avatar {
+            body: qoop_runtime::avatar::BODY.into(),
+            hair: "mohawk".into(),
+            eyes: "big".into(),
+            hair_ink: 212,
+            body_ink: 33,
+        };
+        let mut state = qass_state();
+        state.lines = 50;
+        let rows = state.column_rows_with(0, Some(&pet));
+        let at = rows
+            .iter()
+            .position(|(_, hit)| matches!(hit, Some(sidebar::Hit::Pet(_))))
+            .expect("a pet row");
+        let row = (at + screen::SIDEBAR_TOP) as u16;
+        let cols = sidebar::pet_width(&pet);
+        let on = sidebar::WIDTH - 1;
+        assert!(matches!(
+            state.clicked_with(row, on as u16, Some(&pet)),
+            Some(Clicked::Qass)
+        ));
+        assert!(!matches!(
+            state.clicked_with(row, (sidebar::WIDTH - cols - 1) as u16, Some(&pet)),
+            Some(Clicked::Qass)
+        ));
+        assert!(!matches!(
+            state.clicked_with(row, on as u16, None),
+            Some(Clicked::Qass)
+        ));
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        qass_press(&mut state, &mut seq, &mut seqs, &tx).unwrap();
+        assert!(state.in_qass());
     }
 
     /// A second space a rename called `qass` is kept off the lists with its tabs, and qass
@@ -23951,6 +25581,25 @@ mod tests {
         assert_eq!(spaces.iter().map(|w| w.id).collect::<Vec<_>>(), [1, 3]);
         assert_eq!(rows.iter().map(|r| r.terminal).collect::<Vec<_>>(), [1, 3]);
         assert_eq!(sidebar::qass_space(&state.spaces), Some(11));
+    }
+
+    /// With no qass listed, `ctrl-a Q` asks `qoop qass` once: a second press while that
+    /// answer is on its way starts no second qass.
+    #[test]
+    fn ctrl_a_capital_q_starts_qass_once() {
+        let mut state = qass_state();
+        state.rows.retain(|r| r.terminal != 5);
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        assert!(matches!(
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap(),
+            QassStep::Start
+        ));
+        assert!(matches!(
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap(),
+            QassStep::Moved(None)
+        ));
+        assert_eq!(state.message.as_deref(), Some("qass is on its way"));
+        assert_eq!(state.focused, 1);
     }
 
     /// A client opening on a daemon where qass's space has the lowest id, with its index in
@@ -23970,13 +25619,7 @@ mod tests {
             &mut s,
             ControlResponse::Agents {
                 id: "index".into(),
-                agents: vec![
-                    AgentRow {
-                        status: Some("done".into()),
-                        ..agent(5, 2, "claude", "done")
-                    },
-                    agent(7, 4, "claude", "idle"),
-                ],
+                agents: vec![agent(5, 2, "claude", "done"), agent(7, 4, "claude", "idle")],
                 splits: Vec::new(),
                 qass_checks: None,
             },
@@ -23997,22 +25640,1137 @@ mod tests {
         s.focused = 7;
         s.space = Some(4);
         s.seen_done.clear();
-        let unfiltered = crate::inbox::Inbox::build(
-            &s.rows,
-            &[],
-            &s.hand,
-            &crate::inbox::Context::default(),
-            &[],
+        let full = sidebar::queue(&s.rows, 7, &s.seen_done, &s.unseen_finished);
+        assert!(
+            full.iter().any(|r| r.terminal == 5),
+            "qass's finish is unread"
         );
-        assert!(unfiltered.finished.contains(&5), "qass's finish is unread");
-        s.refresh_ibx();
-        assert!(!s.inbox_now().finished.contains(&5), "and not the owner's");
         assert_eq!(s.up_next(), None);
         s.news_sent = None;
         match news_request(&mut s, &mut request) {
             Some(ControlRequest::News { terminals, .. }) => assert!(!terminals.contains(&5)),
             other => assert!(other.is_none(), "{other:?}"),
         }
+    }
+
+    /// qass's tab going while it is on screen sends the keyboard back to the owner's tab,
+    /// never leaves it in a space no list shows.
+    #[test]
+    fn qass_leaving_sends_the_keyboard_back() {
+        let mut state = qass_state();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let left: Vec<AgentRow> = state
+            .rows
+            .iter()
+            .filter(|r| r.terminal != 5)
+            .cloned()
+            .collect();
+        assert_eq!(out_of_qass(&state, &left), Some(1));
+        state.qass_back = None;
+        assert_eq!(out_of_qass(&state, &left), Some(1));
+        state.space = Some(3);
+        assert_eq!(out_of_qass(&state, &left), None, "only from qass's space");
+    }
+
+    /// The pane's cells and qass's box inside, for a 160x50 window.
+    fn qass_cells(state: &State) -> ((u16, u16), layout::Rect) {
+        let (cols, rows) = screen::pane_size_for(
+            state.cols,
+            state.lines,
+            state.collapsed,
+            0,
+            state.sidebar_width,
+        );
+        let inner = crate::qass_screen::Plan::new(
+            cols as usize,
+            rows as usize,
+            state.qass_ui.zoomed,
+            state.qass_ui.inbox,
+        )
+        .expect("a pane this size is framed")
+        .inner;
+        ((cols, rows), inner)
+    }
+
+    /// qass alone in its tab (its board closed), in a window that frames its box.
+    fn qass_window() -> State {
+        let mut state = qass_split_window();
+        state.parked.clear();
+        state.rows.retain(|r| r.terminal != 4);
+        state
+    }
+
+    /// qass under its board, in a window that holds the header over both.
+    fn qass_split_window() -> State {
+        let mut state = qass_state();
+        state.cols = 160;
+        state.lines = 50;
+        state
+    }
+
+    /// A window wide enough for both shows the board beside qass whatever direction the tab was
+    /// saved with, and nothing is written for it; the resize keys move the divider that is on
+    /// screen and save it so, and a split keeps the tab side by side.
+    #[test]
+    fn qass_tab_shows_the_board_beside_qass_when_the_pane_is_wide() {
+        let mut state = qass_split_window();
+        state.cols = 200;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert_eq!((state.focused, state.space), (5, Some(9)));
+        let saved = state.layouts[&9].root_split().unwrap();
+        assert_eq!(saved.0, layout::Dir::H, "the tab was saved stacked");
+        let area = pane_area(&state);
+        let tiles = state.drawn(&state.layouts[&9]).tile_rects(area);
+        let (board, qass) = (tiles[0].1, tiles[1].1);
+        assert_eq!((tiles[0].0, tiles[1].0), (4, 5));
+        assert!(
+            board.y == qass.y && qass.x > board.x + board.cols,
+            "{tiles:?}"
+        );
+        assert!(board.cols >= crate::qass_screen::BOARD_MIN_COLS && qass.cols >= 40);
+        assert_eq!(
+            state.layouts[&9].root_split(),
+            Some(saved),
+            "nothing saved by looking"
+        );
+        assert_eq!(focused_rect(&state), qass);
+        let frame = state.frame();
+        assert_eq!(frame.tiles[0].rect, board);
+        // The keyboard moves to the board by the side it is on.
+        let target = layout::neighbour_in_dir(
+            &state
+                .drawn(&state.layouts[&9])
+                .tile_rects(pane_area(&state)),
+            5,
+            layout::Move::Left,
+        );
+        assert_eq!(target, Some(4));
+        // `ctrl-a e` then `h`: the divider on screen moves, and the tab is saved side by side.
+        state.modes.resizing = true;
+        resize_key(&mut state, b"h");
+        let (dir, ratio) = state.layouts[&9].root_split().unwrap();
+        assert_eq!(dir, layout::Dir::V);
+        assert!((ratio - 0.65).abs() < 0.001, "{ratio}");
+        // `j` finds no stacked divider on screen: nothing moves.
+        resize_key(&mut state, b"j");
+        assert_eq!(state.layouts[&9].root_split(), Some((dir, ratio)));
+    }
+
+    /// qass's tab in a 200 column window, the keyboard in qass.
+    fn qass_wide() -> State {
+        let mut state = qass_split_window();
+        state.cols = 200;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state
+    }
+
+    /// The board folded (`ctrl-a T` in it) is no columns wide, its tab on the rail: its pty keeps its size
+    /// while qass's grows into the room; opened again (`ctrl-a T`, the keyboard staying in
+    /// qass), both are back as they were. Nothing of the fold is saved.
+    #[test]
+    fn a_folded_pane_keeps_its_size_and_the_other_grows() {
+        let mut state = qass_wide();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let before = state.sized.clone();
+        let open = qass_tiles(&state);
+        state.focused = 4;
+        state.layouts.get_mut(&9).unwrap().focus_terminal(4);
+        assert!(fold_key(&mut state), "ctrl-a T folds the board");
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Board));
+        assert_eq!(
+            state.pending_focus,
+            Some(5),
+            "the keyboard leaves the board"
+        );
+        if let Some(next) = state.pending_focus.take() {
+            move_focus(&mut state, next, &mut seq, &mut seqs).unwrap();
+        }
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let folded = qass_tiles(&state);
+        assert_eq!(folded[0].1.cols, 0, "{folded:?}");
+        assert!(folded[1].1.cols > open[1].1.cols, "qass grows");
+        assert_eq!(
+            state.sized.get(&4),
+            before.get(&4),
+            "the board keeps its size"
+        );
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(folded[1].1.cols as u16, folded[1].1.rows as u16))
+        );
+        assert_eq!(state.committed(&state.layouts[&9]).fold, None);
+        assert_eq!(state.layouts[&9].fold, None, "the kept tree never holds it");
+        assert!(state.handle().is_none() && !state.split_press(1, 1));
+        assert!(!state.swap_sides(9), "no swap while folded");
+        // Opened by the same key from qass: the keyboard stays where it is.
+        assert!(fold_key(&mut state));
+        assert_eq!((state.qass_ui.fold, state.pending_focus), (None, None));
+        size_terminals(&mut state, &mut seqs).unwrap();
+        assert_eq!(qass_tiles(&state), open);
+        assert_eq!(state.sized, before);
+    }
+
+    /// The titles of the board and qass fold their pane on a click and carry it on a drag (a
+    /// drag does nothing while folded); any other tab keeps a click on a title for focus. A
+    /// press on a strip opens it and gives it the keyboard; the keyboard going into a folded
+    /// pane any other way opens it too.
+    #[test]
+    fn titles_fold_strips_open_and_the_keyboard_opens_a_folded_pane() {
+        let mut state = qass_wide();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        assert_eq!(state.title_release(4, false), TitleAct::Fold);
+        assert_eq!(state.title_release(5, false), TitleAct::Fold);
+        assert_eq!(state.title_release(4, true), TitleAct::Carry);
+        assert!(title_fold(&mut state, 5));
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Qass));
+        assert_eq!(state.title_release(4, true), TitleAct::Nothing);
+        // The strip opens on a press, the keyboard going into it; nothing else answers.
+        assert!(!state.strip_press(4));
+        assert!(state.strip_press(5));
+        assert_eq!((state.qass_ui.fold, state.pending_focus), (None, None));
+        // Folded, then the keyboard sent in by any way: open.
+        state.focused = 4;
+        state.layouts.get_mut(&9).unwrap().focus_terminal(4);
+        assert!(title_fold(&mut state, 5));
+        focus(&mut state, 5, &mut seq, &mut seqs).unwrap();
+        assert_eq!(state.qass_ui.fold, None);
+        // The second fold joins the first: both are away and the questions hold the tab.
+        assert!(title_fold(&mut state, 4) && title_fold(&mut state, 5));
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Both));
+        // A tab with no board keeps today's click and drag on a title.
+        let alone = qass_window();
+        assert_eq!(alone.title_release(5, false), TitleAct::Focus);
+        assert_eq!(alone.title_release(5, true), TitleAct::Carry);
+    }
+
+    /// With the board and qass both folded the questions fill the tab: both tiles are no columns
+    /// wide, the questions take the rest less the rail with the keyboard, no divider is left, and
+    /// a tab on the rail opens its pane again while the other stays away.
+    #[test]
+    fn both_panes_folded_leave_the_questions_the_whole_tab() {
+        let mut state = qass_wide();
+        assert!(title_fold(&mut state, 4) && title_fold(&mut state, 5));
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Both));
+        let tiles = qass_tiles(&state);
+        assert!(tiles.iter().all(|(_, r)| r.cols == 0), "{tiles:?}");
+        let tree = state.drawn_tree(9).unwrap();
+        let area = state.tree_area(&tree);
+        let side = state.questions().expect("the questions");
+        assert!(side.replaces);
+        assert_eq!(side.rect.x, area.x + tree.rail);
+        assert_eq!(side.rect.x + side.rect.cols, area.x + area.cols);
+        assert_eq!(side.rect.rows, area.rows);
+        assert!(state.asks_focused(), "the keyboard is in the questions");
+        assert!(state.handle().is_none() && !state.split_press(1, 1));
+        let rail = state.rail_paint().expect("the rail");
+        assert_eq!(
+            rail.panes,
+            [
+                Some(crate::rail::Pane::Board),
+                None,
+                Some(crate::rail::Pane::Qass)
+            ]
+        );
+        assert!(!state.committed(&state.layouts[&9]).fold_all);
+        // The board's tab opens the board: qass stays away.
+        assert!(state.strip_press(4));
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Qass));
+        assert!(!state.drawn_tree(9).unwrap().fold_all);
+    }
+
+    /// Folded panes paint as strips: the board's letters down its cell and the titles of the
+    /// open ones behind their caret; the caret cell and the last letter of a title are a
+    /// click on it, the cell after is not.
+    #[test]
+    fn a_folded_board_paints_its_strip_and_the_titles_their_caret() {
+        let mut state = qass_wide();
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let qass = tile_of(&state, 5);
+        let title_row = (screen::TABS + qass.y) as u16;
+        let caret = (left + 1 + qass.x + 2) as u16;
+        let painted = screen::paint(&state.frame());
+        let titles = written_on(&painted, title_row as usize);
+        assert!(titles.contains("\u{25be} "), "{titles:?}");
+        assert_eq!(state.title_at_screen(title_row, caret), Some(5));
+        let last = caret
+            + 2
+            + crate::width::width(&sidebar::label(
+                state.rows.iter().find(|r| r.terminal == 5).unwrap(),
+            )) as u16
+            - 1;
+        assert_eq!(state.title_at_screen(title_row, last), Some(5));
+        assert_eq!(state.title_at_screen(title_row, last + 2), None);
+        assert!(title_fold(&mut state, 4));
+        assert_eq!(tile_of(&state, 4).cols, 0);
+        let rail = state.rail_paint().expect("the rail");
+        assert_eq!(
+            rail.tabs(),
+            vec![crate::rail::Pane::Board, crate::rail::Pane::Questions]
+        );
+        let painted = screen::paint(&state.frame());
+        let line = |r: usize| written_on(&painted, screen::TABS + 1 + rail.y + r);
+        assert!(line(0).contains("\u{25b8} board"), "{:?}", line(0));
+        assert!(line(1).contains("\u{25b8} questions 0"), "{:?}", line(1));
+        // The wheel over the rail reaches no page.
+        let (row, col) = screen_of(&state, rail.x, rail.y);
+        assert_eq!(state.board_wheel(row, col, true), None);
+    }
+
+    /// With the board folded a card opens nothing: it lights the questions' tab. Brought up,
+    /// the questions are weighed against qass: beside it from qass's side when qass keeps its
+    /// minimum after them, over qass's tile when not.
+    #[test]
+    fn a_card_with_the_board_folded_brought_up_opens_the_questions_from_qass_side() {
+        let mut state = qass_wide();
+        assert!(title_fold(&mut state, 4));
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(state.questions().is_none(), "a card opens nothing");
+        assert!(
+            state
+                .rail_paint()
+                .is_some_and(|r| r.tabs().contains(&crate::rail::Pane::Questions))
+        );
+        assert!(questions_toggle(&mut state), "ctrl-a i brings them up");
+        let side = state.questions().expect("the column");
+        let (strip, qass) = (tile_of(&state, 4), tile_of(&state, 5));
+        assert!(!side.replaces);
+        assert!(
+            side.rect.x >= strip.x && side.rect.x + side.rect.cols < qass.x,
+            "{side:?}"
+        );
+        // A narrow window: over qass's tile.
+        state.cols = 120;
+        let side = state.questions().expect("over qass");
+        assert!(side.replaces && side.rect == tile_of(&state, 5));
+        assert!(
+            state
+                .rail_paint()
+                .is_some_and(|r| r.tabs().contains(&crate::rail::Pane::Questions)),
+            "over qass's tile they keep their tab"
+        );
+    }
+
+    /// Stacked, the lower pane's title stands on the divider and is a click on it all the same;
+    /// the rest of the divider still resizes.
+    #[test]
+    fn the_lower_title_of_a_stacked_tab_folds_too() {
+        let mut state = qass_split_window();
+        state.cols = 120;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let (board, qass) = (tile_of(&state, 4), tile_of(&state, 5));
+        assert!(qass.y > board.y + board.rows, "stacked");
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let row = (screen::TABS + qass.y) as u16;
+        assert_eq!(
+            state.title_at_screen(row, (left + 1 + qass.x + 2) as u16),
+            Some(5)
+        );
+        assert_eq!(state.title_release(5, false), TitleAct::Fold);
+        let far = (left + 1 + qass.x + qass.cols - 3) as u16;
+        assert_eq!(
+            state.title_at_screen(row, far),
+            None,
+            "the divider beyond the title"
+        );
+    }
+
+    /// Every entry to qass's space starts with the board folded onto the rail and the
+    /// keyboard in qass; a fold chosen on the page holds while the screen stays there, also
+    /// through a settle without the board's tab (a board page restarting).
+    #[test]
+    fn entering_qass_space_folds_the_board_and_a_fold_chosen_there_holds() {
+        let mut state = qass_split_window();
+        state.cols = 200;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        state.asks_settle();
+        assert_eq!(state.qass_ui.seen, state.space);
+        assert_ne!(state.space, Some(9));
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert_eq!(state.qass_ui.fold, None, "sized for the split first");
+        assert!(state.asks_settle(), "the entry asks for a resize");
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Board));
+        assert_eq!(state.focused, 5);
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let qass = tile_of(&state, 5);
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(qass.cols as u16, qass.rows as u16))
+        );
+        assert!(qass.cols > 100, "qass takes the room: {qass:?}");
+        // Opened by hand, it stays open on the page, through a settle that misses the board.
+        assert!(state.strip_press(4));
+        assert_eq!(state.qass_ui.fold, None);
+        let board_row = state.rows.iter().position(|r| r.terminal == 4).unwrap();
+        let row = state.rows.remove(board_row);
+        assert!(!state.asks_settle());
+        state.rows.insert(board_row, row);
+        assert!(!state.asks_settle());
+        assert_eq!(state.qass_ui.fold, None);
+        // Leaving and coming back folds it again.
+        state.space = Some(1);
+        state.asks_settle();
+        state.space = Some(9);
+        assert!(state.asks_settle());
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Board));
+    }
+
+    /// The keyboard on its way to the folded board (an entry through `pending_focus`) goes to
+    /// qass instead; questions brought up and left open are down again on the next entry.
+    #[test]
+    fn an_entry_never_leaves_the_keyboard_in_the_folded_board_nor_the_questions_up() {
+        let mut state = qass_wide();
+        state.asks_settle();
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Board));
+        state.pending_focus = Some(4);
+        state.asks_settle();
+        assert_eq!(state.pending_focus, Some(5));
+        state.focused = 4;
+        state.pending_focus = None;
+        state.asks_settle();
+        assert_eq!(state.pending_focus, Some(5));
+        state.pending_focus = None;
+        state.focused = 5;
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(questions_toggle(&mut state));
+        assert!(state.questions().is_some());
+        state.space = Some(1);
+        state.asks_settle();
+        state.space = Some(9);
+        state.asks_settle();
+        assert!(!state.asks.raised);
+        assert!(
+            state.questions().is_none(),
+            "the entry starts with them down"
+        );
+    }
+
+    /// The tiles of qass's tab as drawn now.
+    fn qass_tiles(state: &State) -> Vec<(u32, layout::Rect)> {
+        state.drawn(&state.layouts[&9]).tile_rects(pane_area(state))
+    }
+
+    /// A card waiting opens nothing: it lights the questions' tab. Brought up (`ctrl-a i`),
+    /// they stand between the board and qass, cut from the board: qass's tile and pty keep
+    /// their size, the board's is resized; the last card gone folds them back to their tab and
+    /// gives the board its columns back.
+    #[test]
+    fn a_question_brought_up_opens_the_column_between_the_board_and_qass_and_qass_keeps_its_size() {
+        let mut state = qass_wide();
+        let mut seqs = std::collections::BTreeMap::new();
+        state.asks.take(Vec::new(), Vec::new());
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let shut = qass_tiles(&state);
+        let qass_size = state.sized.get(&5).copied();
+        assert!(state.questions().is_none());
+        let rail = state.rail_paint().expect("folded: their tab on the rail");
+        assert_eq!(rail.tabs(), vec![crate::rail::Pane::Questions]);
+        let rail_cols = state.drawn(&state.layouts[&9]).rail;
+        assert_eq!(rail.w + crate::rail::EDGE, rail_cols);
+        assert_eq!((rail.x, rail.y), (1, tile_of(&state, 4).y - 1));
+        let painted = screen::paint(&state.frame());
+        let row = |r: usize| written_on(&painted, screen::TABS + 1 + rail.y + r);
+        assert!(row(0).contains("\u{25b8} questions"), "{:?}", row(0));
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        size_terminals(&mut state, &mut seqs).unwrap();
+        assert!(state.questions().is_none(), "a card opens nothing");
+        assert_eq!(qass_tiles(&state), shut);
+        assert!(questions_toggle(&mut state));
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let open = qass_tiles(&state);
+        assert_eq!(open[1], shut[1], "qass's tile is the same");
+        assert_eq!(
+            state.sized.get(&5).copied(),
+            qass_size,
+            "qass's pty is not resized"
+        );
+        let board = open[0].1;
+        assert_eq!(
+            board.cols + crate::qass_screen::QUESTIONS_GAP,
+            shut[0].1.cols + rail_cols,
+            "the rail's columns and the column's come off the board"
+        );
+        assert!(
+            state.rail_paint().is_none(),
+            "open: nothing folded, no rail"
+        );
+        assert!(board.cols >= crate::qass_screen::BOARD_MIN_COLS);
+        assert_eq!(
+            state.sized.get(&4),
+            Some(&(board.cols as u16, board.rows as u16))
+        );
+        let side = state.questions().expect("the column");
+        assert!(!side.replaces);
+        assert_eq!(side.rect.x, board.x + board.cols + 1);
+        assert!(
+            side.rect.x + side.rect.cols < open[1].1.x,
+            "between the board and qass"
+        );
+        let painted = screen::paint(&state.frame());
+        assert!(painted.contains("Question 1?"), "{painted:?}");
+        // Answered elsewhere: no card waits, the column folds and the board has it back.
+        state.asks.take(Vec::new(), Vec::new());
+        size_terminals(&mut state, &mut seqs).unwrap();
+        assert!(state.questions().is_none() && state.rail_paint() == Some(rail));
+        assert_eq!(qass_tiles(&state), shut);
+        assert_eq!(state.sized.get(&5).copied(), qass_size);
+    }
+
+    /// The pane-local cell `(x, y)` as the screen's one based `(col, row)`.
+    fn screen_of(state: &State, x: usize, y: usize) -> (u16, u16) {
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        ((left + 1 + x) as u16, (screen::TABS + 1 + y) as u16)
+    }
+
+    /// qass's tab with a card waiting: the questions stand beside the board.
+    fn qass_with_questions() -> State {
+        let mut state = qass_wide();
+        // Room for the board to give columns: at 200 columns it already stands on its minimum.
+        state.cols = 240;
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        // Brought up by hand: a card alone opens nothing.
+        state.asks.raised = true;
+        assert!(!state.questions().expect("the column").replaces);
+        state
+    }
+
+    /// The three columns on screen: the board's, the questions' and qass's.
+    fn widths(state: &State) -> (usize, usize, usize) {
+        let side = state.questions().expect("the column");
+        (
+            tile_of(state, 4).cols,
+            side.rect.cols,
+            tile_of(state, 5).cols,
+        )
+    }
+
+    /// A cell on the edge between the board and the questions.
+    fn board_edge(state: &State) -> (u16, u16) {
+        let tree = state.drawn_tree(9).expect("the tab");
+        let (x, y, rows) = tree.questions_edge(pane_area(state)).expect("an edge");
+        screen_of(state, x, y + rows / 2)
+    }
+
+    /// A cell on the divider between qass and the questions.
+    fn qass_edge(state: &State) -> (u16, u16) {
+        let (board, qass) = (tile_of(state, 4), tile_of(state, 5));
+        let x = if board.x < qass.x {
+            qass.x - 1
+        } else {
+            qass.x + qass.cols
+        };
+        screen_of(state, x, qass.y + qass.rows / 2)
+    }
+
+    /// Press on `at`, move the pointer `dx` columns, let go: whether the edge moved, saved the way
+    /// the loop saves it.
+    fn drag_edge(state: &mut State, edge: fn(&State) -> (u16, u16), dx: i32) -> bool {
+        let at = edge(state);
+        // Two quick drags on one edge would be a double click.
+        state.modes.divider_click = None;
+        assert!(state.split_press(at.0, at.1), "an edge is held at {at:?}");
+        let moved = state.split_motion((i32::from(at.0) + dx) as u16, at.1);
+        assert!(state.modes.split_drag.take().is_some());
+        state.save_split(9);
+        moved
+    }
+
+    /// The edge between the board and the questions drags: those two change and qass keeps its
+    /// columns and its ratio; past the questions' 24 columns or the board's 60 nothing moves.
+    #[test]
+    fn the_edge_between_the_board_and_the_questions_resizes_those_two() {
+        let mut state = qass_with_questions();
+        let (board, questions, qass) = widths(&state);
+        let ratio = state.drawn_tree(9).unwrap().root_split();
+        assert!(drag_edge(&mut state, board_edge, -10));
+        assert_eq!(widths(&state), (board - 10, questions + 10, qass));
+        assert_eq!(
+            state.drawn_tree(9).unwrap().root_split(),
+            ratio,
+            "the divider stays"
+        );
+        assert!(drag_edge(&mut state, board_edge, 10 + 10));
+        assert_eq!(widths(&state), (board + 10, questions - 10, qass));
+        // To the limits, whole cells, and one cell past each is refused.
+        let (board, questions, qass) = widths(&state);
+        assert!(!drag_edge(
+            &mut state,
+            board_edge,
+            (questions as i32 - 24) + 1
+        ));
+        assert!(!drag_edge(&mut state, board_edge, -(board as i32 - 60) - 1));
+        assert_eq!(widths(&state), (board, questions, qass));
+        assert!(drag_edge(&mut state, board_edge, -(board as i32 - 60)));
+        assert_eq!(widths(&state), (60, questions + board - 60, qass));
+        let questions = widths(&state).1;
+        assert!(drag_edge(&mut state, board_edge, questions as i32 - 24));
+        assert_eq!(widths(&state).1, 24, "the questions' own minimum");
+    }
+
+    /// The divider between the questions and qass drags: those two change and the board keeps its
+    /// columns; qass keeps its 40 and the questions their 24.
+    #[test]
+    fn the_divider_between_the_questions_and_qass_resizes_those_two() {
+        let mut state = qass_with_questions();
+        let (board, questions, qass) = widths(&state);
+        assert!(drag_edge(&mut state, qass_edge, 8));
+        assert_eq!(widths(&state), (board, questions + 8, qass - 8));
+        assert!(drag_edge(&mut state, qass_edge, -20));
+        assert_eq!(widths(&state), (board, questions - 12, qass + 12));
+        let (_, questions, qass) = widths(&state);
+        assert!(!drag_edge(&mut state, qass_edge, qass as i32 - 40 + 1));
+        assert!(!drag_edge(
+            &mut state,
+            qass_edge,
+            -(questions as i32 - 24) - 1
+        ));
+        assert_eq!(widths(&state), (board, questions, qass));
+        assert!(drag_edge(&mut state, qass_edge, qass as i32 - 40));
+        assert_eq!(widths(&state), (board, questions + qass - 40, 40));
+    }
+
+    /// The width rides on the root split with the ratio: it is written with every drag, read back
+    /// as drawn, kept while the questions are closed and kept through a swap of sides.
+    #[test]
+    fn the_questions_width_is_remembered_with_the_layout() {
+        let mut state = qass_with_questions();
+        let shut = widths(&state);
+        assert!(drag_edge(&mut state, board_edge, -12));
+        let wide = widths(&state);
+        assert_eq!(wide.1, shut.1 + 12);
+        let saved = state.split_writes.last().expect("saved").clone();
+        let qoop_runtime::control::Pane::Split { questions, .. } = &saved else {
+            panic!("a split");
+        };
+        assert_eq!(*questions as usize, wide.1);
+        // Another client, or a restart: the tree the daemon kept draws the same widths.
+        let back = Layout::from_pane(&saved);
+        assert_eq!(back.questions, Some(wide.1));
+        state.layouts.insert(9, back);
+        assert_eq!(widths(&state), wide);
+        // Closed and opened again.
+        state.asks.take(Vec::new(), Vec::new());
+        assert!(state.questions().is_none());
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert_eq!(widths(&state), wide);
+        // Sides swapped: each keeps its columns, the questions are cut from the other side.
+        assert!(state.swap_sides(9));
+        assert_eq!(widths(&state), wide);
+        assert!(tile_of(&state, 5).x < tile_of(&state, 4).x, "qass is first");
+    }
+
+    /// With qass first the questions stand on the board's left: the same two edges, mirrored.
+    #[test]
+    fn both_edges_work_with_qass_on_the_left() {
+        let mut state = qass_with_questions();
+        assert!(state.swap_sides(9));
+        let (board, questions, qass) = widths(&state);
+        assert!(drag_edge(&mut state, board_edge, 7));
+        assert_eq!(widths(&state), (board - 7, questions + 7, qass));
+        assert!(drag_edge(&mut state, qass_edge, 5));
+        assert_eq!(widths(&state), (board - 7, questions + 7 - 5, qass + 5));
+        assert!(drag_edge(&mut state, qass_edge, -5));
+        assert!(drag_edge(&mut state, board_edge, -7));
+        assert_eq!(widths(&state), (board, questions, qass));
+    }
+
+    /// A double click on the questions' edge puts their width back and nothing else; on the divider
+    /// it puts the ratio back too. A wide column under the default ratio still resets.
+    #[test]
+    fn a_double_click_resets_the_width_and_the_divider_resets_the_ratio_too() {
+        let mut state = qass_with_questions();
+        let first = widths(&state);
+        let ratio = state.drawn_tree(9).unwrap().root_split();
+        assert!(drag_edge(&mut state, board_edge, -9));
+        assert_eq!(state.drawn_tree(9).unwrap().root_split(), ratio);
+        let at = board_edge(&state);
+        // The drag above pressed this edge a moment ago.
+        state.modes.divider_click = None;
+        assert!(state.split_press(at.0, at.1));
+        assert!(state.modes.split_drag.take().is_some());
+        assert!(state.split_press(at.0, at.1), "the second press");
+        assert_eq!(state.modes.split_drag, None);
+        assert_eq!(widths(&state), first);
+        assert_eq!(state.layouts[&9].questions, None);
+        assert_eq!(
+            state.split_writes.last().map(|p| p.leaves()),
+            Some(vec![4, 5])
+        );
+        // Moved the divider: the questions' edge resets the width only.
+        assert!(drag_edge(&mut state, qass_edge, 6));
+        let moved = state.drawn_tree(9).unwrap().root_split();
+        assert_ne!(moved, ratio);
+        let at = board_edge(&state);
+        state.modes.divider_click = None;
+        assert!(state.split_press(at.0, at.1));
+        assert!(state.modes.split_drag.take().is_some());
+        assert!(state.split_press(at.0, at.1));
+        assert_eq!(state.layouts[&9].questions, None);
+        assert_eq!(
+            state.drawn_tree(9).unwrap().root_split(),
+            moved,
+            "the ratio stays"
+        );
+        // The divider resets both.
+        let at = qass_edge(&state);
+        state.modes.divider_click = None;
+        assert!(state.split_press(at.0, at.1));
+        assert!(state.modes.split_drag.take().is_some());
+        assert!(state.split_press(at.0, at.1));
+        assert_eq!(widths(&state), first);
+        // Two different edges one after the other are not a double click.
+        let (b, a) = (board_edge(&state), qass_edge(&state));
+        state.modes.divider_click = None;
+        assert!(state.split_press(b.0, b.1));
+        assert!(state.split_press(a.0, a.1));
+        assert!(state.modes.split_drag.is_some());
+    }
+
+    /// In resize mode `>` widens and `<` narrows the questions by a step, qass keeping its
+    /// columns, to the limits and no further; with the questions away they do nothing.
+    #[test]
+    fn resize_mode_widens_and_narrows_the_questions() {
+        let mut state = qass_with_questions();
+        let (board, questions, qass) = widths(&state);
+        let step = crate::qass_screen::QUESTIONS_STEP;
+        state.modes.resizing = true;
+        resize_key(&mut state, b">");
+        assert_eq!(widths(&state), (board - step, questions + step, qass));
+        assert!(state.modes.resizing, "the mode stays");
+        assert!(state.split_writes.last().is_some());
+        resize_key(&mut state, b"<");
+        assert_eq!(widths(&state), (board, questions, qass));
+        for _ in 0..40 {
+            resize_key(&mut state, b">");
+        }
+        assert_eq!(widths(&state).0, 60, "the board keeps its minimum");
+        for _ in 0..40 {
+            resize_key(&mut state, b"<");
+        }
+        assert_eq!(widths(&state).1, 24, "the questions keep theirs");
+        assert_eq!(widths(&state).2, qass);
+        assert_eq!(
+            screen::RESIZE_QUESTIONS_HINT
+                .iter()
+                .find(|(k, _)| *k == "<>"),
+            Some(&("<>", "questions"))
+        );
+        // Away: nothing to move, the mode is not left and nothing is saved.
+        state.asks.take(Vec::new(), Vec::new());
+        let kept = state.layouts[&9].questions;
+        resize_key(&mut state, b">");
+        assert!(state.modes.resizing);
+        assert_eq!(state.layouts[&9].questions, kept);
+    }
+
+    /// Zoomed there is no edge to hold, and the width is what it was after the unzoom.
+    #[test]
+    fn a_zoomed_tab_has_no_questions_edge_and_keeps_the_width() {
+        let mut state = qass_with_questions();
+        assert!(drag_edge(&mut state, board_edge, -6));
+        let wide = widths(&state);
+        let at = board_edge(&state);
+        assert!(state.layouts.get_mut(&9).unwrap().toggle_zoom());
+        assert!(state.questions().is_none());
+        assert!(!state.split_press(at.0, at.1), "no edge while zoomed");
+        assert!(state.layouts.get_mut(&9).unwrap().toggle_zoom());
+        assert_eq!(widths(&state), wide);
+    }
+
+    /// The questions' tab on the rail opens them on a click, as the chip does, and carries the same
+    /// count as the header's `[ N questions ]`: before the ask store is read and after.
+    #[test]
+    fn the_questions_tab_opens_them_and_counts_what_the_header_counts() {
+        let mut state = qass_wide();
+        // The tab's text, wide enough (the 14 cell rail) for the word and its count.
+        let tab_count = |state: &State| {
+            let rail = state.rail_paint().expect("folded");
+            let painted = screen::paint(&state.frame());
+            let row = plain(&written_on(&painted, screen::TABS + 1 + rail.y));
+            row.split_whitespace()
+                .find_map(|w| {
+                    w.parse::<String>()
+                        .ok()
+                        .filter(|w| w.chars().all(|c| c.is_ascii_digit()))
+                })
+                .expect("a count on the tab")
+        };
+        let header_count = |state: &State| {
+            let frame = state.frame();
+            let (_, screen) =
+                screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false).unwrap();
+            let chip = screen.chip().expect("the chip");
+            let row = written_on(&screen::paint(&frame), 1 + chip.row);
+            let at = row.find(" question").expect("the chip's words");
+            row[..at].rsplit(' ').next().unwrap().to_string()
+        };
+        // Before the store is read: both fall back to the same count.
+        assert_eq!(state.asks.count(), None);
+        assert_eq!(tab_count(&state), header_count(&state));
+        // Three cards: they light the tab and open nothing; the tab says 3, so does the header.
+        state.asks.take(
+            vec![
+                ask_card(1, "korea"),
+                ask_card(2, "japan"),
+                ask_card(3, "peru"),
+            ],
+            Vec::new(),
+        );
+        assert!(state.questions().is_none());
+        assert_eq!(tab_count(&state), "3");
+        assert_eq!(header_count(&state), "3");
+        let frame = state.frame();
+        let (_, screen) =
+            screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false).unwrap();
+        let painted = screen::paint(&frame);
+        let chip = screen.chip().unwrap();
+        assert!(written_on(&painted, 1 + chip.row).contains("[ 3 questions ]"));
+        // Its words show under the tab (the ember block itself is the rail's own test).
+        assert!(painted.contains("3 questions"), "{painted:?}");
+        // A click on the tab opens them.
+        let rail = state.rail_paint().unwrap();
+        let (col, row) = screen_of(&state, rail.x + 2, rail.y);
+        assert_eq!(state.ask_click(row, col), Some(AskClick::Toggle));
+        assert!(asks_toggle(&mut state) && state.questions().is_some());
+    }
+
+    /// Brought up with `ctrl-a i`, put away with it again: no card brings them back by itself,
+    /// a new one, a rewritten one or one reopened alike; the rail's tab says they wait.
+    /// Brought up, the last answer and its word gone, they go, and a later card stays on the
+    /// rail.
+    #[test]
+    fn no_card_brings_the_put_away_column_back_and_the_last_answer_puts_it_away() {
+        let mut state = qass_wide();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(state.questions().is_none(), "a card opens nothing");
+        assert!(questions_toggle(&mut state), "brought up");
+        assert!(state.asks.focus && state.questions().is_some());
+        assert!(questions_toggle(&mut state), "put away");
+        assert!(!state.asks.focus && state.questions().is_none());
+        assert_eq!(
+            state.pending_focus, None,
+            "the keyboard was in qass already"
+        );
+        let mut rewritten = ask_card(1, "korea");
+        rewritten.body.asks = "Question 1, again?".into();
+        state.asks.take(vec![rewritten.clone()], Vec::new());
+        assert!(state.questions().is_none(), "rewritten: still on the rail");
+        state
+            .asks
+            .take(vec![ask_card(1, "korea"), ask_card(2, "japan")], Vec::new());
+        assert!(state.questions().is_none(), "a new one: still on the rail");
+        assert!(
+            state
+                .rail_paint()
+                .is_some_and(|r| r.tabs().contains(&crate::rail::Pane::Questions))
+        );
+        // Brought up, the cards answered elsewhere: they go, and the next card opens nothing.
+        assert!(questions_toggle(&mut state));
+        state.asks.take(Vec::new(), Vec::new());
+        state.asks_settle();
+        assert!(!state.asks.raised && state.questions().is_none());
+        state.asks.take(vec![ask_card(3, "peru")], Vec::new());
+        assert!(
+            state.questions().is_none(),
+            "a later card stays on the rail"
+        );
+    }
+
+    /// Put away and brought up again, the last answer's word is still seen before they go;
+    /// a `ctrl-a i` refused for want of room leaves nothing raised to pop up later.
+    #[test]
+    fn brought_up_again_the_last_answer_word_is_seen_and_a_refusal_raises_nothing() {
+        let mut state = qass_wide();
+        // The entry settled first: it starts with the questions down.
+        state.asks_settle();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(questions_toggle(&mut state), "up");
+        assert!(questions_toggle(&mut state), "put away");
+        assert!(questions_toggle(&mut state), "up again");
+        state.asks.key(b"a", 1);
+        assert!(state.asks.busy());
+        state.asks.take(Vec::new(), Vec::new());
+        state.asks_settle();
+        assert!(state.questions().is_some(), "the word is still due");
+        // Zoomed: no room, refused.
+        let mut state = qass_wide();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        state.layouts.get_mut(&9).unwrap().zoomed = Some(5);
+        assert!(!questions_toggle(&mut state));
+        assert!(!state.asks.raised);
+        state.layouts.get_mut(&9).unwrap().zoomed = None;
+        assert!(
+            state.questions().is_none(),
+            "nothing pops up once there is room"
+        );
+    }
+
+    /// `ctrl-a i` with nothing waiting brings the questions up all the same (what qass
+    /// handled); in a pane too narrow for the column they come over the board's tile, with
+    /// qass's tile still drawn, brought up there as beside; a card alone opens nothing.
+    #[test]
+    fn ctrl_a_i_brings_the_questions_up_and_a_narrow_pane_shows_them_over_the_board() {
+        let mut state = qass_wide();
+        state.asks.take(Vec::new(), Vec::new());
+        assert!(questions_toggle(&mut state));
+        assert!(state.asks.focus && !state.questions().unwrap().replaces);
+        assert!(questions_toggle(&mut state) && state.questions().is_none());
+        // 180 columns: P 141, side by side, no room for the column.
+        state.cols = 180;
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        let tiles = qass_tiles(&state);
+        assert!(tiles[0].1.y == tiles[1].1.y, "side by side");
+        assert!(state.questions().is_none(), "a card opens nothing");
+        assert!(!state.asks.focus, "a card does not take the keyboard");
+        assert!(questions_toggle(&mut state));
+        let side = state.questions().expect("over the board, brought up");
+        assert!(side.replaces && side.rect == tiles[0].1);
+        assert!(
+            state
+                .rail_paint()
+                .is_some_and(|r| r.tabs().contains(&crate::rail::Pane::Questions)),
+            "over the board's tile they keep their tab, so nothing moves"
+        );
+        let painted = screen::paint(&state.frame());
+        assert!(painted.contains("Question 1?"), "{painted:?}");
+        // Zoomed, nothing of them.
+        state.layouts.get_mut(&9).unwrap().zoomed = Some(5);
+        assert!(state.questions().is_none());
+    }
+
+    /// A press on the board page of qass's tab, the keyboard in qass, is forwarded at once and
+    /// held; let go over qass's pane the page gets the drop, not a release on its edge.
+    #[test]
+    fn a_card_held_on_the_board_and_let_go_over_qass_is_dropped_there() {
+        let state = qass_wide();
+        let tiles = qass_tiles(&state);
+        let (board, qass) = (tiles[0].1, tiles[1].1);
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let at = |r: layout::Rect| {
+            (
+                (screen::TABS + 1 + r.y + 1) as u16,
+                (left + 1 + r.x + 1) as u16,
+            )
+        };
+        assert!(state.board_pane(4) && !state.board_pane(5));
+        let (row, col) = at(board);
+        assert_eq!(state.board_target(4, row, col), None, "on the board itself");
+        let (row, col) = at(qass);
+        assert_eq!(state.board_target(4, row, col), Some(true));
+        assert_eq!(state.board_target(4, 1, 1), Some(false), "on the tab bar");
+        assert_eq!(board_drop(true), b"\x1b]7701;drop=qass\x07".to_vec());
+        assert_eq!(board_drop(false), b"\x1b]7701;drop=none\x07".to_vec());
+    }
+
+    fn tile_of(state: &State, terminal: u32) -> layout::Rect {
+        qass_tiles(state)
+            .into_iter()
+            .find(|(t, _)| *t == terminal)
+            .expect("a tile")
+            .1
+    }
+
+    /// The board and qass change sides with `s` in resize mode: qass keeps its columns and the
+    /// board its own, the questions column stands between them in the mirrored order, the handle
+    /// moves to qass's other edge, the page's reads (the drop, the board pane) follow the
+    /// panes and not their places, and the tab is saved so; again is the identity.
+    #[test]
+    fn swapping_sides_keeps_the_columns_and_the_questions_and_the_handle_follow() {
+        let mut state = qass_wide();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        state.asks.raised = true;
+        let before = qass_tiles(&state);
+        let (board0, qass0) = (before[0].1, before[1].1);
+        let h0 = state.handle().expect("a handle");
+        assert_eq!(
+            (h0.x, h0.vertical),
+            (qass0.x - 1, true),
+            "the divider before qass"
+        );
+        assert_eq!(h0.len, qass0.rows / 2, "the middle half");
+        assert_eq!(h0.y, qass0.y + (qass0.rows - h0.len) / 2, "centred");
+        let questions0 = state.questions().unwrap().rect;
+        assert!(questions0.x > board0.x);
+
+        state.modes.resizing = true;
+        resize_key(&mut state, b"s");
+        assert_eq!(state.layouts[&9].leaves(), [5, 4]);
+        let (qass1, board1) = (tile_of(&state, 5), tile_of(&state, 4));
+        assert_eq!(
+            (qass1.cols, qass1.rows),
+            (qass0.cols, qass0.rows),
+            "qass keeps its size"
+        );
+        assert_eq!((board1.cols, board1.rows), (board0.cols, board0.rows));
+        assert!(qass1.x < board1.x, "qass on the left");
+        let side = state.questions().expect("still open");
+        assert!(!side.replaces);
+        assert!(
+            side.rect.x > qass1.x + qass1.cols && side.rect.x + side.rect.cols < board1.x,
+            "qass, questions, board: {side:?} {qass1:?} {board1:?}"
+        );
+        assert_eq!(side.rect.cols, questions0.cols);
+        let h1 = state.handle().expect("a handle");
+        assert_eq!(
+            (h1.x, h1.vertical, h1.len),
+            (qass1.x + qass1.cols, true, h0.len)
+        );
+        // The page's reads follow the panes.
+        assert!(
+            state.board_tree(&state.layouts[&9]) && state.board_pane(4) && !state.board_pane(5)
+        );
+        assert_eq!(state.qass_leaf(), Some(5));
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let over = |r: layout::Rect| ((screen::TABS + 2 + r.y) as u16, (left + 2 + r.x) as u16);
+        let (row, col) = over(qass1);
+        assert_eq!(
+            state.board_target(4, row, col),
+            Some(true),
+            "qass is where it is drawn"
+        );
+        let (row, col) = over(board1);
+        assert_eq!(state.board_target(4, row, col), None);
+        let saved = state.split_writes.last().expect("saved").leaves();
+        assert_eq!(saved, vec![5, 4]);
+        // Painted once, in ember, on the divider and nowhere else on the panes' edge.
+        let painted = screen::paint(&state.frame());
+        assert!(painted.contains("Question 1?"), "{painted:?}");
+
+        resize_key(&mut state, b"s");
+        assert_eq!(state.layouts[&9].leaves(), [4, 5]);
+        assert_eq!(qass_tiles(&state), before, "swapping twice changes nothing");
+        // Not on another tab: `s` is no key there.
+        let mut other = tiled_state();
+        other.modes.resizing = true;
+        let out = resize_key(&mut other, b"s");
+        assert!(!other.modes.resizing && matches!(out, ModeOutcome::Passthrough(_)));
+        assert_eq!(other.layouts[&1].leaves(), [1, 2]);
+    }
+
+    /// The handle is the middle half of the divider on qass's tab only: a row of it when the
+    /// tab is stacked, none when zoomed, none on another tab.
+    #[test]
+    fn the_handle_stands_on_the_divider_of_qass_tab_only() {
+        let mut state = qass_wide();
+        assert!(state.handle().is_some());
+        state.layouts.get_mut(&9).unwrap().zoomed = Some(5);
+        assert_eq!(state.handle(), None, "zoomed draws no divider");
+        state.layouts.get_mut(&9).unwrap().zoomed = None;
+        state.cols = 120;
+        let tiles = qass_tiles(&state);
+        let (board, qass) = (tiles[0].1, tiles[1].1);
+        assert!(qass.y > board.y, "stacked");
+        let h = state.handle().expect("a horizontal handle");
+        assert_eq!((h.vertical, h.y, h.len), (false, qass.y - 1, qass.cols / 2));
+        assert_eq!(h.x, qass.x + (qass.cols - h.len) / 2);
+        assert_eq!(tiled_state().handle(), None, "another tab");
+    }
+
+    /// The handle is painted on the frame, and is what a frame without it lacks.
+    #[test]
+    fn the_handle_is_painted_on_the_frame() {
+        let state = qass_wide();
+        let h = state.handle().unwrap();
+        let mut frame = state.frame();
+        let painted = screen::paint(&frame);
+        frame.chrome.handle = None;
+        let bare = screen::paint(&frame);
+        assert_ne!(painted, bare, "the handle is the difference: {h:?}");
+    }
+
+    /// The key row of resize mode names `<>` while the questions are beside the board, and not
+    /// when they are away, where the keys do nothing.
+    #[test]
+    fn the_key_row_offers_the_questions_keys_only_while_they_are_beside() {
+        let mut state = qass_with_questions();
+        state.modes.resizing = true;
+        let shown = state.frame().chrome.mode;
+        assert_eq!(shown, Some(("resize", screen::RESIZE_QUESTIONS_HINT)));
+        state.asks.take(Vec::new(), Vec::new());
+        let shown = state.frame().chrome.mode;
+        assert_eq!(shown, Some(("resize", screen::RESIZE_BOARD_HINT)));
+    }
+
+    /// The questions' own edge has a handle where the board's frame meets them, only while they
+    /// are beside the board, and it is painted.
+    #[test]
+    fn the_questions_edge_has_a_handle_beside_the_board_only() {
+        let mut state = qass_with_questions();
+        let h = state.questions_handle().expect("a handle");
+        let tree = state.drawn_tree(9).unwrap();
+        let (x, ..) = tree.questions_edge(pane_area(&state)).unwrap();
+        assert!(h.vertical && h.x == x);
+        let mut frame = state.frame();
+        assert_eq!(frame.chrome.questions_handle, Some(h));
+        let painted = screen::paint(&frame);
+        frame.chrome.questions_handle = None;
+        assert_ne!(painted, screen::paint(&frame), "the handle is painted");
+        state.asks.take(Vec::new(), Vec::new());
+        assert_eq!(state.questions_handle(), None);
+    }
+
+    /// A move of the divider that would turn the page over, or squeeze the board under its
+    /// minimum, is refused whole: the tab stays side by side and the divider stays put, with
+    /// and without the questions column.
+    #[test]
+    fn a_resize_never_turns_qass_tab_over_or_squeezes_the_board() {
+        let mut state = qass_wide();
+        state.modes.resizing = true;
+        for key in [b"H", b"H", b"H", b"H", b"L", b"L", b"L", b"L", b"L", b"H"] {
+            resize_key(&mut state, key);
+            let (dir, _) = state.drawn(&state.layouts[&9]).root_split().unwrap();
+            assert_eq!(dir, layout::Dir::V, "side by side after {key:?}");
+            assert_eq!(state.layouts[&9].root_split().unwrap().0, layout::Dir::V);
+            assert!(tile_of(&state, 4).cols >= crate::qass_screen::BOARD_MIN_COLS);
+            assert!(tile_of(&state, 5).cols >= 40);
+        }
+        // With the questions open the board cannot go under what keeps the column.
+        let mut state = qass_wide();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        state.asks.raised = true;
+        assert!(state.questions().is_some());
+        state.modes.resizing = true;
+        let was = state.layouts[&9].root_split();
+        resize_key(&mut state, b"HHHH");
+        assert!(state.questions().is_some(), "the column stays");
+        assert!(tile_of(&state, 4).cols >= crate::qass_screen::BOARD_MIN_COLS);
+        assert!(state.layouts[&9].root_split().is_some() && was.is_some());
+    }
+
+    /// Dragging the divider is kept (the tab is queued to be saved on the release), and a
+    /// second press on it within a double click's time puts the default shares back.
+    #[test]
+    fn the_divider_is_saved_after_a_drag_and_a_double_click_resets_it() {
+        let mut state = qass_wide();
+        let qass = tile_of(&state, 5);
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let col = (left + 1 + qass.x - 1) as u16;
+        let row = (screen::TABS + 1 + qass.y + qass.rows / 2) as u16;
+        assert!(state.split_press(col, row));
+        assert!(state.split_motion(col - 8, row));
+        let moved = tile_of(&state, 5).cols;
+        assert_eq!(moved, qass.cols + 8);
+        state.modes.split_drag = None;
+        // The release saves it: what the release arm does.
+        state.save_split(9);
+        let saved = state.split_writes.last().expect("queued").clone();
+        assert_eq!(saved.leaves(), vec![4, 5]);
+        // A single press and then another far later: no reset.
+        state.modes.divider_click = None;
+        let col = (left + 1 + tile_of(&state, 5).x - 1) as u16;
+        assert!(state.split_press(col, row));
+        assert_eq!(tile_of(&state, 5).cols, moved, "one press resets nothing");
+        // The second press at once: back to the default, nothing held.
+        assert!(state.split_press(col, row));
+        assert_eq!(state.modes.split_drag, None);
+        assert_eq!(tile_of(&state, 5).cols, qass.cols, "the default shares");
+        let (dir, ratio) = state.layouts[&9].root_split().unwrap();
+        assert_eq!(dir, layout::Dir::V);
+        assert!((ratio - 0.70).abs() < 0.01, "{ratio}");
     }
 
     /// Another tab's divider keeps its own way: a second quick press still holds it.
@@ -24027,6 +26785,454 @@ mod tests {
         state.modes.split_drag = None;
         assert!(state.split_press(col, row));
         assert!(state.modes.split_drag.is_some());
+    }
+
+    /// qass's title can be pressed under its header; dropped on the outer edge of the board it
+    /// swaps the sides, on any other edge or off the tab it only says they stay together.
+    #[test]
+    fn qass_title_carried_to_the_boards_outer_edge_swaps_and_nothing_else_moves_it() {
+        let mut state = qass_wide();
+        let qass = tile_of(&state, 5);
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let title_row = (screen::TABS + 1 + qass.y - 1) as u16;
+        let title_col = (left + 1 + qass.x + 2) as u16;
+        assert_eq!(state.title_at_screen(title_row, title_col), Some(5));
+        let mut request = 0;
+        // The inner edge, the top edge and the tab bar: refused, nothing moves.
+        for drop in [
+            RowDrop::Pane(4, layout::Move::Right),
+            RowDrop::Pane(4, layout::Move::Up),
+            RowDrop::Bar {
+                space: 9,
+                place: Place::End,
+            },
+        ] {
+            assert_eq!(drop_row(&mut state, 5, drop, &mut request, true), None);
+            assert_eq!(state.layouts[&9].leaves(), [4, 5]);
+            assert!(
+                state
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("stay together"))
+            );
+        }
+        assert!(
+            drop_hint(
+                &state,
+                Source::Pane(5),
+                Some(RowDrop::Pane(4, layout::Move::Up))
+            )
+            .contains("stay together")
+        );
+        assert_eq!(
+            drop_hint(
+                &state,
+                Source::Pane(5),
+                Some(RowDrop::Pane(4, layout::Move::Left))
+            ),
+            "swap qass and the board"
+        );
+        assert_eq!(
+            drop_row(
+                &mut state,
+                5,
+                RowDrop::Pane(4, layout::Move::Left),
+                &mut request,
+                true
+            ),
+            None
+        );
+        assert_eq!(state.layouts[&9].leaves(), [5, 4], "swapped");
+        assert_eq!(state.split_writes.last().unwrap().leaves(), vec![5, 4]);
+        // The board's title: qass's inner edge (the right one now) changes nothing, its outer
+        // edge (the left one) swaps back.
+        drop_row(
+            &mut state,
+            4,
+            RowDrop::Pane(5, layout::Move::Right),
+            &mut request,
+            true,
+        );
+        assert_eq!(state.layouts[&9].leaves(), [5, 4]);
+        drop_row(
+            &mut state,
+            4,
+            RowDrop::Pane(5, layout::Move::Left),
+            &mut request,
+            true,
+        );
+        assert_eq!(state.layouts[&9].leaves(), [4, 5]);
+    }
+
+    /// The wheel over the board page reaches it whichever pane has the keyboard, and only when
+    /// that page asked for the mouse: a board that is a plain shell gets nothing, the pointer
+    /// over qass or the tab bar is not the board's.
+    #[test]
+    fn the_wheel_over_the_board_page_reaches_it_while_the_keyboard_is_in_qass() {
+        let mut state = qass_wide();
+        let tiles = qass_tiles(&state);
+        let (board, qass) = (tiles[0].1, tiles[1].1);
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let at = |r: layout::Rect, dy: usize, dx: usize| {
+            (
+                (screen::TABS + 1 + r.y + dy + 1) as u16,
+                (left + 1 + r.x + dx + 1) as u16,
+            )
+        };
+        assert_ne!(state.focused, 4, "the keyboard is not on the board");
+        let (row, col) = at(board, 3, 7);
+        assert_eq!(
+            state.board_wheel(row, col, false),
+            None,
+            "a shell: no report"
+        );
+        let mut asked = snapshot_with_behind(0);
+        asked.modes.mouse_reporting = true;
+        state.snapshots.insert(4, asked);
+        assert_eq!(
+            state.board_wheel(row, col, false),
+            Some((4, b"\x1b[<65;9;5M".to_vec()))
+        );
+        assert_eq!(
+            state.board_wheel(row, col, true),
+            Some((4, b"\x1b[<64;9;5M".to_vec()))
+        );
+        let (row, col) = at(qass, 3, 7);
+        assert_eq!(state.board_wheel(row, col, false), None, "over qass");
+        assert_eq!(state.board_wheel(1, 1, false), None, "over the tab bar");
+    }
+
+    /// Put away by the owner, the questions stay away while an answer is held or its word is
+    /// up; putting them away gives the keyboard back to the pane it came from (the board here),
+    /// and their last card answered gives it to qass's terminal.
+    #[test]
+    fn leaving_the_questions_hides_them_over_a_sent_answer_and_gives_the_keyboard_back() {
+        let mut state = qass_wide();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        state.focused = 4;
+        state.layouts.get_mut(&9).unwrap().focus_terminal(4);
+        assert!(
+            questions_toggle(&mut state) && state.asks.focus,
+            "brought up, in"
+        );
+        state.asks.key(b"a", 1);
+        assert!(state.asks.busy());
+        assert!(questions_toggle(&mut state));
+        assert!(
+            state.asks.busy(),
+            "the answer went, and its word is still due"
+        );
+        assert!(
+            state.questions().is_none(),
+            "put away wins over the word on screen"
+        );
+        assert_eq!((state.pending_focus, state.focused), (None, 4));
+        // The last card going while the keyboard is in them does the same.
+        let mut state = qass_wide();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        state.focused = 4;
+        state.layouts.get_mut(&9).unwrap().focus_terminal(4);
+        questions_toggle(&mut state);
+        assert!(state.asks_focused());
+        state.asks.take(Vec::new(), Vec::new());
+        state.asks_settle();
+        assert!(!state.asks.focus);
+        assert_eq!(state.pending_focus, Some(5));
+    }
+
+    /// A card held on the board is let go when the keyboard goes elsewhere.
+    #[test]
+    fn the_board_lets_go_of_a_held_card_when_the_keyboard_leaves_it() {
+        let mut state = qass_wide();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        state.board_drag = Some(4);
+        state.drop_hover = Some(5);
+        state.forwarded_press = true;
+        state.focused = 4;
+        let out = move_focus(&mut state, 1, &mut seq, &mut seqs)
+            .unwrap()
+            .unwrap();
+        assert_eq!((state.board_drag, state.drop_hover), (None, None));
+        assert!(!state.forwarded_press);
+        assert!(!out.is_empty());
+        assert!(
+            seqs.contains_key(&4),
+            "the board page is written to: told it lost the card"
+        );
+    }
+
+    /// Bringing the questions up (they may cover the board) lets go of a card held there.
+    #[test]
+    fn the_questions_let_go_of_a_card_held_on_the_board() {
+        let mut state = qass_wide();
+        state.board_drag = Some(4);
+        state.forwarded_press = true;
+        questions_toggle(&mut state);
+        assert_eq!((state.board_drag, state.board_owed), (None, Some(4)));
+        assert!(!state.forwarded_press);
+    }
+
+    /// The keyboard leaving for an empty or asleep space ends a card held on the board, and
+    /// the page is owed the word.
+    #[test]
+    fn leaving_for_an_empty_space_lets_go_of_a_held_card() {
+        let mut state = qass_wide();
+        state.board_drag = Some(4);
+        state.forwarded_press = true;
+        state.drop_hover = Some(5);
+        unfocus(&mut state, "nothing here", &mut 0).unwrap();
+        assert_eq!((state.board_drag, state.drop_hover), (None, None));
+        assert!(!state.forwarded_press);
+        assert_eq!(state.board_owed, Some(4));
+    }
+
+    /// A refused change on qass's tab puts back the direction it was saved with: looking is
+    /// never saved, only a change that happened.
+    #[test]
+    fn a_refused_change_on_qass_tab_keeps_its_saved_direction() {
+        let mut state = qass_split_window();
+        state.cols = 200;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let saved = state.layouts[&9].root_split();
+        // Zoomed, no split is placed.
+        state.layouts.get_mut(&9).unwrap().zoomed = Some(5);
+        let area = pane_area(&state);
+        assert!(!state.change_shown(9, |l| l.split_placeholder(5, layout::Dir::V, area)));
+        assert_eq!(state.layouts[&9].root_split(), saved);
+    }
+
+    /// qass's split tab is qass's screen as a whole: the header spans the pane, the board and
+    /// qass's terminal share what is under it (board on top), wherever the keyboard is in the
+    /// tab; their ptys keep that size when the person looks away; `ctrl-a z` on the board gives
+    /// it the whole pane, header and all, and back.
+    #[test]
+    fn the_header_sits_over_qass_split_and_a_zoom_on_the_board_takes_the_pane() {
+        let mut state = qass_split_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        let (cols, rows) = screen::pane_size_for(
+            state.cols,
+            state.lines,
+            state.collapsed,
+            0,
+            state.sidebar_width,
+        );
+        let band = crate::qass_screen::Plan::band(cols as usize, rows as usize)
+            .unwrap()
+            .header
+            .rows();
+        assert_eq!(band, 4, "the full header, two of its rows in the tab bar's");
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let before = state.sized.clone();
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert_eq!(state.focused, 5);
+        assert!(!state.on_qass_screen() && state.qass_split() && state.qass_header());
+        assert_eq!(state.sized, before, "looking at qass resizes nothing");
+        let tiles = qass_tiles(&state);
+        let (board, qass) = (tiles[0].1, tiles[1].1);
+        assert_eq!((tiles[0].0, tiles[1].0), (4, 5));
+        assert!(board.y > band && qass.y > board.y + board.rows, "{tiles:?}");
+        assert_eq!(
+            state.sized.get(&4),
+            Some(&(board.cols as u16, board.rows as u16))
+        );
+        assert_eq!(focused_rect(&state), qass);
+        let frame = state.frame();
+        assert!(frame.chrome.qass.is_some() && frame.tiles.len() == 2);
+        let painted = screen::paint(&frame);
+        assert!(
+            painted.contains("qass") && painted.contains("need you"),
+            "{painted:?}"
+        );
+        // The keyboard on the board: still qass's screen.
+        state.focused = 4;
+        state.layouts.get_mut(&9).unwrap().focus_terminal(4);
+        assert!(state.qass_split());
+        // Zoomed, the board has the whole pane and no header.
+        let (changed, _) = zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(changed && !state.qass_header());
+        assert_eq!(pane_area(&state).y, 0);
+        assert_eq!(focused_rect(&state).rows, rows as usize - 2, "in its frame");
+        assert_eq!(state.sized.get(&4), Some(&(cols - 2, rows - 2)));
+        assert!(state.frame().chrome.qass.is_none());
+        let (changed, _) = zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(changed && state.qass_header());
+        assert_eq!(
+            state.sized.get(&4),
+            Some(&(board.cols as u16, board.rows as u16))
+        );
+        // Away from qass: the owner's tabs are the whole pane, qass's panes keep their size.
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(!state.qass_header());
+        assert_eq!(pane_area(&state).y, 0);
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(qass.cols as u16, qass.rows as u16))
+        );
+    }
+
+    /// qass's pty is the inside of its box, the owner's agents keep the whole pane, and
+    /// going to qass and back reflows nobody.
+    #[test]
+    fn qass_is_sized_to_its_box_and_nobody_else_is() {
+        let mut state = qass_window();
+        let ((cols, rows), inner) = qass_cells(&state);
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut state, &mut seqs).unwrap();
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(inner.cols as u16, inner.rows as u16))
+        );
+        // The owner's agents: the pane inside its frame, less each agent pane's rail.
+        let rail = (crate::tabq::WIDE + 1) as u16;
+        let framed = (cols - 2 - rail, rows - 2);
+        assert_eq!(state.sized.get(&1), Some(&framed));
+        assert_eq!(state.sized.get(&3), Some(&framed));
+        assert!(inner.rows < rows as usize && inner.cols < cols as usize);
+
+        let before = state.sized.clone();
+        let mut seq = 0;
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(state.on_qass_screen());
+        assert_eq!(state.sized, before, "looking at qass resizes nothing");
+        assert_eq!(size_terminals(&mut state, &mut seqs).unwrap(), None);
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(!state.on_qass_screen());
+        assert_eq!(state.sized, before, "and neither does coming back");
+        assert_eq!(focused_rect(&state), state.lone_rect(state.focused));
+    }
+
+    /// The box is qass's agent alone: a shell opened in its space, or a split there, is the
+    /// ordinary pane.
+    #[test]
+    fn only_qass_agent_alone_is_in_the_box() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        assert!(!state.on_qass_screen(), "the owner's tab is a plain pane");
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(state.on_qass_screen());
+        let (_, inner) = qass_cells(&state);
+        assert_eq!(focused_rect(&state), inner);
+
+        let mut shell = agent(6, 9, "zsh", "idle");
+        shell.agent = false;
+        state.rows.push(shell);
+        state.focused = 6;
+        assert!(!state.on_qass_screen(), "a shell in qass's space");
+        assert_eq!(focused_rect(&state), layout::framed(pane_area(&state)));
+
+        state.focused = 5;
+        let mut layout = Layout::single(5);
+        let area = pane_area(&state);
+        assert!(layout.split_placeholder(5, layout::Dir::V, area));
+        assert!(layout.bind_placeholder(6));
+        state.layouts.insert(9, layout);
+        assert!(!state.on_qass_screen(), "a split in qass's space");
+        let (_, inner) = qass_cells(&state);
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let tile = state
+            .layouts
+            .get(&9)
+            .unwrap()
+            .tile_rects(pane_area(&state))
+            .into_iter()
+            .find(|(t, _)| *t == 5)
+            .map(|(_, r)| (r.cols as u16, r.rows as u16))
+            .unwrap();
+        assert_ne!(tile, (inner.cols as u16, inner.rows as u16));
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&tile),
+            "a split tile is its tile, as before"
+        );
+        // A split still waiting for its terminal is a split too.
+        state.layouts.remove(&9);
+        let mut layout = Layout::single(5);
+        assert!(layout.split_placeholder(5, layout::Dir::V, pane_area(&state)));
+        state.layouts.insert(9, layout);
+        assert!(!state.on_qass_screen(), "a split waiting for its terminal");
+        state.layouts.remove(&9);
+        state.focused = 5;
+        assert!(state.on_qass_screen());
+        // The pointer far outside the box is held on its edge, never past it.
+        assert_eq!(clamped_to_focused(&state, 1, 1), (0, 0));
+        assert_eq!(
+            clamped_to_focused(&state, state.lines, state.cols),
+            (inner.rows - 1, inner.cols - 1)
+        );
+    }
+
+    /// A click inside the box is a cell of qass's terminal; the header and the frame are not.
+    #[test]
+    fn a_click_in_the_box_lands_on_qass_terminal_and_the_frame_does_not() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let (_, inner) = qass_cells(&state);
+        let first_col = screen::left_for(state.cols, state.collapsed, state.sidebar_width) + 1;
+        let screen_row = |y: usize| (screen::TABS + 1 + y) as u16;
+        let screen_col = |x: usize| (first_col + x) as u16;
+        // The first cell inside the box is cell (0, 0) of the terminal.
+        assert_eq!(
+            state.in_pane(screen_row(inner.y), screen_col(inner.x)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            state.in_pane(
+                screen_row(inner.y + inner.rows - 1),
+                screen_col(inner.x + inner.cols - 1)
+            ),
+            Some((inner.rows - 1, inner.cols - 1))
+        );
+        // The border, the header and the cell after the last column are qass's frame.
+        assert_eq!(
+            state.in_pane(screen_row(inner.y - 1), screen_col(inner.x)),
+            None
+        );
+        assert_eq!(state.in_pane(screen_row(0), screen_col(inner.x)), None);
+        assert_eq!(
+            state.in_pane(screen_row(inner.y), screen_col(inner.x - 1)),
+            None
+        );
+        assert_eq!(
+            state.in_pane(screen_row(inner.y), screen_col(inner.x + inner.cols)),
+            None
+        );
+    }
+
+    /// `ctrl-a z` on qass's screen puts the header away and gives the terminal the whole
+    /// pane, and again brings it back; the pty follows both.
+    #[test]
+    fn zoom_on_qass_screen_swaps_the_header_for_room() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let (_, boxed) = qass_cells(&state);
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(boxed.cols as u16, boxed.rows as u16))
+        );
+        let (changed, out) = zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(changed && out.is_some());
+        assert!(state.qass_ui.zoomed);
+        let (_, zoomed) = qass_cells(&state);
+        assert!(zoomed.rows > boxed.rows && zoomed.y < boxed.y);
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(zoomed.cols as u16, zoomed.rows as u16))
+        );
+        assert_eq!(focused_rect(&state), zoomed);
+        let (changed, _) = zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(changed && !state.qass_ui.zoomed);
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(boxed.cols as u16, boxed.rows as u16))
+        );
+        // Elsewhere there is nothing to zoom, as before.
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let (changed, _) = zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(!changed);
+        assert!(!state.qass_ui.zoomed);
     }
 
     /// A painted frame as the text a person reads: the cursor moves and the colours gone.
@@ -24136,6 +27342,634 @@ mod tests {
         assert_eq!(sidebar(&state), before, "inks too");
     }
 
+    /// The left sidebar is the owner's, and stays exactly as it is: whatever the panes do (the
+    /// questions folded or beside the board, the board or qass folded, the rail dragged to its
+    /// narrowest and widest, a stacked or a swapped tab, a zoom, 200 or 120 columns), the cells of
+    /// its columns are the same, row for row.
+    #[test]
+    fn the_left_sidebar_paints_the_same_whatever_the_panes_do() {
+        for cols in [200u16, 120] {
+            let mut state = qass_wide();
+            state.cols = cols;
+            let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+            let rows = state.lines as usize - screen::STATUS;
+            let sidebar = |state: &State| {
+                let grid = cells_of(
+                    &screen::paint(&state.frame()),
+                    state.cols as usize,
+                    state.lines as usize,
+                );
+                grid.into_iter()
+                    .take(rows)
+                    // Without the rule, which is also the panes' left side.
+                    .map(|row| row[..left - 1].iter().collect::<String>())
+                    .collect::<Vec<_>>()
+            };
+            let base = sidebar(&state);
+            assert!(
+                base.iter().any(|row| row.trim().len() > 3),
+                "the sidebar has something in it"
+            );
+            type Change = Box<dyn Fn(&mut State)>;
+            // Cards about no agent of the column: an agent's own count beside its name is the
+            // owner's asked change (left-sidebar.md, 2026-11-18); here only the panes move.
+            let variants: Vec<(&str, Change)> = vec![
+                (
+                    "a card brought up beside the board",
+                    Box::new(|s| {
+                        s.asks.take(vec![ask_about_nothing(1, "korea")], Vec::new());
+                        s.asks.raised = true;
+                    }),
+                ),
+                (
+                    "three waiting on the rail",
+                    Box::new(|s| {
+                        s.asks.take(
+                            vec![
+                                ask_about_nothing(1, "a"),
+                                ask_about_nothing(2, "b"),
+                                ask_about_nothing(3, "c"),
+                            ],
+                            Vec::new(),
+                        );
+                    }),
+                ),
+                (
+                    "the board folded",
+                    Box::new(|s| s.qass_ui.fold = Some(crate::qass_screen::Fold::Board)),
+                ),
+                (
+                    "qass folded",
+                    Box::new(|s| s.qass_ui.fold = Some(crate::qass_screen::Fold::Qass)),
+                ),
+                (
+                    "the rail at its narrowest",
+                    Box::new(|s| s.qass_ui.rail = Some(crate::rail::MIN)),
+                ),
+                (
+                    "the rail at its widest",
+                    Box::new(|s| s.qass_ui.rail = Some(crate::rail::MAX)),
+                ),
+                (
+                    "the sides swapped",
+                    Box::new(|s| {
+                        let area = pane_area(s);
+                        s.layouts.get_mut(&9).unwrap().swap_root(area);
+                    }),
+                ),
+                (
+                    "zoomed",
+                    Box::new(|s| s.layouts.get_mut(&9).unwrap().zoomed = Some(5)),
+                ),
+                (
+                    "the agents' tabs without their rails",
+                    Box::new(|s| s.asks.unsupported = true),
+                ),
+            ];
+            for (what, apply) in variants {
+                let mut state = qass_wide();
+                state.cols = cols;
+                apply(&mut state);
+                assert_eq!(
+                    sidebar(&state),
+                    base,
+                    "{what} at {cols} columns moved the sidebar"
+                );
+            }
+        }
+    }
+
+    /// The sidebar's cells as a person's terminal shows them: per row, each cell's character after
+    /// the escape in force on it (written only where it changes), columns `0..left - 1`, rows
+    /// above the status rows. The rule in the last column is left out: it is also the panes'
+    /// left side, joined to their lines and in the focused pane's ink. Links and other strings are skipped; the version is masked, so a release
+    /// of the same length leaves the bytes alone.
+    fn sidebar_bytes(painted: &str, cols: usize, lines: usize, left: usize) -> Vec<String> {
+        let mut grid = vec![vec![(' ', String::new()); cols]; lines];
+        let (mut r, mut c, mut sgr) = (0usize, 0usize, String::new());
+        let mut chars = painted.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                if chars.peek() == Some(&']') {
+                    while let Some(ch) = chars.next() {
+                        if ch == '\x07' || (ch == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                let mut seq = String::new();
+                for ch in chars.by_ref() {
+                    seq.push(ch);
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                if let Some(at) = seq.strip_prefix('[').and_then(|s| s.strip_suffix('H')) {
+                    let mut it = at.split(';').map(|n| n.parse::<usize>().unwrap_or(1));
+                    r = it.next().unwrap_or(1).saturating_sub(1);
+                    c = it.next().unwrap_or(1).saturating_sub(1);
+                } else if seq.ends_with('m') {
+                    if seq == "[m" || seq.starts_with("[0") {
+                        sgr.clear();
+                    }
+                    sgr.push_str(&seq);
+                }
+                continue;
+            }
+            if let Some(cell) = grid.get_mut(r).and_then(|row| row.get_mut(c)) {
+                *cell = (ch, sgr.clone());
+            }
+            c += crate::width::columns(ch).max(1);
+        }
+        let version = sidebar::VERSION;
+        grid.into_iter()
+            .take(lines - screen::STATUS)
+            .map(|row| {
+                let mut out = String::new();
+                let mut was = None;
+                for (ch, sgr) in &row[..left.saturating_sub(1)] {
+                    if was != Some(sgr) {
+                        out.push_str(&format!("<{sgr}>"));
+                        was = Some(sgr);
+                    }
+                    out.push(*ch);
+                }
+                out.replace(version, &"#".repeat(version.len()))
+            })
+            .collect()
+    }
+
+    /// FNV-1a: a hash that stays the same across Rust releases, for bytes pinned in a test.
+    fn fnv(text: &str) -> u64 {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// A zoomed pane says so on the notice row with the key that shows every pane again; the
+    /// note goes with the zoom.
+    #[test]
+    fn a_zoomed_pane_says_so_on_the_notice_row() {
+        let mut state = qass_wide();
+        let notice =
+            |state: &State| written_on(&screen::paint(&state.frame()), state.lines as usize - 1);
+        state.layouts.get_mut(&9).unwrap().zoomed = Some(5);
+        let said = notice(&state);
+        assert!(said.contains("zoomed") && said.contains(" z "), "{said}");
+        state.layouts.get_mut(&9).unwrap().zoomed = None;
+        assert!(!notice(&state).contains("zoomed"));
+    }
+
+    /// qass's page beside the open column of an 80 and a 60 column window. A resize never moves
+    /// the keyboard: qass keeps it and the board rests on its tab. `ctrl-a T` opens the board in
+    /// the room with the keyboard, the questions open over it with every word and option, and
+    /// close back to the board. The column keeps its fold whatever opens, and a resize back
+    /// gives the layout the same keys give at that size.
+    #[test]
+    fn a_narrow_qass_page_opens_the_board_and_the_questions_beside_the_open_column() {
+        const ASKS: &str = "Which PR lands first, and may the agent remove the old branch?";
+        let size = |state: &mut State, cols: u16, lines: u16| {
+            (state.cols, state.lines) = (cols, lines);
+            state.sidebar_width = sidebar::opening_width(cols);
+        };
+        // qass's tab at `cols` x `lines`: the board opened with `ctrl-a T`, then the questions.
+        let opened = |cols: u16, lines: u16| {
+            let mut state = qass_wide();
+            state.palette = None;
+            state.qass_ui.fold = None;
+            assert_eq!(state.focused, 5, "the keyboard in qass");
+            size(&mut state, cols, lines);
+            assert_eq!(state.focused, 5, "a resize leaves the keyboard at {cols}");
+            if cols < 100 {
+                assert_eq!(state.folded(), Some(4), "the board rests at {cols}");
+            }
+            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+            assert!(fold_key(&mut state), "ctrl-a T");
+            if let Some(next) = state.pending_focus.take() {
+                move_focus(&mut state, next, &mut seq, &mut seqs).unwrap();
+            }
+            let mut card = ask_card(1, "korea");
+            card.body.asks = ASKS.into();
+            state.asks.take(vec![card], Vec::new());
+            state
+        };
+        for (cols, lines) in [(80u16, 24u16), (60, 24)] {
+            let mut state = opened(cols, lines);
+            assert_eq!(state.folded(), Some(5), "qass rests on its tab at {cols}");
+            assert_eq!(state.focused, 4, "the keyboard goes with the board");
+            let board = tile_of(&state, 4);
+            assert!(board.cols >= 20 && board.rows >= 8, "{cols}: {board:?}");
+            asks_toggle(&mut state);
+            let painted = cells_of(
+                &screen::paint(&state.frame()),
+                cols as usize,
+                lines as usize,
+            )
+            .iter()
+            .map(|row| row.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+            assert!(state.questions().is_some(), "{cols}: {:?}", state.message);
+            assert!(!state.collapsed, "the column keeps its fold at {cols}");
+            for word in ASKS.split(' ').chain(["[1]", "[2]"]) {
+                assert!(painted.contains(word), "{word:?} at {cols}:\n{painted}");
+            }
+            // Closed, the keyboard is back on the board it came from.
+            assert!(asks_toggle(&mut state));
+            assert!(
+                state.pending_focus.is_none() && state.focused == 4,
+                "{cols}"
+            );
+            assert_eq!(state.folded(), Some(5));
+            assert!(!state.collapsed);
+            // `ctrl-a T` from the board opens qass with the keyboard at once; again, the board.
+            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+            for (focused, rests) in [(5, 4), (4, 5)] {
+                assert!(fold_key(&mut state));
+                if let Some(next) = state.pending_focus.take() {
+                    move_focus(&mut state, next, &mut seq, &mut seqs).unwrap();
+                }
+                assert_eq!(
+                    (state.focused, state.folded()),
+                    (focused, Some(rests)),
+                    "{cols}"
+                );
+            }
+            // Open again and resized to 120x40: as the same keys leave it at 120x40.
+            asks_toggle(&mut state);
+            size(&mut state, 120, 40);
+            let mut wide = opened(120, 40);
+            asks_toggle(&mut wide);
+            assert_eq!(state.focused, wide.focused, "{cols}");
+            assert_eq!(state.folded(), wide.folded(), "{cols}");
+            assert_eq!(state.questions(), wide.questions(), "{cols}");
+        }
+    }
+
+    /// The left sidebar is the owner's and frozen: its cells, characters and inks both, are
+    /// pinned to the bytes recorded at d4a3518 (origin/main before the 2026-10-27 overhaul) for
+    /// qass's page and a terminal page, open and folded, at four sizes, dark, light and without
+    /// colour. A palette change that reaches the sidebar fails here even when it moves every
+    /// frame alike, which the test above cannot see. Its rule is left out since 2026-10-28, when
+    /// it became the panes' left side too; the hashes were taken again from the code before that
+    /// change, so they still pin the d4a3518 bytes of every other column.
+    #[test]
+    fn the_left_sidebar_keeps_the_bytes_it_had_at_d4a3518() {
+        use crate::colorlevel::{Level, TEST_LEVEL};
+        use crate::theme::TEST_LIGHT;
+        const PINNED: &[(&str, u64)] = &[
+            ("qass 200x60 open dark", 0x039e53c74e224f44),
+            ("qass 200x60 folded dark", 0x5c63fce590019b7d),
+            ("qass 120x40 open dark", 0x9d5430d406a003c0),
+            ("qass 120x40 folded dark", 0xb8819bd326634501),
+            ("qass 80x24 open dark", 0x89abb9002c8359dc),
+            ("qass 80x24 folded dark", 0xe7ce5b51b3ba2c11),
+            ("qass 60x24 open dark", 0xf74d831d17e345f0),
+            ("qass 60x24 folded dark", 0xe7ce5b51b3ba2c11),
+            ("terminal 200x60 open dark", 0x7326d162f429bd9e),
+            ("terminal 200x60 folded dark", 0x8ba592bd24d453b8),
+            ("terminal 120x40 open dark", 0xff60084cb5b94ffa),
+            ("terminal 120x40 folded dark", 0xf5f8876c8e0e6d94),
+            ("terminal 80x24 open dark", 0x374de3e8d1134472),
+            ("terminal 80x24 folded dark", 0x6a480b3714ea7124),
+            ("terminal 60x24 open dark", 0x03663f54ee2de29e),
+            ("terminal 60x24 folded dark", 0x6a480b3714ea7124),
+            ("agent picked 200x60 open dark", 0x74a67686bf790738),
+            ("agent picked 200x60 folded dark", 0x8d6531bd9fb67418),
+            ("agent picked 120x40 open dark", 0xdc5f15cde15d40a4),
+            ("agent picked 120x40 folded dark", 0xecdde9f98d5e0f74),
+            ("agent picked 80x24 open dark", 0xa6bbeb2904414fae),
+            ("agent picked 80x24 folded dark", 0x91a55b02a39e2c84),
+            ("agent picked 60x24 open dark", 0xc9d5bb9e62ddaa4a),
+            ("agent picked 60x24 folded dark", 0x91a55b02a39e2c84),
+            ("space picked 200x60 open dark", 0x352640cca90eaef5),
+            ("space picked 200x60 folded dark", 0xfc99f80d50e88753),
+            ("space picked 120x40 open dark", 0x31958585ab54a679),
+            ("space picked 120x40 folded dark", 0xba166e8e16f56b27),
+            ("space picked 80x24 open dark", 0x1e9139d1df7b6524),
+            ("space picked 80x24 folded dark", 0x015cc0c105b41377),
+            ("space picked 60x24 open dark", 0x12788dda150f00a0),
+            ("space picked 60x24 folded dark", 0x015cc0c105b41377),
+            ("qass 200x60 open light", 0xa9009fc44565ca38),
+            ("qass 200x60 folded light", 0x1d2020dcc648fc8f),
+            ("qass 120x40 open light", 0x8785c6454ba5c954),
+            ("qass 120x40 folded light", 0xe66c49ccec4ab8db),
+            ("qass 80x24 open light", 0x3cd310dc60733a0c),
+            ("qass 80x24 folded light", 0x00d64a2dea52b3eb),
+            ("qass 60x24 open light", 0x07c19183717a3b43),
+            ("qass 60x24 folded light", 0x00d64a2dea52b3eb),
+            ("terminal 200x60 open light", 0x337dd1aeabcb52fa),
+            ("terminal 200x60 folded light", 0x31d4b2babfe93908),
+            ("terminal 120x40 open light", 0x0fb0377f37e41436),
+            ("terminal 120x40 folded light", 0x0ccce3e8da7523d4),
+            ("terminal 80x24 open light", 0x55cfab3707775082),
+            ("terminal 80x24 folded light", 0x8a0faf03218351e4),
+            ("terminal 60x24 open light", 0x5762d37e50ec0c35),
+            ("terminal 60x24 folded light", 0x8a0faf03218351e4),
+            ("agent picked 200x60 open light", 0x7d23c8b1019530c0),
+            ("agent picked 200x60 folded light", 0xc99b486581a8c8cc),
+            ("agent picked 120x40 open light", 0xc85216a2063ea114),
+            ("agent picked 120x40 folded light", 0xbacda406c67c0a68),
+            ("agent picked 80x24 open light", 0xcfac3cbb1665ad21),
+            ("agent picked 80x24 folded light", 0x700467d267c1fb78),
+            ("agent picked 60x24 open light", 0xff094d28b749ddb0),
+            ("agent picked 60x24 folded light", 0x700467d267c1fb78),
+            ("space picked 200x60 open light", 0xcaaf9cdf9274cefa),
+            ("space picked 200x60 folded light", 0x7c7cd2ebecd64a81),
+            ("space picked 120x40 open light", 0x0dea1fddeae8881e),
+            ("space picked 120x40 folded light", 0x096b50c0cb57e43d),
+            ("space picked 80x24 open light", 0x238bbb5d7b724af2),
+            ("space picked 80x24 folded light", 0x80ba3cc76ac764cd),
+            ("space picked 60x24 open light", 0xf2bec938fc142a1d),
+            ("space picked 60x24 folded light", 0x80ba3cc76ac764cd),
+            ("qass 200x60 open mono", 0xe060f7003fe214af),
+            ("qass 200x60 folded mono", 0x919634c62394fde7),
+            ("qass 120x40 open mono", 0xd25845b8dfc33d0f),
+            ("qass 120x40 folded mono", 0x03d75c6ef8ce33d7),
+            ("qass 80x24 open mono", 0xb85b48e6507c3a09),
+            ("qass 80x24 folded mono", 0x215e5d58874fa097),
+            ("qass 60x24 open mono", 0x1975c71f6740daf9),
+            ("qass 60x24 folded mono", 0x215e5d58874fa097),
+            ("terminal 200x60 open mono", 0x620576d91e588f0f),
+            ("terminal 200x60 folded mono", 0x7af61d9696861c5b),
+            ("terminal 120x40 open mono", 0xaafb9f2157f57fef),
+            ("terminal 120x40 folded mono", 0xb82597383e9999ab),
+            ("terminal 80x24 open mono", 0x7b2115052bb12061),
+            ("terminal 80x24 folded mono", 0xfea98da227c87feb),
+            ("terminal 60x24 open mono", 0x45f3591c02d29811),
+            ("terminal 60x24 folded mono", 0xfea98da227c87feb),
+            ("agent picked 200x60 open mono", 0x9dfd9e2ee592beb4),
+            ("agent picked 200x60 folded mono", 0x9a9152dd338edf33),
+            ("agent picked 120x40 open mono", 0xc8a42df41ae19294),
+            ("agent picked 120x40 folded mono", 0x9599a6e9f6f94043),
+            ("agent picked 80x24 open mono", 0x801a5252adc60a2d),
+            ("agent picked 80x24 folded mono", 0xd9f4c883dea2c183),
+            ("agent picked 60x24 open mono", 0x67e70e48fab3265d),
+            ("agent picked 60x24 folded mono", 0xd9f4c883dea2c183),
+            ("space picked 200x60 open mono", 0xa5efa9ae4a0538d4),
+            ("space picked 200x60 folded mono", 0xe0b93aaef4109dd7),
+            ("space picked 120x40 open mono", 0xfbbae7a0308ebd34),
+            ("space picked 120x40 folded mono", 0x163f25aa224f5087),
+            ("space picked 80x24 open mono", 0x4b4e4c0aa0c274b3),
+            ("space picked 80x24 folded mono", 0x4bd4f41aaa6bae47),
+            ("space picked 60x24 open mono", 0xac03590f40a6a683),
+            ("space picked 60x24 folded mono", 0x4bd4f41aaa6bae47),
+        ];
+        let mut got = Vec::new();
+        for (theme, light, level) in [
+            ("dark", false, None),
+            ("light", true, None),
+            ("mono", false, Some(Level::Mono)),
+        ] {
+            TEST_LIGHT.with(|c| c.set(Some(light)));
+            TEST_LEVEL.with(|c| c.set(level));
+            // The column's own pick raises its row with `theme::selected`: on an agent, and
+            // after `k` up to its space's rule.
+            let picked = |ups: usize| {
+                let mut state = qass_state();
+                enter_side(&mut state, false);
+                for _ in 0..ups {
+                    mode_input(&mut state, b"k", 0x01, &mut 0);
+                }
+                state
+            };
+            let pages: [(&str, &dyn Fn() -> State); 4] = [
+                ("qass", &qass_wide),
+                ("terminal", &qass_state),
+                ("agent picked", &|| picked(0)),
+                ("space picked", &|| picked(9)),
+            ];
+            for (page, make) in pages {
+                for (cols, lines) in [(200u16, 60u16), (120, 40), (80, 24), (60, 24)] {
+                    for collapsed in [false, true] {
+                        let mut state = make();
+                        // The palette the test state opens with would cover the column at 80.
+                        (state.palette, state.menu) = (None, None);
+                        (state.cols, state.lines, state.collapsed) = (cols, lines, collapsed);
+                        state.sidebar_width = sidebar::opening_width(cols);
+                        let left = screen::left_for(cols, collapsed, state.sidebar_width);
+                        let rows = sidebar_bytes(
+                            &screen::paint(&state.frame()),
+                            cols as usize,
+                            lines as usize,
+                            left,
+                        );
+                        let fold = if collapsed { "folded" } else { "open" };
+                        let name = format!("{page} {cols}x{lines} {fold} {theme}");
+                        got.push((name, fnv(&rows.join("\n")), rows));
+                    }
+                }
+            }
+        }
+        TEST_LIGHT.with(|c| c.set(None));
+        TEST_LEVEL.with(|c| c.set(None));
+        let recorded: String = got
+            .iter()
+            .map(|(name, hash, _)| format!("            ({name:?}, {hash:#018x}),\n"))
+            .collect();
+        for (name, hash, rows) in &got {
+            let pinned = PINNED.iter().find(|(n, _)| n == name).map(|(_, h)| *h);
+            assert_eq!(
+                pinned,
+                Some(*hash),
+                "the sidebar of {name} moved:\n{}\nnow:\n{recorded}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    /// A tab on the rail is a click that opens its pane: the board's and qass's tabs fold away
+    /// and come back, the questions' tab is the chip's click; a press anywhere else on the rail's
+    /// rows (under the tabs) opens nothing.
+    #[test]
+    fn a_press_on_a_tab_opens_its_pane() {
+        let mut state = qass_wide();
+        state.qass_ui.fold = Some(crate::qass_screen::Fold::Board);
+        let rail = state.rail_paint().expect("the rail");
+        assert_eq!(
+            rail.tabs(),
+            vec![crate::rail::Pane::Board, crate::rail::Pane::Questions]
+        );
+        let at = |dx: usize, dy: usize| {
+            let (col, row) = screen_of(&state, rail.x + dx, rail.y + dy);
+            (row, col)
+        };
+        let (row, col) = at(1, 0);
+        assert_eq!(state.rail_tab_at(row, col), Some(crate::rail::Pane::Board));
+        assert_eq!(state.rail_leaf(crate::rail::Pane::Board), Some(4));
+        let (row, col) = at(1, 1);
+        assert_eq!(
+            state.rail_tab_at(row, col),
+            Some(crate::rail::Pane::Questions)
+        );
+        assert_eq!(state.ask_click(row, col), Some(AskClick::Toggle));
+        let (row, col) = at(1, 5);
+        assert_eq!(state.rail_tab_at(row, col), None, "under the tabs");
+        // The edge column and the sidebar are not tabs.
+        let (row, col) = at(rail.w, 0);
+        assert_eq!(state.rail_tab_at(row, col), None);
+        assert!(state.strip_press(4), "the board's tab opens it");
+        assert_eq!(state.qass_ui.fold, None);
+        // Qass's tab, folded the other way round.
+        state.qass_ui.fold = Some(crate::qass_screen::Fold::Qass);
+        let rail = state.rail_paint().expect("the rail");
+        assert_eq!(
+            rail.tabs(),
+            vec![crate::rail::Pane::Questions, crate::rail::Pane::Qass]
+        );
+        assert_eq!(state.rail_leaf(crate::rail::Pane::Qass), Some(5));
+    }
+
+    /// The rail's edge drags its width between the narrowest and the widest, keeps the board at
+    /// its minimum, never moves qass's tile (the board gives the columns), saves nothing, and a
+    /// double press puts the width back.
+    #[test]
+    fn the_rail_edge_drags_its_width_and_qass_keeps_its_tile() {
+        let mut state = qass_wide();
+        let qass = tile_of(&state, 5);
+        let rail = state.rail_paint().expect("the rail");
+        let default = rail.w;
+        assert_eq!(default, crate::rail::default_width(pane_area(&state).cols));
+        assert!(state.on_rail_edge(rail.x + rail.w, rail.y + 3));
+        // The board's frame line beside it is the line the rail shows, and drags it too.
+        assert!(state.on_rail_edge(rail.x + rail.w + 1, rail.y + 3));
+        assert!(!state.on_rail_edge(rail.x + rail.w + 2, rail.y + 3));
+        let (col, row) = screen_of(&state, rail.x + rail.w, rail.y + 3);
+        assert!(state.split_press(col, row), "the press holds the edge");
+        assert_eq!(state.modes.split_drag, Some(Grab::Rail));
+        // Wider: the tabs and the board's tile change, qass's does not.
+        let (col, row) = screen_of(&state, rail.x + 24, rail.y + 3);
+        assert!(state.split_motion(col, row));
+        assert_eq!(state.rail_paint().unwrap().w, 24);
+        assert_eq!(tile_of(&state, 5), qass, "qass keeps its tile");
+        assert!(tile_of(&state, 4).cols >= crate::qass_screen::BOARD_MIN_COLS);
+        // Past the widest and past the narrowest.
+        let (col, row) = screen_of(&state, rail.x + 90, rail.y + 3);
+        state.split_motion(col, row);
+        assert_eq!(state.rail_paint().unwrap().w, crate::rail::MAX);
+        let (col, row) = screen_of(&state, 0, rail.y + 3);
+        state.split_motion(col, row);
+        assert_eq!(state.rail_paint().unwrap().w, crate::rail::MIN);
+        assert_eq!(tile_of(&state, 5), qass);
+        assert!(tile_of(&state, 4).cols >= crate::qass_screen::BOARD_MIN_COLS);
+        // A double press on the edge resets only the width.
+        state.modes.split_drag = None;
+        let rail = state.rail_paint().unwrap();
+        let (col, row) = screen_of(&state, rail.x + rail.w, rail.y + 3);
+        state.modes.divider_click = Some((Grab::Rail, std::time::Instant::now()));
+        assert!(state.split_press(col, row));
+        assert_eq!(state.modes.split_drag, None, "a double press holds nothing");
+        assert_eq!(state.qass_ui.rail, None);
+        assert_eq!(state.rail_paint().unwrap().w, default);
+    }
+
+    /// Qass keeps its columns and its pty size when the rail comes and goes, with the board on
+    /// either side: the rail is the board's.
+    #[test]
+    fn qass_keeps_its_tile_when_the_rail_comes_and_goes_on_either_side() {
+        for swapped in [false, true] {
+            let mut state = qass_wide();
+            if swapped {
+                let area = pane_area(&state);
+                assert!(state.layouts.get_mut(&9).unwrap().swap_root(area));
+            }
+            // Questions folded: the rail shows. A card brought up beside the board: it does not.
+            let shut = tile_of(&state, 5);
+            assert!(state.rail_paint().is_some());
+            state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+            state.asks.raised = true;
+            assert!(state.rail_paint().is_none() && state.questions().is_some());
+            let open = tile_of(&state, 5);
+            // Qass on the left moves right by the rail's columns; its size is the same.
+            assert_eq!(
+                (open.cols, open.rows),
+                (shut.cols, shut.rows),
+                "swapped: {swapped}"
+            );
+            assert_eq!(open.x == shut.x, !swapped, "swapped: {swapped}");
+            state.asks.take(Vec::new(), Vec::new());
+            state.qass_ui.fold = Some(crate::qass_screen::Fold::Board);
+            assert!(state.rail_paint().is_some());
+        }
+    }
+
+    /// A swapped tab with the rail showing: the handle stands on the divider that is drawn, a
+    /// press there holds it, and the rail's body is never taken for a divider.
+    #[test]
+    fn the_divider_of_a_swapped_tab_is_where_it_is_drawn_with_the_rail_showing() {
+        let mut state = qass_wide();
+        let area = pane_area(&state);
+        assert!(state.layouts.get_mut(&9).unwrap().swap_root(area));
+        let rail = state.rail_paint().expect("the rail");
+        let qass = tile_of(&state, 5);
+        let handle = state.handle().expect("a handle");
+        assert_eq!(handle.x, qass.x + qass.cols, "on qass's right edge, drawn");
+        let (col, row) = screen_of(&state, handle.x, handle.y + 1);
+        assert!(state.split_press(col, row));
+        assert!(matches!(state.modes.split_drag, Some(Grab::Divider(_))));
+        state.modes.split_drag = None;
+        // A press inside qass's tile, one rail's width left of the divider, holds nothing.
+        let (col, row) = screen_of(&state, handle.x - rail.w - crate::rail::EDGE, handle.y + 1);
+        assert!(!state.split_press(col, row));
+    }
+
+    /// A swapped tab with the rail showing: dragging the divider puts it under the pointer, and
+    /// the rail's body is not a divider on a stacked tab either; with the questions open over
+    /// the board's tile the rail's preview is not repeated.
+    #[test]
+    fn the_divider_follows_the_pointer_with_the_rail_showing_and_stacked_presses_pass_the_rail() {
+        let mut state = qass_wide();
+        let area = pane_area(&state);
+        assert!(state.layouts.get_mut(&9).unwrap().swap_root(area));
+        let handle = state.handle().expect("a handle");
+        let (col, row) = screen_of(&state, handle.x, handle.y + 1);
+        assert!(state.split_press(col, row));
+        let (col, row) = screen_of(&state, handle.x + 6, handle.y + 1);
+        assert!(state.split_motion(col, row));
+        let qass = tile_of(&state, 5);
+        assert_eq!(qass.x + qass.cols, handle.x + 6, "under the pointer");
+        // Stacked (120 columns): a press on the rail body at the divider row is not a divider.
+        let mut stacked = qass_split_window();
+        stacked.cols = 120;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut stacked, &mut seq, &mut seqs).unwrap();
+        let rail = stacked.rail_paint().expect("the rail, stacked");
+        let qass = tile_of(&stacked, 5);
+        let (col, row) = screen_of(&stacked, rail.x + 2, qass.y - 1);
+        assert!(!stacked.split_press(col, row));
+        // The questions open over the board's tile: the tab keeps its place, the preview goes.
+        stacked.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        stacked.asks.raised = true;
+        assert!(stacked.questions().is_some_and(|q| q.replaces));
+        let painted = plain(&screen::paint(&stacked.frame()));
+        assert!(!painted.contains("ctrl-a i opens"), "{painted}");
+    }
+
+    /// Dragging the rail wider never turns the tab over, however narrow the board was dragged.
+    #[test]
+    fn a_wide_rail_never_turns_the_tab_over() {
+        let mut state = qass_wide();
+        let area = pane_area(&state);
+        let _ = area;
+        state
+            .layouts
+            .get_mut(&9)
+            .unwrap()
+            .set_root_split(layout::Dir::V, 0.5);
+        let dir = state.drawn(&state.layouts[&9]).root_split().unwrap().0;
+        let qass = tile_of(&state, 5);
+        let rail = state.rail_paint().unwrap();
+        for x in [rail.x + 20, rail.x + 28, rail.x + 90] {
+            state.modes.split_drag = Some(Grab::Rail);
+            let (col, row) = screen_of(&state, x, rail.y + 3);
+            state.split_motion(col, row);
+            assert_eq!(state.drawn(&state.layouts[&9]).root_split().unwrap().0, dir);
+            assert_eq!(tile_of(&state, 5), qass);
+            assert!(tile_of(&state, 4).cols >= crate::qass_screen::BOARD_MIN_COLS);
+        }
+    }
+
     /// The column's rule is the left side of the panes beside it: one line, never two side by
     /// side, joined where a pane's top and bottom lines meet it.
     #[test]
@@ -24169,35 +28003,368 @@ mod tests {
         }
     }
 
-    /// The Inbox over an agent page repaints the divider whole: the page's frame under it joins
-    /// the divider at the pane's top and bottom lines (`├`, `┴`), and the Inbox has no such
-    /// lines. The divider is a plain line from the top bend to the bottom one.
+    /// qass's lone box draws its own frame, and the column's rule is its left side too: the
+    /// box's corners join the rule, its side beside the rule is blank, with or without the
+    /// questions open on its left.
     #[test]
-    fn the_inbox_repaints_the_divider_without_the_pages_joints() {
-        let state = tiled_state();
-        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
-        let rule = left - 1;
-        let frame = state.frame();
-        let mut painted = screen::paint(&frame);
-        let rows = state.ibx_size().1;
-        let view = crate::inbox_pane::View {
-            rows: vec![String::new(); rows],
-            plain: Vec::new(),
-            targets: Vec::new(),
-            cursor: None,
-        };
-        let joined = cells_of(&painted, state.cols as usize, state.lines as usize);
-        assert!(
-            (1..rows).any(|i| matches!(joined[i][rule], '\u{251c}' | '\u{2534}')),
-            "the page's frame joins the divider before the Inbox covers it"
-        );
-        screen::paint_inbox(&frame, &view, &mut painted);
-        let grid = cells_of(&painted, state.cols as usize, state.lines as usize);
-        assert_eq!(grid[0][rule], '\u{256e}', "the top bend stays");
-        for (at, row) in grid.iter().enumerate().take(rows - 1).skip(1) {
-            assert_eq!(row[rule], '\u{2502}', "row {at}");
+    fn the_column_rule_is_the_left_side_of_qass_box() {
+        for inbox in [false, true] {
+            let mut state = qass_window();
+            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+            assert!(state.on_qass_screen());
+            state.qass_ui.inbox = inbox;
+            // Nothing over the box: the test state opens with the find box up.
+            state.palette = None;
+            let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+            let grid = cells_of(
+                &screen::paint(&state.frame()),
+                state.cols as usize,
+                state.lines as usize,
+            );
+            if std::env::var_os("QOOP_SHOW").is_some() {
+                for row in &grid {
+                    eprintln!("{}", row[left - 4..left + 60].iter().collect::<String>());
+                }
+            }
+            let plan = state.qass_plan().expect("qass's box");
+            let (rule, first) = (left - 1, left);
+            let row = |pane_row: usize| &grid[screen::TABS + pane_row];
+            let (top, bottom) = (plan.frame.y, plan.frame.y + plan.frame.rows - 1);
+            // The line under the header runs into the rule too.
+            assert_eq!(row(plan.header.rows() - 1)[rule], '\u{251c}');
+            assert_eq!(row(top)[rule], '\u{251c}', "the box's top joins the rule");
+            assert_eq!(row(top)[first], '\u{2500}');
+            assert_eq!(row(bottom)[rule], '\u{2534}', "and its bottom");
+            assert_eq!(row(bottom)[first], '\u{2500}');
+            for at in top + 1..bottom {
+                assert_eq!(row(at)[rule], '\u{2502}', "inbox {inbox}, row {at}");
+                assert_eq!(
+                    row(at)[first],
+                    ' ',
+                    "no second line, inbox {inbox}, row {at}"
+                );
+            }
+            // The questions beside it share one line with the box, joined at both ends.
+            if let Some(side) = plan.side.filter(|s| !s.replaces) {
+                let (end, box_left) = (left + side.rect.cols - 1, left + plan.frame.x);
+                assert_eq!(box_left, end + 1);
+                assert_eq!(row(top)[end], '\u{252c}');
+                assert_eq!(row(top)[box_left], '\u{2500}');
+                assert_eq!(row(bottom)[end], '\u{2534}');
+                assert_eq!(row(bottom)[box_left], '\u{2500}');
+                for at in top + 1..bottom {
+                    assert_eq!(row(at)[end], '\u{2502}', "row {at}");
+                    assert_eq!(row(at)[box_left], ' ', "no second line, row {at}");
+                }
+            } else {
+                assert!(!inbox, "the window holds the questions beside the box");
+            }
         }
-        assert_eq!(grid[rows - 1][rule], '\u{256f}', "the bottom bend");
+    }
+
+    /// On qass's split tab qass paints the header over the panes and the schedules under them
+    /// from the pane's first column too: the rule joins their lines and is their left side.
+    #[test]
+    fn the_column_rule_is_the_left_side_of_qass_schedules_on_its_split_tab() {
+        let mut state = qass_split_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.palette = None;
+        state.clock.take(vec![clock_row(1, "morning review")]);
+        let plan = state.qass_plan().expect("qass's split tab");
+        assert_eq!(
+            plan.frame, plan.inner,
+            "the split tab, whose panes draw their own edges"
+        );
+        let clock = plan.clock.expect("the schedules under the panes");
+        assert!(clock.under && clock.rect.x == 0);
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let grid = cells_of(
+            &screen::paint(&state.frame()),
+            state.cols as usize,
+            state.lines as usize,
+        );
+        let (rule, first) = (left - 1, left);
+        let row = |pane_row: usize| &grid[screen::TABS + pane_row];
+        assert_eq!(
+            row(plan.header.rows() - 1)[rule],
+            '\u{251c}',
+            "the header's line"
+        );
+        let (top, bottom) = (clock.rect.y, clock.rect.y + clock.rect.rows - 1);
+        assert_eq!(
+            row(top)[rule],
+            '\u{251c}',
+            "the schedules' top joins the rule"
+        );
+        assert_eq!(row(top)[first], '\u{2500}');
+        assert_eq!(row(bottom)[rule], '\u{2534}', "and their bottom");
+        assert_eq!(row(bottom)[first], '\u{2500}');
+        for at in top + 1..bottom {
+            assert_eq!(row(at)[rule], '\u{2502}', "row {at}");
+            assert_eq!(row(at)[first], ' ', "no second line on row {at}");
+        }
+    }
+
+    /// The rail and the open pane share one line: the board's frame, with the rail's edge
+    /// blank beside it, never two lines side by side.
+    #[test]
+    fn the_rail_and_the_open_pane_share_one_line() {
+        let mut state = qass_wide();
+        state.qass_ui.fold = Some(crate::qass_screen::Fold::Qass);
+        let rail = state.rail_paint().expect("the rail");
+        let grid = cells_of(
+            &screen::paint(&state.frame()),
+            state.cols as usize,
+            state.lines as usize,
+        );
+        let cell = |x: usize| {
+            let (col, row) = screen_of(&state, x, rail.y + 3);
+            grid[row as usize - 1][col as usize - 1]
+        };
+        assert_eq!(cell(rail.x + rail.w), ' ', "the edge is blank");
+        assert_eq!(
+            cell(rail.x + rail.w + 1),
+            '\u{2502}',
+            "the frame draws the line"
+        );
+    }
+
+    /// What a drawn copy carries (the rail among it) never reaches a tree that is kept, and
+    /// the focused pane's corner beside the rail survives the rail's paint.
+    #[test]
+    fn the_rail_stays_off_kept_trees_and_off_the_focused_corner() {
+        let mut state = qass_wide();
+        state.qass_ui.fold = Some(crate::qass_screen::Fold::Qass);
+        assert!(state.drawn(&state.layouts[&9]).rail > 0);
+        assert_eq!(state.committed(&state.layouts[&9]).rail, 0);
+        assert_eq!(state.layouts[&9].rail, 0);
+        state.qass_ui.fold = None;
+        state.focused = 4;
+        state.layouts.get_mut(&9).unwrap().focus_terminal(4);
+        let board = tile_of(&state, 4);
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let grid = cells_of(
+            &screen::paint(&state.frame()),
+            state.cols as usize,
+            state.lines as usize,
+        );
+        let corner = grid[screen::TABS + board.y - 1][left + board.x - 1];
+        assert_eq!(
+            corner, '\u{256d}',
+            "the focused pane's corner, beside the rail"
+        );
+    }
+
+    /// qass's full header stands in the tab bar's rows on qass's screen: no tab is painted
+    /// there and a click there opens none, while the `[ N questions ]` chip in those rows still
+    /// opens the questions. On any other tab, or zoomed, the bar is the bar.
+    #[test]
+    fn qass_screen_wears_its_header_where_the_tab_bar_was() {
+        let mut state = qass_split_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let bar_row = |state: &State| {
+            let painted = screen::paint(&state.frame());
+            (written_on(&painted, 1), written_on(&painted, 2))
+        };
+        let (first, second) = bar_row(&state);
+        assert!(!state.qass_header());
+        assert!(
+            !first.contains("need you"),
+            "the owner's tab: the bar, {first:?}"
+        );
+        let tab_click = state.clicked(1, (left + 3) as u16);
+        assert!(tab_click.is_some(), "a tab is clicked");
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(state.header_in_strip());
+        let (first, second2) = bar_row(&state);
+        assert!(
+            second2.contains("need you") && second2.contains("working"),
+            "{first:?} / {second2:?}"
+        );
+        assert_ne!(second, second2);
+        for col in left + 1..state.cols as usize {
+            assert!(
+                state.clicked(1, col as u16).is_none(),
+                "no tab under the header"
+            );
+            assert!(
+                state.clicked(2, col as u16).is_none(),
+                "no tab under the header"
+            );
+        }
+        // The chip in the bar's second row toggles the questions.
+        let frame = state.frame();
+        let (_, screen) =
+            screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false).unwrap();
+        let chip = screen.chip().expect("the chip on the header");
+        assert_eq!(chip.row, 1);
+        assert_eq!(
+            state.ask_click(2, (left + 1 + chip.x0) as u16),
+            Some(AskClick::Toggle)
+        );
+        // Zoomed on the board: no header, the bar again.
+        state.focused = 4;
+        state.layouts.get_mut(&9).unwrap().focus_terminal(4);
+        zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(!state.header_in_strip());
+        assert!(!bar_row(&state).1.contains("need you"));
+    }
+
+    /// On qass's split tab, the last waiting card answered (queued) or gone elsewhere while he
+    /// types for it: the questions stay up with the keyboard and his words, so no letter of his
+    /// reaches qass's chat. Esc stops the typing and the words stand as not sent; a second esc
+    /// lets them go.
+    #[test]
+    fn typing_for_the_last_card_handled_elsewhere_keeps_the_questions_up() {
+        for gone in [false, true] {
+            let mut state = qass_wide();
+            // The frame that came onto qass's screen, before he brings the questions up.
+            state.asks_settle();
+            state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+            assert!(questions_toggle(&mut state));
+            state.asks.key(b"t", 1);
+            state.asks.key(b"run it after the", 1);
+            assert!(state.asks.typing() && state.asks.focus);
+            let mut queued = ask_card(1, "korea");
+            queued.status = "queued".into();
+            state
+                .asks
+                .take(if gone { Vec::new() } else { vec![queued] }, Vec::new());
+            state.asks_settle();
+            let kept = (
+                state.asks.typing(),
+                state.asks.typed().to_string(),
+                state.asks.focus,
+                state.asks.raised,
+                state.questions().is_some(),
+            );
+            assert_eq!(
+                kept,
+                (true, "run it after the".to_string(), true, true, true),
+                "gone={gone}"
+            );
+            state.asks.key(b"\x1b", 1);
+            state.asks_settle();
+            assert!(state.asks.raised && !state.asks.typing(), "gone={gone}");
+            state.asks.key(b"\x1b", 1);
+            state.asks_settle();
+            assert!(!state.asks.raised, "gone={gone}");
+        }
+    }
+
+    fn clock_row(id: i64, name: &str) -> qoop_runtime::control::ScheduleInfo {
+        qoop_runtime::control::ScheduleInfo {
+            id,
+            name: name.to_string(),
+            cron: Some("0 9 * * 1-5".into()),
+            at: None,
+            watch: None,
+            agent: "claude".into(),
+            cwd: "/tmp".into(),
+            space: None,
+            prompt: "review".into(),
+            paused: false,
+            created_at: sidebar::now_unix() - 3600,
+            last_slot: None,
+            last_at: None,
+            last_result: None,
+            last_terminal: None,
+            next_at: Some(sidebar::now_unix() + 3600),
+            when: "weekdays 09:00".into(),
+        }
+    }
+
+    /// Schedules on the clock draw their panel on qass's screen, beside its terminal in a wide
+    /// window and under it in a narrow one, and qass's terminal is sized to what is left; with
+    /// nothing on the clock there is no panel and the terminal has the pane.
+    #[test]
+    fn schedules_draw_their_panel_beside_or_under_qass_and_size_its_terminal_to_fit() {
+        for (cols, beside) in [(160, true), (90, false)] {
+            let mut state = qass_window();
+            state.cols = cols;
+            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+            let bare = state.qass_rect().unwrap();
+            assert!(state.qass_plan().unwrap().clock.is_none());
+            state.clock.take(vec![clock_row(1, "morning review")]);
+            let plan = state.qass_plan().unwrap();
+            let panel = plan.clock.expect("a panel for a schedule");
+            assert_eq!(!panel.under, beside, "{cols} columns");
+            let inner = state.qass_rect().unwrap();
+            if beside {
+                assert!(inner.cols < bare.cols && inner.rows == bare.rows);
+            } else {
+                assert!(inner.rows < bare.rows && inner.cols == bare.cols);
+            }
+            // The pty is told the smaller size, so nothing of qass hides under the panel.
+            size_terminals(&mut state, &mut seqs).unwrap();
+            assert_eq!(
+                state.sized.get(&5),
+                Some(&(inner.cols as u16, inner.rows as u16))
+            );
+            let painted = screen::paint(&state.frame());
+            assert!(painted.contains("schedules"), "{cols} columns");
+            assert!(painted.contains("morning review"), "{cols} columns");
+            // Gone from the list: the terminal has the pane back.
+            state.clock.take(Vec::new());
+            assert_eq!(state.qass_rect().unwrap(), bare);
+        }
+    }
+
+    /// `ctrl-a C` gives the panel the keyboard and again gives it back; with the keyboard in it
+    /// space writes a pause, `+` opens the form with the folder the owner came from, and
+    /// escape closes the form. Off qass's screen it only says where the schedules are.
+    #[test]
+    fn ctrl_a_capital_c_gives_the_schedules_the_keyboard() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        assert!(!clock_toggle(&mut state), "not on qass's screen");
+        assert!(
+            state
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("qass's screen"))
+        );
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.clock.take(vec![clock_row(7, "morning review")]);
+        assert!(!state.clock_focused());
+        clock_toggle(&mut state);
+        assert!(state.clock_focused() && !state.asks_focused());
+        let sent = clock_keys(&mut state, b" ", 1);
+        assert_eq!(sent, ClockKeys::default());
+        let (sends, _) = state.clock.tick(std::time::Instant::now());
+        assert!(matches!(
+            &sends[0],
+            ControlRequest::ScheduleWrite { action, .. }
+                if **action == qoop_runtime::control::ScheduleOp::Pause { schedule: 7 }
+        ));
+        let opened = clock_keys(&mut state, b"+", 1);
+        assert!(opened.resize, "the form is taller than the list");
+        let form = state.clock.form.as_ref().expect("the form is open");
+        assert!(form.folder.starts_with('/'), "{}", form.folder);
+        assert!(screen::paint(&state.frame()).contains("new schedule"));
+        // The prefix is not the form's.
+        assert_eq!(
+            clock_keys(&mut state, b"\x01c", 1).feed,
+            Some(b"\x01c".to_vec())
+        );
+        clock_keys(&mut state, b"\x1b", 1);
+        assert!(state.clock.form.is_none());
+        // Tab hands the keyboard back to qass's chat.
+        clock_keys(&mut state, b"\t", 1);
+        assert!(!state.clock_focused());
+    }
+
+    /// A card about nothing: no agent, no terminal, so Talk it through goes to qass.
+    fn ask_about_nothing(n: u32, handle: &str) -> qoop_runtime::control::AskInfo {
+        qoop_runtime::control::AskInfo {
+            agent: None,
+            terminal: None,
+            ..ask_card(n, handle)
+        }
     }
 
     fn ask_card(n: u32, handle: &str) -> qoop_runtime::control::AskInfo {
@@ -24233,6 +28400,603 @@ mod tests {
                 pick: None,
             },
         }
+    }
+
+    /// `ctrl-a i` opens the inbox beside qass's chat and sizes the chat to what is left, again
+    /// puts it away and gives the chat its columns back; the chat stays fully on screen.
+    #[test]
+    fn the_inbox_narrows_qass_chat_beside_it_and_gives_the_columns_back() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let (_, shut) = qass_cells(&state);
+        size_terminals(&mut state, &mut seqs).unwrap();
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(shut.cols as u16, shut.rows as u16))
+        );
+
+        assert!(asks_toggle(&mut state), "the layout changed");
+        assert!(state.qass_ui.inbox && state.asks.focus && state.asks_focused());
+        let plan = state.qass_plan().unwrap();
+        let side = plan.side.expect("beside at this width");
+        assert!(!side.replaces);
+        let (_, open) = qass_cells(&state);
+        assert_eq!((open.rows, open.y), (shut.rows, shut.y), "no rows lost");
+        assert_eq!(open.cols + side.rect.cols, shut.cols);
+        assert_eq!(
+            open.x,
+            side.rect.cols + 1,
+            "the chat starts after the inbox"
+        );
+        assert!(size_terminals(&mut state, &mut seqs).unwrap().is_some());
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(open.cols as u16, open.rows as u16))
+        );
+        assert_eq!(focused_rect(&state), open);
+        // The chat is whole on screen: its box is painted beside the inbox, not under it.
+        let painted = plain(&screen::paint(&state.frame()));
+        assert!(
+            painted.contains("questions") && painted.contains("\u{2500} terminal "),
+            "{painted}"
+        );
+
+        // The keyboard in the inbox puts it away; the pty gets its columns back.
+        assert!(asks_toggle(&mut state));
+        assert!(!state.qass_ui.inbox && !state.asks.focus);
+        assert!(size_terminals(&mut state, &mut seqs).unwrap().is_some());
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(shut.cols as u16, shut.rows as u16))
+        );
+        // Open and with the keyboard in the chat, it takes the keyboard and changes no size.
+        assert!(asks_toggle(&mut state));
+        size_terminals(&mut state, &mut seqs).unwrap();
+        state.asks.focus = false;
+        assert!(!asks_toggle(&mut state) && state.asks.focus);
+        assert_eq!(size_terminals(&mut state, &mut seqs).unwrap(), None);
+    }
+
+    #[test]
+    fn in_a_narrow_pane_the_inbox_takes_the_chats_place_and_the_pty_keeps_its_size() {
+        let mut state = qass_window();
+        state.cols = 120;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let before = state.sized.clone();
+        assert!(asks_toggle(&mut state));
+        assert!(state.qass_plan().unwrap().side.unwrap().replaces);
+        assert_eq!(
+            size_terminals(&mut state, &mut seqs).unwrap(),
+            None,
+            "nothing repaints"
+        );
+        assert_eq!(state.sized, before);
+        let painted = plain(&screen::paint(&state.frame()));
+        assert!(
+            painted.contains("questions") && !painted.contains("\u{2500} terminal "),
+            "{painted}"
+        );
+    }
+
+    #[test]
+    fn a_pane_too_narrow_or_too_short_says_so_and_changes_nothing() {
+        // Short: folding the column makes no room. (Any pane wide enough for qass's screen is
+        // wide enough for the questions.)
+        let mut state = qass_window();
+        (state.cols, state.lines) = (160, 15);
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(!asks_toggle(&mut state));
+        assert!(!state.qass_ui.inbox && !state.collapsed);
+        assert_eq!(
+            state.message.as_deref(),
+            Some("the pane is too small for the questions")
+        );
+        // qass's tab with the board, the same rule by where the questions would stand.
+        for (cols, lines, says) in [
+            // Narrow with the column open: folding it makes the room, so the key is named.
+            (
+                63u16,
+                40u16,
+                "the pane is too narrow for the questions; ctrl-a b folds the column",
+            ),
+            (200, 17, "the pane is too small for the questions"),
+        ] {
+            let mut state = qass_split_window();
+            state.cols = cols;
+            state.lines = lines;
+            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+            state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+            assert!(!questions_toggle(&mut state), "{cols}x{lines}");
+            assert!(!state.asks.raised && !state.collapsed);
+            assert_eq!(state.message.as_deref(), Some(says), "{cols}x{lines}");
+        }
+        // Away from qass's screen it says where it is.
+        let mut state = qass_window();
+        assert!(!asks_toggle(&mut state));
+        assert!(
+            state
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("ctrl-a Q"))
+        );
+    }
+
+    /// The zoom puts the header and the inbox away together, and `ctrl-a i` brings the inbox
+    /// back unzoomed.
+    #[test]
+    fn zoom_puts_the_inbox_away_and_ctrl_a_i_unzooms_it() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        asks_toggle(&mut state);
+        zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(state.qass_ui.zoomed && state.qass_plan().unwrap().side.is_none());
+        assert!(!state.asks_focused(), "no keys for what is not shown");
+        assert!(asks_toggle(&mut state));
+        assert!(!state.qass_ui.zoomed && state.asks_focused());
+    }
+
+    /// A click lands on what was painted: the chip toggles, a card selects, an option is held,
+    /// the box types, a blank cell of the inbox takes the keyboard, the chat takes it back.
+    #[test]
+    fn clicks_in_the_inbox_and_on_the_chip_land_on_what_was_painted() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state
+            .asks
+            .take(vec![ask_card(1, "korea"), ask_card(2, "cv")], Vec::new());
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let at = |pane_row: usize, pane_col: usize| {
+            (
+                (screen::TABS + 1 + pane_row) as u16,
+                (left + 1 + pane_col) as u16,
+            )
+        };
+        // The chip, closed.
+        let frame = state.frame();
+        let (_, screen) =
+            screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false).unwrap();
+        let chip = screen.chip().expect("the chip is on the header");
+        // The chip stands on a header row, counted from the screen's first row.
+        let (row, col) = ((1 + chip.row) as u16, (left + 1 + chip.x0 + 2) as u16);
+        assert_eq!(state.ask_click(row, col), Some(AskClick::Toggle));
+        assert!(asks_toggle(&mut state));
+        state.asks.focus = false;
+        // Open: find the rows the way the click does.
+        let plan = state.qass_plan().unwrap();
+        let side = plan.side.unwrap().rect;
+        let frame = state.frame();
+        let (_, screen) =
+            screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false).unwrap();
+        let painted: Vec<String> = (0..plan.rows)
+            .map(|r| screen.row(r, |_| " ".repeat(plan.inner.cols)))
+            .collect();
+        let strip = |s: &str| {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let find = |needle: &str| {
+            painted
+                .iter()
+                .position(|r| {
+                    strip(r)
+                        .chars()
+                        .take(side.cols)
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("{needle} not painted"))
+        };
+        // Where a word stands in its painted row, in cells.
+        let col_of = |row: usize, needle: &str| {
+            let line = strip(&painted[row]);
+            let at = line.find(needle).expect("painted");
+            line[..at].chars().count()
+        };
+        // A folded card: its head row opens it, each answer and its reply are a click.
+        let (row, col) = at(find(" cv "), side.x + 4);
+        assert_eq!(
+            state.ask_click(row, col),
+            Some(AskClick::Inbox(crate::asks::Hit::Card(1)))
+        );
+        let answers = find("[2] pick b");
+        let (row, col) = at(answers, col_of(answers, "[2] pick b") + 1);
+        assert_eq!(
+            state.ask_click(row, col),
+            Some(AskClick::Inbox(crate::asks::Hit::Answer(0, 1)))
+        );
+        let (row, col) = at(answers, col_of(answers, "[r] Reply") + 1);
+        assert_eq!(
+            state.ask_click(row, col),
+            Some(AskClick::Inbox(crate::asks::Hit::Reply(0)))
+        );
+        // A cell of the inbox with nothing to press, and the chat.
+        let (row, col) = at(find("questions"), side.x + side.cols - 3);
+        assert_eq!(state.ask_click(row, col), Some(AskClick::InboxBlank));
+        let (row, col) = at(plan.inner.y + 1, plan.inner.x + 5);
+        assert_eq!(state.ask_click(row, col), Some(AskClick::Chat));
+        // Nothing on the owner's own tabs.
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert_eq!(state.ask_click(row, col), None);
+    }
+
+    /// The chip counts the cards waiting once the inbox is readable, the blocked agents before.
+    #[test]
+    fn the_header_chip_counts_the_cards_when_it_can() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let chip_of = |state: &State| {
+            let painted = screen::paint(&state.frame());
+            let at = painted.find(" question").expect("the chip");
+            let head: String = painted[..at]
+                .chars()
+                .rev()
+                .take(12)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            head
+        };
+        let before = chip_of(&state);
+        state.asks.take(
+            vec![ask_card(1, "a"), ask_card(2, "b"), ask_card(3, "c")],
+            Vec::new(),
+        );
+        assert!(
+            chip_of(&state).contains("3"),
+            "{:?} then {:?}",
+            before,
+            chip_of(&state)
+        );
+        state.asks.take(Vec::new(), Vec::new());
+        assert!(chip_of(&state).contains('0'));
+    }
+
+    #[test]
+    fn keys_in_the_inbox_close_it_leave_it_or_go_back_to_the_ordinary_path() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        asks_toggle(&mut state);
+        // The prefix and the mouse are not the inbox's.
+        let taken = asks_keys(&mut state, b"\x01", 1);
+        assert_eq!(taken.feed.as_deref(), Some(&b"\x01"[..]));
+        assert!(state.asks.focus);
+        // A letter is the inbox's and goes nowhere else.
+        let taken = asks_keys(&mut state, b"z", 1);
+        assert_eq!(taken, AskKeys::default());
+        // An answer goes out; tab gives the chat the keyboard and the answer stays sent.
+        asks_keys(&mut state, b"a", 1);
+        assert!(state.asks.busy());
+        asks_keys(&mut state, b"\t", 1);
+        assert!(!state.asks.focus && state.asks.busy() && state.qass_ui.inbox);
+        // Esc puts it away and asks for the pty to be sized again.
+        state.asks.focus = true;
+        let taken = asks_keys(&mut state, b"\x1b", 1);
+        assert!(taken.resize && !state.qass_ui.inbox && !state.asks.focus);
+        // `g` on a card goes to its agent's tab (enter opens the card in place).
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"g", 1);
+        assert_eq!(taken.jump, Some(1));
+        assert!(!state.asks.focus);
+        // `o` on a card about an agent goes to that agent's tab, not to qass.
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!((taken.jump, taken.paste), (Some(1), None));
+        // A card about nothing is talked through in qass: the line waits on qass's input while
+        // qass is at rest, and nothing is answered.
+        state
+            .asks
+            .take(vec![ask_about_nothing(1, "korea")], Vec::new());
+        let line = "About E1 (korea): Question 1? ".to_string();
+        let busy = state.asks.busy();
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, Some((5, line.clone())));
+        assert!(!state.asks.focus && state.qass_ui.inbox);
+        assert_eq!(state.asks.busy(), busy);
+        // qass working, or a key sent to it moments ago: the line only on the notice row.
+        fn row(state: &mut State) -> &mut AgentRow {
+            state.rows.iter_mut().find(|r| r.terminal == 5).unwrap()
+        }
+        row(&mut state).state = "working".into();
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, None);
+        assert_eq!(state.message.take(), Some(line.clone()));
+        row(&mut state).state = "idle".into();
+        state.typed_at.insert(5, std::time::Instant::now());
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, None);
+        assert_eq!(state.message.take(), Some(line.clone()));
+        // Past the window the line is pasted again; a trust question up, never.
+        let quiet = std::time::Duration::from_secs(31);
+        let long_ago = std::time::Instant::now().checked_sub(quiet).unwrap();
+        state.typed_at.insert(5, long_ago);
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, Some((5, line.clone())));
+        // Someone typed in qass's terminal from another client (the phone) moments ago, by the
+        // daemon's record: the line only on the notice row, so it never joins his words there.
+        row(&mut state).typed_by = Some(qoop_runtime::control::TypedBy {
+            kind: "phone".into(),
+            at: sidebar::now_unix(),
+        });
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, None);
+        assert_eq!(state.message.take(), Some(line.clone()));
+        row(&mut state).typed_by = Some(qoop_runtime::control::TypedBy {
+            kind: "phone".into(),
+            at: sidebar::now_unix() - 31,
+        });
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, Some((5, line.clone())));
+        row(&mut state).readiness = "trust_required".into();
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, None);
+        assert_eq!(state.message.take(), Some(line));
+        row(&mut state).readiness = "ready".into();
+        // No qass terminal: the inbox says so and keeps the keyboard.
+        asks_toggle(&mut state);
+        row(&mut state).agent = false;
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken, AskKeys::default());
+        assert!(state.asks.focus);
+        row(&mut state).agent = true;
+        let painted = plain(&screen::paint(&state.frame()));
+        assert!(painted.contains("qass is not running"), "{painted}");
+    }
+
+    /// A talk line once pasted counts as typing in qass, its Chat shows the terminal, and `o`
+    /// again at once only says the line.
+    #[tokio::test]
+    async fn a_second_talk_at_once_does_not_paste_the_line_again() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state
+            .asks
+            .take(vec![ask_about_nothing(1, "korea")], Vec::new());
+        state.chat.toggle(5, Some("claude"));
+        asks_toggle(&mut state);
+        let Some((terminal, line)) = asks_keys(&mut state, b"o", 1).paste else {
+            panic!("pasted")
+        };
+        let mut wire = Vec::new();
+        paste_talk(&mut state, terminal, &line, &mut seqs, &mut wire)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&wire).contains("\"paste\""));
+        assert!(
+            state.chat.typing(5),
+            "qass's Chat shows its terminal, as typing does"
+        );
+        asks_toggle(&mut state);
+        assert_eq!(asks_keys(&mut state, b"o", 1).paste, None);
+        assert_eq!(state.message, Some(line));
+    }
+
+    #[test]
+    fn in_a_narrow_pane_tab_puts_the_inbox_away_because_there_is_no_chat_beside_it() {
+        let mut state = qass_window();
+        state.cols = 120;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        asks_toggle(&mut state);
+        assert!(state.qass_plan().unwrap().side.unwrap().replaces);
+        asks_keys(&mut state, b"\t", 1);
+        assert!(!state.qass_ui.inbox && !state.asks.focus);
+    }
+
+    #[test]
+    fn the_keyboard_leaves_the_inbox_with_the_screen_it_was_on() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        asks_toggle(&mut state);
+        asks_keys(&mut state, b"b", 1);
+        assert!(state.asks_focused() && state.asks.busy());
+        // Away from qass's screen: nothing is shown.
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(!state.asks_focused());
+        state.asks_settle();
+        assert!(!state.asks.focus);
+        // Zoomed, the same.
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.asks.focus = true;
+        zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        state.asks_settle();
+        assert!(!state.asks.focus);
+    }
+
+    /// In qass's split tab stacked (a 160 column window) the questions never open by
+    /// themselves; `ctrl-a i` brings them over the board's tile, the panes and their ptys keep
+    /// their size, qass's tile is still drawn, and the chip and the questions answer clicks.
+    #[test]
+    fn the_questions_come_over_the_board_when_the_split_tab_is_stacked() {
+        let mut state = qass_split_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        size_terminals(&mut state, &mut seqs).unwrap();
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(state.qass_split() && !state.on_qass_screen());
+        let shut = qass_tiles(&state);
+        assert!(shut[1].1.y > shut[0].1.y, "stacked");
+        // Stacked, the rail is cut from both panes' left edge and carries the questions' tab.
+        let rail = state.rail_paint().expect("the rail, stacked too");
+        assert_eq!(rail.tabs(), vec![crate::rail::Pane::Questions]);
+        let full = pane_area(&state);
+        let inner = state.drawn(&state.layouts[&9]).inner(full);
+        assert!(
+            shut.iter()
+                .all(|(_, r)| r.x == inner.x + rail.w + crate::rail::EDGE),
+            "both panes lose the rail's columns: {shut:?}"
+        );
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let before = state.sized.clone();
+        // A card opens nothing (R2, 2026-10-13: it lights the rail's tab); `ctrl-a i` brings
+        // them over the board, the keyboard in them.
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(state.questions().is_none(), "a card opens nothing");
+        assert!(asks_toggle(&mut state));
+        assert!(state.asks_focused());
+        let side = state.qass_plan().unwrap().side.expect("over the board");
+        assert!(side.replaces && side.rect == shut[0].1);
+        assert_eq!(qass_tiles(&state), shut, "the panes keep their place");
+        assert_eq!(size_terminals(&mut state, &mut seqs).unwrap(), None);
+        assert_eq!(state.sized, before);
+        let painted = plain(&screen::paint(&state.frame()));
+        assert!(painted.contains("Question 1?"), "{painted}");
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let frame = state.frame();
+        let (_, screen) =
+            screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false).unwrap();
+        let chip = screen.chip().expect("the chip on the header");
+        let at = |r: usize, c: usize| ((screen::TABS + 1 + r) as u16, (left + 1 + c) as u16);
+        // The chip stands on a header row, counted from the screen's first row.
+        let (row, col) = ((1 + chip.row) as u16, (left + 1 + chip.x0 + 2) as u16);
+        assert_eq!(state.ask_click(row, col), Some(AskClick::Toggle));
+        let (row, col) = at(side.rect.y + 3, side.rect.x + 5);
+        assert!(matches!(
+            state.ask_click(row, col),
+            Some(AskClick::Inbox(_))
+        ));
+        // Put away: nothing moved, nothing to size.
+        assert!(asks_toggle(&mut state));
+        assert!(state.questions().is_none());
+        assert_eq!(qass_tiles(&state), shut);
+    }
+
+    #[test]
+    fn in_a_narrow_window_the_inbox_takes_the_split_tabs_place_and_the_ptys_keep_their_size() {
+        let mut state = qass_split_window();
+        state.cols = 120;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        size_terminals(&mut state, &mut seqs).unwrap();
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let before = state.sized.clone();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        // A card opens nothing; `ctrl-a i` brings them over the split, the keyboard in them.
+        assert!(state.questions().is_none());
+        assert!(asks_toggle(&mut state) && state.asks_focused());
+        assert!(state.qass_plan().unwrap().side.unwrap().replaces);
+        assert_eq!(size_terminals(&mut state, &mut seqs).unwrap(), None);
+        assert_eq!(state.sized, before);
+        let painted = plain(&screen::paint(&state.frame()));
+        assert!(painted.contains("Question 1?"), "{painted}");
+    }
+
+    /// A window too small for qass's box leaves its pane plain, its pty in the frame every
+    /// pane has, so leaving it for another tab resizes nothing.
+    #[test]
+    fn a_tiny_pane_stays_plain_for_qass() {
+        let mut state = qass_window();
+        state.cols = 40;
+        state.lines = 8;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert_eq!(state.qass_rect(), None);
+        assert_eq!(focused_rect(&state), layout::framed(pane_area(&state)));
+        assert!(
+            state.frame().chrome.qass.is_some(),
+            "asked for, and refused by the plan"
+        );
+        let painted = screen::paint(&state.frame());
+        assert!(!painted.contains("terminal"), "{painted:?}");
+    }
+
+    /// The frame of the real state: the header and the box on qass's tab, the plain pane on
+    /// the owner's, and the sleeping tab speaks for qass too.
+    #[test]
+    fn the_frame_wears_the_header_on_qass_tab_only() {
+        let mut state = qass_window();
+        let strip = |s: &str| {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let plain = strip(&screen::paint(&state.frame()));
+        assert!(
+            !plain.contains("keeping watch") && !plain.contains("T5"),
+            "{plain}"
+        );
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let painted = strip(&screen::paint(&state.frame()));
+        for want in [
+            "qass",
+            "idle",
+            "listening for changes in 2 agents",
+            "[ 0 need you ]",
+            "terminal",
+            "T5",
+        ] {
+            assert!(painted.contains(want), "{want:?} in\n{painted}");
+        }
+        // Asleep: its tab is a line of its space, the keyboard rests on it, the header says so.
+        state.rows.retain(|r| r.terminal != 5);
+        let space = state.spaces.iter_mut().find(|w| w.name == "qass").unwrap();
+        space.asleep = true;
+        space.sleeping = vec![qoop_runtime::control::SleepingTab {
+            terminal: 5,
+            lead: None,
+            title: None,
+            agent: Some("claude".to_string()),
+            session: None,
+            cwd: "/q".to_string(),
+        }];
+        state.focused = 0;
+        assert!(state.on_qass_screen());
+        let painted = strip(&screen::paint(&state.frame()));
+        for want in [
+            "asleep",
+            "enter or",
+            "wakes it",
+            "nothing until you wake it",
+            "T5",
+        ] {
+            assert!(painted.contains(want), "{want:?} in\n{painted}");
+        }
+        let ((cols, rows), inner) = qass_cells(&state);
+        assert_eq!(pane_cells(&state), (inner.cols as u16, inner.rows as u16));
+        assert!(inner.cols < cols as usize && inner.rows < rows as usize);
     }
 
     /// `ctrl-a s/S` pass a sleeping space by, and with every other space asleep stay put.
@@ -25163,6 +29927,28 @@ mod tests {
             "{shown}"
         );
         assert_eq!(s.focused, 1);
+    }
+
+    #[test]
+    fn qass_draws_the_chat_inside_its_box() {
+        let mut s = qass_window();
+        s.palette = None;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut s, &mut seq, &mut seqs).unwrap();
+        assert!(s.on_qass_screen());
+        s.snapshot = Some(pty_screen("PTYTEXT"));
+        let (_, inner) = qass_cells(&s);
+        switch_on(&mut s, 5, "what is blocked");
+        let painted = screen::paint(&s.frame());
+        let shown = plain(&painted);
+        assert!(
+            shown.contains("what is blocked") && !shown.contains("PTYTEXT"),
+            "{shown}"
+        );
+        let drawn = s.chat.shown(5).unwrap();
+        assert_eq!((drawn.cols, drawn.rows), (inner.cols, inner.rows));
+        let row = plain(&written_on(&painted, screen::TABS + 1 + inner.y));
+        assert!(row.contains("> what is blocked"), "{row:?}");
     }
 
     /// The held mouse selection is what the copy key (prefix y) copies, whatever
@@ -26366,135 +31152,128 @@ mod tests {
         s
     }
 
-    /// An Inbox item about `terminal`, so its line says what to do.
-    fn waits(s: &mut State, terminal: u32) {
-        s.ibx_list = crate::inbox::Inbox {
-            items: vec![crate::inbox::Item {
-                slot: crate::answers::Slot::Agent(terminal),
-                kind: crate::inbox::ItemKind::Menu,
-                terminal: Some(terminal),
-                since: Some(100),
-                hand_to_qass: false,
-                lost: false,
-            }],
-            count: 1,
-            ..crate::inbox::Inbox::default()
-        };
+    /// The rail's cells as painted, one string per pane row it covers, trailing blanks off.
+    fn rail_cells(s: &State) -> Vec<String> {
+        cells_in(s, s.tab_rail_paint().expect("a rail").rect)
     }
 
-    /// The line's text as painted, one string, trailing blanks off.
-    fn line_text(s: &State, line: &crate::tabq::Paint) -> String {
+    /// The cells of `rail` as painted, one string per pane row it covers, trailing blanks off.
+    fn cells_in(s: &State, rail: layout::Rect) -> Vec<String> {
         let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
         let grid = cells_of(
             &screen::paint(&s.frame()),
             s.cols as usize,
             s.lines as usize,
         );
-        grid[screen::TABS + line.rect.y][left + line.rect.x..left + line.rect.x + line.rect.cols]
-            .iter()
-            .collect::<String>()
-            .trim_end()
-            .to_string()
+        (0..rail.rows)
+            .map(|y| {
+                grid[screen::TABS + rail.y + y][left + rail.x..left + rail.x + rail.cols]
+                    .iter()
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
     }
 
-    /// The line of the one agent (terminal 1) of a tab, as painted.
-    fn line_of_1(s: &State) -> String {
-        let lines = s.tab_lines();
-        let line = lines.iter().find(|l| l.terminal == 1).expect("a line");
-        line_text(s, line)
-    }
-
-    /// At 170 by 46 an agent's tab keeps all 129 columns of its tile, and under the agent the
-    /// frame's rule and one line of its own, framed with it. Nothing waits: the task's progress
-    /// stands alone at the right end.
+    /// At 170 by 46 an agent's tab keeps a 6 column rail and the line it shares with the pane:
+    /// Claude keeps 122 columns. Nothing waits: a quiet `⠄0` on top, and at the foot a rule, the
+    /// task's `2/4` and its stage word. The pane and the rail are framed together.
     #[test]
-    fn an_agent_tab_keeps_every_column_and_one_framed_line_at_170_by_46() {
+    fn an_agent_tab_keeps_a_quiet_rail_at_170_by_46() {
         let s = agent_tab(170, 46);
-        let tile = tiles_of(&s)[0].1;
-        let term = focused_rect(&s);
-        assert_eq!((term.cols, term.rows), (129, tile.rows - 2));
-        assert_eq!((tile.cols, tile.rows), (129, 40));
-        let lines = s.tab_lines();
-        assert_eq!(lines.len(), 1);
-        let line = lines[0];
-        assert_eq!(line.terminal, 1);
+        let tile = focused_rect(&s);
+        assert_eq!((tile.cols, tile.rows), (122, 40));
+        let rail = s.tab_rail_paint().expect("a rail");
         assert_eq!(
-            (line.rect.x, line.rect.y, line.rect.cols, line.rect.rows),
-            (tile.x, tile.y + tile.rows - 1, 129, 1)
+            (rail.rect, rail.terminal),
+            (
+                layout::Rect {
+                    x: 124,
+                    y: 1,
+                    cols: 6,
+                    rows: 40
+                },
+                1
+            )
         );
-        let text = line_of_1(&s);
+        let cells = rail_cells(&s);
+        assert_eq!(cells[0], " \u{2804}0");
+        assert_eq!(cells[36], "\u{2500}".repeat(6));
+        assert_eq!(cells[37], " 2/4");
+        assert_eq!(cells[38], " build");
         assert!(
-            text.ends_with("2/4 implementing") && !text.contains("needs you"),
-            "{text:?}"
+            cells[1..36]
+                .iter()
+                .chain(&cells[39..])
+                .all(String::is_empty),
+            "{cells:?}"
         );
         let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
         let grid = cells_of(&screen::paint(&s.frame()), 170, 46);
-        let at = |y: usize, x: usize| grid[screen::TABS + y][left + x];
-        let (rule, bottom, right) = (
-            tile.y + tile.rows - 2,
-            tile.y + tile.rows,
-            tile.x + tile.cols,
-        );
+        let (top, bottom) = (&grid[screen::TABS], &grid[screen::TABS + 41]);
         assert_eq!(
             (
-                at(rule, tile.x + 5),
-                at(rule, right),
-                at(bottom, tile.x + 5),
-                at(bottom, right)
+                top[left + 123],
+                top[left + 130],
+                bottom[left + 123],
+                bottom[left + 130]
             ),
-            ('\u{2500}', '\u{2524}', '\u{2500}', '\u{256f}'),
-            "one frame round the pane and its line, joined by a rule"
+            ('\u{252c}', '\u{256e}', '\u{2534}', '\u{256f}'),
+            "one frame round the pane and the rail, joined"
+        );
+        let shared = grid[screen::TABS + 10][left + 123];
+        assert_eq!(shared, '\u{2502}');
+    }
+
+    /// At 80 by 24 the rail is 4 columns (Claude keeps 34): the count stays, the stage word drops.
+    #[test]
+    fn the_rail_narrows_at_80_by_24() {
+        let s = agent_tab(80, 24);
+        assert_eq!(focused_rect(&s).cols, 34);
+        let cells = rail_cells(&s);
+        assert_eq!(cells.len(), 18);
+        assert_eq!(cells[0], "\u{2804}0");
+        assert_eq!(
+            &cells[14..],
+            [
+                "\u{2500}".repeat(4),
+                "2/4".into(),
+                String::new(),
+                String::new()
+            ]
         );
     }
 
-    /// At 80 by 24 the agent keeps the whole width of its tile, the words stay whole and the
-    /// stage word gives way before the count does.
+    /// Beside a shell, an agent pane under 60 columns takes the narrow rail. The rail speaks for
+    /// the agent while the keyboard is in the shell, and the shell is never cut.
     #[test]
-    fn the_line_keeps_its_words_whole_and_drops_the_stage_first_at_80_by_24() {
-        let mut s = agent_tab(80, 24);
-        let tile = tiles_of(&s)[0].1;
-        assert_eq!(focused_rect(&s).cols, tile.cols, "no columns go to a rail");
-        assert!(tile.cols < 46, "{tile:?}");
-        assert!(
-            line_of_1(&s).ends_with("2/4 implementing"),
-            "{:?}",
-            line_of_1(&s)
-        );
-        waits(&mut s, 1);
-        let text = line_of_1(&s);
-        assert!(text.starts_with(" needs you: ctrl-a i answers"), "{text:?}");
-        assert!(
-            text.ends_with("2/4") && !text.contains("implementing"),
-            "{text:?}"
-        );
-    }
-
-    /// Beside a shell, the agent's pane keeps its own line and the shell has none; the line
-    /// speaks for the agent while the keyboard is in the shell.
-    #[test]
-    fn a_split_keeps_the_line_with_the_agent_only() {
+    fn a_60_column_split_keeps_the_rail_with_the_agent() {
         let s = shell_beside_agent();
-        let lines = s.tab_lines();
-        assert_eq!(lines.len(), 1, "the shell carries none");
-        assert_eq!(lines[0].terminal, 1);
+        let rail = s.tab_rail_paint().expect("a rail");
+        assert_eq!((rail.rect.cols, rail.terminal), (4, 1));
         let tree = s.drawn_tree(1).unwrap();
         let tiles = tree.tile_rects(pane_area(&s));
         let terms = s.term_rects(&tree);
-        assert_eq!(terms[0].1, tiles[0].1, "the shell keeps its whole tile");
+        let (shell, claude) = (terms[0].1, terms[1].1);
+        assert!(claude.cols < 60 && shell.cols > claude.cols, "{terms:?}");
+        assert_eq!(shell, tiles[0].1, "the shell keeps its whole tile");
         assert_eq!(
-            terms[1].1.cols, tiles[1].1.cols,
-            "the agent keeps every column"
+            claude.x + claude.cols + 1,
+            rail.rect.x,
+            "the rail right of the agent"
         );
-        assert_eq!(terms[1].1.rows + 2, tiles[1].1.rows);
-        assert_eq!(lines[0].rect.cols, tiles[1].1.cols);
-        assert!(
-            line_of_1(&s).ends_with("2/4 implementing"),
-            "{:?}",
-            line_of_1(&s)
+        assert_eq!(
+            rail.rect.x + rail.rect.cols,
+            tiles[1].1.x + tiles[1].1.cols,
+            "inside the agent's own tile"
         );
+        assert_eq!(rail_cells(&s)[0], "\u{2804}0");
+        assert_eq!(s.tab_rails().len(), 1, "the shell carries none");
     }
 
-    /// Two Claude panes (1 and 2) side by side in one tab, the keyboard in the first.
+    /// Two Claude panes (1 and 2) side by side in one tab, the keyboard in the first; 1 waits on
+    /// Q1, 2 on Q2 and Q3.
     fn two_agents(cols: u16, lines: u16) -> State {
         let mut s = agent_tab(cols, lines);
         let mut second = s.rows[0].clone();
@@ -26513,46 +31292,53 @@ mod tests {
             ..Layout::single(1)
         };
         s.layouts.insert(1, tree);
+        let card = |terminal: u32, name: &str| {
+            let mut c = ask_card(terminal, "claude");
+            c.card = name.to_string();
+            c
+        };
+        s.asks.take(
+            vec![card(1, "Q1"), card(2, "Q2"), card(2, "Q3")],
+            Vec::new(),
+        );
         s
     }
 
-    /// The tiles of space 1's tab as laid out, before any line is cut from them.
+    /// The tiles of space 1's tab as laid out, before any rail is cut from them.
     fn tiles_of(s: &State) -> Vec<(u32, layout::Rect)> {
         s.layouts[&1].tile_rects(pane_area(s))
     }
 
-    /// Each of two agents split in one tab carries its own line at the foot of its own tile,
-    /// with its own task and words, read the same without colour; each one's terminal is its
-    /// tile less its line, and that is what its PTY is sized to.
+    /// Each of two agents split in one tab carries its own rail at the right of its own tile,
+    /// with its own count and cards, read the same without colour; each one's terminal is its
+    /// tile less its rail, and that is what its PTY is sized to.
     #[test]
-    fn two_agents_side_by_side_each_carry_their_own_line() {
+    fn two_agents_side_by_side_each_carry_their_own_rail() {
         use crate::colorlevel::{Level, TEST_LEVEL};
-        let mut s = two_agents(170, 46);
-        waits(&mut s, 2);
-        let lines = s.tab_lines();
-        assert_eq!(lines.iter().map(|l| l.terminal).collect::<Vec<_>>(), [1, 2]);
+        let s = two_agents(170, 46);
+        let rails = s.tab_rails();
+        assert_eq!(rails.iter().map(|r| r.terminal).collect::<Vec<_>>(), [1, 2]);
         let tiles = tiles_of(&s);
-        for (line, (t, tile)) in lines.iter().zip(&tiles) {
-            assert_eq!(line.terminal, *t);
-            assert_eq!(
-                (line.rect.x, line.rect.y + 1, line.rect.cols),
-                (tile.x, tile.y + tile.rows, tile.cols),
-                "{t}"
-            );
+        for (rail, (t, tile)) in rails.iter().zip(&tiles) {
+            assert_eq!(rail.terminal, *t);
+            assert_eq!(rail.rect.cols, crate::tabq::NARROW, "a tile under 120");
+            assert_eq!(rail.rect.x + rail.rect.cols, tile.x + tile.cols, "{t}");
+            assert_eq!((rail.rect.y, rail.rect.rows), (tile.y, tile.rows));
         }
-        let first = line_text(&s, &lines[0]);
-        let second = line_text(&s, &lines[1]);
-        assert!(
-            !first.contains("needs you") && first.ends_with("2/4 implementing"),
-            "{first:?}"
+        let first = cells_in(&s, rails[0].rect);
+        let second = cells_in(&s, rails[1].rect);
+        assert_eq!(
+            (first[0].as_str(), first[2].as_str(), first[3].as_str()),
+            ("\u{2814}1", "\u{2814}Q1", "")
         );
-        assert!(
-            second.starts_with(" needs you: ctrl-a i answers"),
-            "{second:?}"
+        assert_eq!(
+            (second[0].as_str(), second[2].as_str(), second[3].as_str()),
+            ("\u{2814}2", "\u{2814}Q2", "\u{2814}Q3")
         );
-        assert!(second.ends_with("1/4 implementing"), "{second:?}");
+        // Each foot is its own agent's task.
+        assert_eq!((first[37].as_str(), second[37].as_str()), ("2/4", "1/4"));
         TEST_LEVEL.with(|c| c.set(Some(Level::Mono)));
-        let mono = (line_text(&s, &lines[0]), line_text(&s, &lines[1]));
+        let mono = (cells_in(&s, rails[0].rect), cells_in(&s, rails[1].rect));
         TEST_LEVEL.with(|c| c.set(None));
         assert_eq!(mono, (first, second), "the same without colour");
 
@@ -26560,89 +31346,351 @@ mod tests {
         let mut seqs = std::collections::BTreeMap::new();
         size_terminals(&mut s, &mut seqs).unwrap();
         for (t, tile) in tiles_of(&s) {
-            assert_eq!(
-                s.sized[&t],
-                (tile.cols as u16, (tile.rows - 2) as u16),
-                "{t}"
-            );
+            let cols = (tile.cols - crate::tabq::NARROW - 1) as u16;
+            assert_eq!(s.sized[&t], (cols, tile.rows as u16), "{t}");
         }
         // The focus moving between them resizes nothing.
         (s.focused, s.layouts.get_mut(&1).unwrap().focus) = (2, 2);
         assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none());
     }
 
-    /// No line on a tab with no local agent in it or on qass's tabs: the pane keeps its whole
-    /// height. A daemon that keeps no cards still has the line: the Inbox does not need them.
+    /// Unfolded, one agent's pane narrows that agent only; the other keeps its size and its
+    /// folded rail. A click on the second pane's rail unfolds that one and folds the first.
     #[test]
-    fn a_tab_with_no_local_agent_has_no_line() {
+    fn unfolding_one_agent_narrows_only_its_pane() {
+        let mut s = two_agents(300, 46);
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut s, &mut seqs).unwrap();
+        let before = s.sized.clone();
+        let tiles = tiles_of(&s);
+        assert!(tiles.iter().all(|(_, t)| t.cols >= 118), "{tiles:?}");
+        assert!(fold_key(&mut s));
+        assert_eq!(s.tabq, Some(1));
+        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_some());
+        let open = (tiles[0].1.cols - crate::tabq::OPEN - 1) as u16;
+        assert_eq!(s.sized[&1].0, open, "the first narrows");
+        assert_eq!(s.sized[&2], before[&2], "the second keeps its size");
+        let rails = s.tab_rails();
+        assert!(rails[0].open.is_some_and(|o| !o.over));
+        assert_eq!((rails[1].open.is_none(), rails[1].rect.cols), (true, 6));
+        assert!(pane_text(&s).contains("questions \u{b7} claude \u{2814} 1"));
+
+        let rail = rails[1].rect;
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let (row, col) = (
+            (screen::TABS + 1 + rail.y + 3) as u16,
+            (left + 1 + rail.x + 2) as u16,
+        );
+        assert!(
+            s.tile_at_screen(row, col).is_none(),
+            "the rail is no terminal"
+        );
+        assert_eq!(s.tabq_click(row, col), Some(true));
+        assert_eq!(s.tabq, Some(2), "the second unfolds, the first folds");
+        size_terminals(&mut s, &mut seqs).unwrap();
+        assert_eq!(s.sized[&1], before[&1]);
+        assert_eq!(
+            s.sized[&2].0,
+            (tiles[1].1.cols - crate::tabq::OPEN - 1) as u16
+        );
+        assert!(pane_text(&s).contains("questions \u{b7} claude \u{2814} 2"));
+    }
+
+    /// `<` and `>` in the unfolded pane take 4 columns off or add them, the agent beside it
+    /// sized again; never under 40. Its left edge drags its width; past what leaves the agent 60
+    /// columns the pane stands over the agent at that width and the agent keeps its folded
+    /// size. The width holds through a fold for the session.
+    #[test]
+    fn the_unfolded_pane_takes_the_width_he_gives_it() {
+        let mut s = two_agents(300, 46);
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut s, &mut seqs).unwrap();
+        let folded = s.sized[&1];
+        let other = s.sized[&2];
+        let tile = tiles_of(&s)[0].1;
+        assert!(fold_key(&mut s));
+        let width = |s: &State| s.tabq_open().unwrap().rect.cols - 2;
+        assert_eq!(width(&s), crate::tabq::OPEN);
+        let agent = |s: &mut State, seqs: &mut std::collections::BTreeMap<u32, u32>| {
+            size_terminals(s, seqs).unwrap();
+            s.sized[&1].0 as usize
+        };
+        assert_eq!(agent(&mut s, &mut seqs), tile.cols - 53);
+        assert!(tabq_keys(&mut s, b">", 0x01).resize);
+        assert_eq!(width(&s), 56);
+        assert_eq!(
+            agent(&mut s, &mut seqs),
+            tile.cols - 57,
+            "the agent narrows"
+        );
+        assert_eq!(s.sized[&2], other, "the other agent is never touched");
+        for _ in 0..10 {
+            tabq_keys(&mut s, b"<", 0x01);
+        }
+        assert_eq!(width(&s), crate::tabq::OPEN_MIN, "never under 40");
+        assert!(
+            !tabq_keys(&mut s, b"<", 0x01).resize,
+            "nothing left to take"
+        );
+
+        // The left edge, held and dragged ten columns left: ten columns wider.
+        let open = s.tabq_open().unwrap().rect;
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let (row, col) = (
+            (screen::TABS + 1 + open.y + 5) as u16,
+            (left + 1 + open.x) as u16,
+        );
+        let mut control_seq = 0;
+        assert!(
+            tabq_press(&mut s, row, col, &mut control_seq, &mut seqs)
+                .unwrap()
+                .is_none(),
+            "the edge is not the pane's"
+        );
+        assert!(s.split_press(col, row));
+        assert_eq!(s.modes.split_drag, Some(Grab::Tabq));
+        assert!(s.split_motion(col - 10, row));
+        assert_eq!(width(&s), crate::tabq::OPEN_MIN + 10);
+        // Far left, past the agent's 60 columns: over the agent, at that width.
+        assert!(s.split_motion(col - 60, row));
+        let (over, open_x) = s.tabq_open().map(|o| (o.over, o.rect.x)).unwrap();
+        assert!(over);
+        assert_eq!(width(&s), crate::tabq::OPEN_MIN + 60);
+        assert_eq!(agent(&mut s, &mut seqs), folded.0 as usize, "folded size");
+        assert!(open_x > tile.x, "the agent's left part stays in sight");
+        s.modes.split_drag = None;
+        // Folded and unfolded again, the width he chose holds.
+        assert!(fold_key(&mut s));
+        assert!(fold_key(&mut s));
+        assert_eq!(width(&s), crate::tabq::OPEN_MIN + 60);
+    }
+
+    /// Where the agent would keep under 60 columns, its pane opens over its own tile: nothing
+    /// is resized, the other agent's rail stays folded, and a click on that rail unfolds it.
+    #[test]
+    fn a_narrow_split_opens_the_pane_over_its_own_tile() {
+        let mut s = two_agents(170, 46);
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut s, &mut seqs).unwrap();
+        assert!(fold_key(&mut s));
+        let open = s.tabq_open().unwrap();
+        assert!(open.over);
+        let tiles = tiles_of(&s);
+        assert!(open.rect.x + open.rect.cols <= tiles[0].1.x + tiles[0].1.cols);
+        assert!(
+            size_terminals(&mut s, &mut seqs).unwrap().is_none(),
+            "no resize"
+        );
+        let rail = s.tab_rails()[1].rect;
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let (row, col) = (
+            (screen::TABS + 1 + rail.y + 2) as u16,
+            (left + 1 + rail.x + 1) as u16,
+        );
+        assert_eq!(s.tabq_click(row, col), Some(true));
+        assert_eq!(s.tabq, Some(2));
+        assert!(s.tabq_open().is_some_and(|o| o.over));
+        assert!(
+            size_terminals(&mut s, &mut seqs).unwrap().is_none(),
+            "still none"
+        );
+    }
+
+    /// A press on the other agent's rail moves the keyboard there first, then unfolds its pane:
+    /// the lit frame, the pane's keys and `g` all speak for that agent. A press in its open pane
+    /// from the first agent brings the keyboard back the same way.
+    #[test]
+    fn a_press_on_another_agents_rail_moves_the_focus_there_first() {
+        let mut s = two_agents(170, 46);
+        let (mut control_seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        size_terminals(&mut s, &mut seqs).unwrap();
+        let rail = s.tab_rails()[1].rect;
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let at = |r: layout::Rect, dy: usize, dx: usize| {
+            (
+                (screen::TABS + 1 + r.y + dy) as u16,
+                (left + 1 + r.x + dx) as u16,
+            )
+        };
+        let (row, col) = at(rail, 2, 1);
+        assert_eq!(s.tabq_at(row, col), Some(2));
+        let (resize, _) = tabq_press(&mut s, row, col, &mut control_seq, &mut seqs)
+            .unwrap()
+            .expect("the rail's");
+        assert!(resize);
+        assert_eq!((s.focused, s.layouts[&1].focus, s.tabq), (2, 2, Some(2)));
+        assert!(s.tabq_focused(), "the pane has the keys");
+        assert!(s.frame().tiles.iter().any(|t| t.focused && t.terminal == 2));
+        // The keyboard back in the first agent, then a press in the second's open pane.
+        focus(&mut s, 1, &mut control_seq, &mut seqs).unwrap();
+        s.tabq_settle();
+        assert!(!s.tabq_focused() && s.tabq_open().is_some());
+        let (row, col) = at(s.tabq_open().unwrap().rect, 3, 4);
+        assert_eq!(
+            tabq_press(&mut s, row, col, &mut control_seq, &mut seqs)
+                .unwrap()
+                .map(|(resize, _)| resize),
+            Some(false)
+        );
+        assert_eq!(s.focused, 2);
+        assert!(s.tabq_focused());
+        // `g` gives the keyboard to the agent whose pane it was (over its tile, the pane folds).
+        assert_eq!(tabq_keys(&mut s, b"g", 0x01).jump, Some(2));
+    }
+
+    /// The unfolded pane folds once its agent closes, is split out to a tab of its own, or moves
+    /// to another space, so it never arrives unfolded anywhere else; a pane closing beside it or
+    /// a new one split in leaves it open.
+    #[test]
+    fn the_unfolded_pane_folds_once_its_agent_leaves_its_tab() {
+        let unfolded = || {
+            let mut s = two_agents(300, 46);
+            assert!(fold_key(&mut s));
+            assert_eq!(s.tabq, Some(1));
+            s
+        };
+        let mut seqs = std::collections::BTreeMap::new();
+
+        let mut closed = unfolded();
+        closed.rows.retain(|r| r.terminal != 1);
+        closed.layouts.insert(1, Layout::single(2));
+        (closed.focused, closed.layouts.get_mut(&1).unwrap().focus) = (2, 2);
+        assert!(closed.tabq_settle());
+        assert_eq!(closed.tabq, None, "closed");
+
+        let mut split_out = unfolded();
+        split_out.layouts.insert(1, Layout::single(2));
+        split_out.parked.insert(1, vec![Layout::single(1)]);
+        size_terminals(&mut split_out, &mut seqs).unwrap();
+        assert_eq!(split_out.tabq, None, "a tab of its own");
+        assert_eq!(
+            split_out.sized[&1].0 as usize,
+            split_out.lone_rect(1).cols,
+            "sized folded"
+        );
+
+        let mut moved = unfolded();
+        moved.spaces.push(space(2, "other"));
+        moved.rows[0].workspace = 2;
+        moved.layouts.insert(1, Layout::single(2));
+        moved.layouts.insert(2, Layout::single(1));
+        assert!(moved.tabq_settle());
+        assert_eq!(moved.tabq, None, "another space");
+        (moved.space, moved.focused) = (Some(2), 1);
+        assert!(moved.tab_rails().iter().all(|r| r.open.is_none()));
+
+        let mut beside_closed = unfolded();
+        beside_closed.rows.retain(|r| r.terminal != 2);
+        beside_closed.layouts.insert(1, Layout::single(1));
+        beside_closed.tabq_settle();
+        assert_eq!(beside_closed.tabq, Some(1), "the other pane closed");
+
+        let mut split_in = unfolded();
+        split_in.rows.push(agent(3, 1, "zsh", "idle"));
+        let leaf = |t| Box::new(crate::layout::Node::Leaf { terminal: Some(t) });
+        let tree = split_in.layouts.get_mut(&1).unwrap();
+        tree.root = crate::layout::Node::Split {
+            dir: crate::layout::Dir::H,
+            ratio: 0.5,
+            first: Box::new(tree.root.clone()),
+            second: leaf(3),
+        };
+        split_in.tabq_settle();
+        assert_eq!(split_in.tabq, Some(1), "a new pane split in");
+    }
+
+    /// Without colour the rail reads the same: its words and marks carry it, and none of its
+    /// rows asks for a colour.
+    #[test]
+    fn the_rail_reads_the_same_without_colour() {
+        use crate::colorlevel::{Level, TEST_LEVEL};
+        let mut s = agent_tab(170, 46);
+        let mut card = ask_card(1, "claude");
+        card.card = "Q8".to_string();
+        s.asks.take(vec![card], Vec::new());
+        let colour = rail_cells(&s);
+        TEST_LEVEL.with(|c| c.set(Some(Level::Mono)));
+        let mono = rail_cells(&s);
+        let paint = s.tab_rail_paint().unwrap();
+        let rows = crate::tabq::rows(&paint, s.rows[0].task.as_ref(), false);
+        TEST_LEVEL.with(|c| c.set(None));
+        assert_eq!(mono, colour);
+        assert_eq!(
+            (mono[0].as_str(), mono[2].as_str()),
+            (" \u{2814}1", " \u{2814}Q8")
+        );
+        assert!(rows.iter().all(|r| !r.contains("38;5")), "{rows:?}");
+    }
+
+    /// No rail on a tab with no local agent in it, on qass's tabs, or while the daemon keeps no
+    /// cards (not read yet, or too old): the pane keeps its whole width.
+    #[test]
+    fn a_tab_with_no_local_agent_has_no_rail() {
         let whole = |s: &State| {
-            assert!(s.tab_lines().is_empty());
-            focused_rect(s).rows
+            assert!(s.tab_rail_paint().is_none());
+            focused_rect(s).cols
         };
         let mut shell = agent_tab(170, 46);
         shell.rows[0].agent = false;
-        assert_eq!(whole(&shell), 40, "a shell-only tab");
+        assert_eq!(whole(&shell), 129, "a shell-only tab");
 
         let mut remote = agent_tab(170, 46);
         let far = crate::mux::REMOTE_TERMINAL | 1;
         remote.rows[0].terminal = far;
         remote.focused = far;
         remote.layouts.insert(1, Layout::single(far));
-        assert_eq!(whole(&remote), 40, "another machine's agent");
+        assert_eq!(whole(&remote), 129, "another machine's agent");
 
         let mut qass = agent_tab(170, 46);
         qass.spaces = vec![space(1, sidebar::QASS_SPACE)];
-        assert!(qass.tab_lines().is_empty(), "qass's tab");
+        assert_eq!(qass.tree_area(&qass.layouts[&1]).cols, 131, "qass's tab");
 
         let mut old = agent_tab(170, 46);
         old.asks.unsupported = true;
-        assert_eq!(
-            old.tab_lines().len(),
-            1,
-            "a daemon without cards still has it"
-        );
-        assert_eq!(focused_rect(&old).rows, 38);
+        assert_eq!(whole(&old), 129, "a daemon without cards");
 
         let shells_only = {
             let mut s = shell_beside_agent();
             s.rows[0].agent = false;
             s
         };
-        assert!(shells_only.tab_lines().is_empty(), "two shells");
+        assert!(shells_only.tab_rail_paint().is_none(), "two shells");
     }
 
-    /// The line is there from the first size, before any card is read, so an attach sizes the
-    /// agent once; a question arriving or answered, a step ticked and the first read change
-    /// the line's words and never the agent's size.
+    /// The rail is there from the first size, before any card is read, so an attach sizes the
+    /// agent once; folded, the first read, a card arriving or answered and a step ticked change
+    /// its rows and never the agent's size.
     #[test]
-    fn the_agents_size_holds_while_the_lines_words_change() {
+    fn the_agents_size_holds_while_the_rail_is_folded() {
         let mut s = agent_tab(170, 46);
         s.asks = crate::asks::Pane::new();
-        assert!(!s.tab_lines().is_empty(), "no read needed");
+        assert!(s.tab_rail_paint().is_some(), "no read needed");
         let mut seqs = std::collections::BTreeMap::new();
         assert!(size_terminals(&mut s, &mut seqs).unwrap().is_some());
-        assert_eq!(s.sized.get(&1), Some(&(129, 38)));
+        assert_eq!(s.sized.get(&1), Some(&(122, 40)));
         s.asks.take(Vec::new(), Vec::new());
         assert!(
             size_terminals(&mut s, &mut seqs).unwrap().is_none(),
             "the first read"
         );
-        waits(&mut s, 1);
+        let mut card = ask_card(1, "claude");
+        card.card = "Q8".to_string();
+        s.asks.take(vec![card], Vec::new());
         assert!(
             size_terminals(&mut s, &mut seqs).unwrap().is_none(),
-            "a question arrives"
+            "a card arrives"
         );
         s.rows[0].task.as_mut().unwrap().steps_done = 3;
         assert!(
             size_terminals(&mut s, &mut seqs).unwrap().is_none(),
             "a step ticked"
         );
-        s.ibx_list = crate::inbox::Inbox::default();
+        s.asks.take(Vec::new(), Vec::new());
         assert!(
             size_terminals(&mut s, &mut seqs).unwrap().is_none(),
-            "answered"
+            "the card answered"
         );
-        assert_eq!(s.sized.get(&1), Some(&(129, 38)));
+        assert_eq!(s.sized.get(&1), Some(&(122, 40)));
     }
 
     /// The keyboard moving between the shell and the agent of one tab resizes neither.
@@ -26656,1231 +31704,658 @@ mod tests {
         s.focused = 1;
         assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none());
         assert_eq!(s.sized, before);
-        assert_eq!(s.tab_lines().len(), 1);
+        assert_eq!(s.tab_rail_paint().unwrap().rect.cols, 4);
     }
 
-    /// The line follows the row it reads: a step ticked moves its count, an Inbox item puts its
-    /// words in front, the next frame; a task on no item says its stage alone.
+    /// The rail follows the row it reads: a step ticked moves its count, a card arriving puts
+    /// its mark under the count, the next frame.
     #[test]
-    fn a_tick_or_an_inbox_item_refreshes_the_line() {
+    fn a_tick_or_a_card_refreshes_the_rail() {
         let mut s = agent_tab(170, 46);
-        assert!(line_of_1(&s).ends_with("2/4 implementing"));
+        assert_eq!(rail_cells(&s)[37], " 2/4");
         s.rows[0].task.as_mut().unwrap().steps_done = 3;
-        assert!(line_of_1(&s).ends_with("3/4 implementing"));
+        assert_eq!(rail_cells(&s)[37], " 3/4");
         s.rows[0].task.as_mut().unwrap().steps_total = 6;
-        assert!(
-            line_of_1(&s).ends_with("3/6 implementing"),
-            "a plan grown to six steps"
+        assert_eq!(rail_cells(&s)[37], " 3/6", "a plan grown to six steps");
+        let mut card = ask_card(1, "claude");
+        card.card = "Q8".to_string();
+        s.asks.take(vec![card], Vec::new());
+        let cells = rail_cells(&s);
+        assert_eq!(
+            (cells[0].as_str(), cells[2].as_str()),
+            (" \u{2814}1", " \u{2814}Q8")
         );
-        waits(&mut s, 1);
-        assert!(line_of_1(&s).starts_with(" needs you: ctrl-a i answers"));
-        // The agent's row in the column carries no card mark any more.
-        assert!(!plain(&screen::paint(&s.frame())).contains("claude \u{2814}"));
+        // The agent's row in the column counts it too.
+        assert!(plain(&screen::paint(&s.frame())).contains("claude \u{2814}1"));
+        // A task on no item: its stage word alone under the rule.
         let task = s.rows[0].task.as_mut().unwrap();
         (task.item, task.steps_done, task.steps_total) = (None, 0, 0);
         task.stage = "waiting-human".to_string();
-        assert!(
-            line_of_1(&s).ends_with("waiting human"),
-            "{:?}",
-            line_of_1(&s)
+        let cells = rail_cells(&s);
+        assert_eq!(
+            (cells[36].as_str(), cells[37].as_str()),
+            ("\u{2500}".repeat(6).as_str(), " waits")
         );
     }
 
-    /// A press on the line is the line's: no pane is under it, and while its agent waits it is
-    /// `ctrl-a i`; a press on the agent's tile is the agent's.
+    /// A press on the rail is the rail's: no pane is under it, and it unfolds the pane; a press on
+    /// the agent's tile is the agent's.
     #[test]
-    fn a_press_on_the_line_reaches_no_pane() {
+    fn a_press_on_the_rail_reaches_no_pane() {
         let mut s = agent_tab(170, 46);
-        let line = s.tab_lines()[0].rect;
+        let rail = s.tab_rail_paint().unwrap().rect;
         let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
         let (row, col) = (
-            (screen::TABS + 1 + line.y) as u16,
-            (left + 1 + line.x + 2) as u16,
+            (screen::TABS + 1 + rail.y + 3) as u16,
+            (left + 1 + rail.x + 2) as u16,
         );
         assert!(s.tile_at_screen(row, col).is_none());
-        assert!(
-            s.clicked(row, col).is_none(),
-            "nothing waits: no key to press"
-        );
-        waits(&mut s, 1);
-        assert!(matches!(s.clicked(row, col), Some(Clicked::Inbox)));
         let pane = (left + 1 + 10) as u16;
-        assert_eq!(s.tile_at_screen(row - 3, pane).map(|hit| hit.0), Some(1));
-        assert!(
-            s.clicked(row - 3, pane).is_none(),
-            "the agent's own cells stay the agent's"
-        );
+        assert_eq!(s.tile_at_screen(row, pane).map(|hit| hit.0), Some(1));
+        assert_eq!(s.tabq_click(row, pane), None, "the agent's");
+        assert_eq!(s.tabq_click(row, col), Some(true), "unfolds");
+        assert!(s.tabq_focused());
     }
 
-    // The Inbox (round 2) -------------------------------------------------------------------
-
-    /// A row as the daemon sends it now: with the status it decided, and since when it waits.
-    fn waiting_row(terminal: u32, workspace: i64, status: &str, since: i64) -> AgentRow {
-        let mut row = agent(terminal, workspace, "claude", status);
-        row.status = Some(status.to_string());
-        row.last_active_at_unix = Some(since);
-        row
-    }
-
-    /// An Inbox state: a failed agent (3) and a blocked one (1), the oldest first, an unread
-    /// finish (2) between them in the daemon's list, and the keyboard on a working agent (6).
-    fn inbox_state() -> State {
-        let mut s = state();
-        s.spaces = vec![space(1, "app"), space(2, "webshop")];
-        s.rows = vec![
-            waiting_row(1, 1, "blocked", 100),
-            waiting_row(2, 2, "done", 150),
-            waiting_row(3, 2, "failed", 200),
-            waiting_row(6, 2, "working", 50),
-        ];
-        s.focused = 6;
-        s.space = Some(2);
-        s.palette = None;
-        s.refresh_ibx();
-        s
-    }
-
-    /// The status line says whole predicates ("has failed", "is blocked") and names an agent as
-    /// the agents column does, its space and its session.
-    #[test]
-    fn the_status_line_names_the_agent_as_the_column_does_and_says_a_whole_predicate() {
-        let mut s = inbox_state();
-        s.view = sidebar::View::Priority;
-        let column: Vec<String> = s
-            .column_rows_now()
-            .iter()
-            .map(|(l, _)| l.text.clone())
-            .collect();
-        let next = s.next_waiting().expect("one waits");
-        assert_eq!((next.who.as_str(), next.says), ("app claude", "is blocked"));
-        assert!(
-            column.iter().any(|l| l.contains("app claude")),
-            "{column:?}"
-        );
-        s.focused = 1;
-        let next = s.next_waiting().expect("the failed one");
-        assert_eq!(
-            (next.who.as_str(), next.says),
-            ("webshop claude", "has failed")
-        );
-        assert!(
-            column.iter().any(|l| l.contains("webshop claude")),
-            "{column:?}"
-        );
-        assert_eq!(next.short, "webshop / claude");
-    }
-
-    #[test]
-    fn ctrl_a_tab_visits_only_what_is_counted_and_skips_unread_done() {
-        let mut s = inbox_state();
-        let next = |s: &State| s.up_next().and_then(|i| i.terminal);
-        // Oldest first, and the unread finish (2) is never the next.
-        assert_eq!(next(&s), Some(1));
-        s.focused = 1;
-        assert_eq!(
-            next(&s),
-            Some(3),
-            "after the blocked one comes the failed one"
-        );
-        s.focused = 3;
-        assert_eq!(
-            next(&s),
-            Some(1),
-            "and round again, never the unread finish"
-        );
-        s.focused = 2;
-        assert_eq!(next(&s), Some(1));
-        // Nothing counted: nothing is next.
-        s.rows.retain(|r| r.terminal == 2 || r.terminal == 6);
-        s.focused = 6;
-        assert_eq!(next(&s), None);
-        // The status line names the same one, in the failed ink for a failure.
-        let mut s = inbox_state();
-        s.focused = 1;
-        let next = s.next_waiting().expect("one waits");
-        assert_eq!(next.who, "webshop claude");
-        assert!(next.failed && next.says == "has failed");
-    }
-
-    #[test]
-    fn the_palettes_needs_you_section_counts_by_the_one_rule() {
-        let mut s = inbox_state();
-        // qass runs, and one blocked agent is handed to it.
-        s.spaces.push(space(3, "qass"));
-        s.rows.push(waiting_row(9, 3, "idle", 10));
-        let mut handed = waiting_row(5, 1, "blocked", 120);
-        handed.with_qass = true;
-        s.rows.push(handed);
-        s.refresh_ibx();
-        let palette = s.new_palette(Vec::new());
-        let entries = palette.items(
-            &s.rows,
-            &s.spaces,
-            s.focused,
-            &s.seen_done,
-            &s.unseen_finished,
-        );
-        let section = |name: &str| -> Vec<palette::Item> {
-            entries
-                .iter()
-                .filter(|e| e.section == name)
-                .map(|e| e.item.clone())
-                .collect()
-        };
-        // The blocked and the failed agent, oldest first: not the handed one, not the finish.
-        assert_eq!(
-            section("needs you"),
-            vec![palette::Item::Terminal(1), palette::Item::Terminal(3)]
-        );
-        assert_eq!(section("with qass"), vec![palette::Item::Terminal(5)]);
-        assert_eq!(section("new"), vec![palette::Item::Terminal(2)]);
-    }
-
-    #[test]
-    fn ctrl_a_i_opens_the_inbox_over_any_tab_and_a_jump_puts_it_away() {
-        // From an agent's tab in a window of 104 columns: the column stays.
-        let mut s = inbox_state();
-        s.cols = 104;
-        s.lines = 30;
-        assert!(!s.ibx.open && s.ibx_view().is_none());
-        assert!(!inbox_toggle(&mut s));
-        assert!(s.ibx.open && !s.collapsed);
-        let view = s.ibx_view().expect("painted");
-        assert!(view.plain[0].contains("needs you 2"), "{:?}", view.plain[0]);
-        // Over everything: the first row is the Inbox's, not the tab bar's.
-        assert_eq!(view.plain.len(), s.ibx_size().1);
-        // Away again by the same key.
-        assert!(!inbox_toggle(&mut s));
-        assert!(!s.ibx.open);
-        // Going to an agent puts it away too.
-        inbox_toggle(&mut s);
-        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
-        focus(&mut s, 1, &mut seq, &mut seqs).expect("focus");
-        assert!(!s.ibx.open);
-        assert_eq!(s.focused, 1);
-    }
-
-    /// `ctrl-a i` with qass's ledger up (opened over the Inbox or not) shows the Inbox list, as
-    /// the key says: it never closes whatever is up, which left the person on the terminal with
-    /// the next keys typed into it. On the list itself it puts the Inbox away.
-    #[test]
-    fn ctrl_a_i_from_the_ledger_shows_the_inbox_list() {
-        for over_the_inbox in [true, false] {
-            let mut s = inbox_state();
-            s.cols = 104;
-            s.lines = 30;
-            if over_the_inbox {
-                open_inbox(&mut s);
-            }
-            assert!(!ledger_toggle(&mut s));
-            assert!(matches!(s.ibx.place, Some(crate::places::Place::Ledger(_))));
-            assert!(!inbox_toggle(&mut s));
-            assert!(s.ibx.open && s.ibx.place.is_none(), "the list shows");
-            assert!(!inbox_toggle(&mut s));
-            assert!(!s.ibx.open, "on the list the key puts it away");
-        }
-    }
-
-    #[test]
-    fn below_100_columns_the_inbox_folds_the_column_to_its_strip_and_unfolds_it_after() {
-        let mut s = inbox_state();
-        assert_eq!((s.cols, s.collapsed), (80, false));
-        inbox_toggle(&mut s);
-        assert!(s.collapsed, "the column stays wide under the cards");
-        let view = s.ibx_view().expect("painted");
-        assert_eq!(view.plain[0].chars().count(), 80 - 5);
-        assert!(
-            inbox_toggle(&mut s),
-            "unfolding means the terminals are sized again"
-        );
-        assert!(!s.collapsed && !s.ibx.open);
-        // A fold the person made themselves is theirs: the Inbox leaves it.
-        s.collapsed = true;
-        inbox_toggle(&mut s);
-        inbox_toggle(&mut s);
-        assert!(s.collapsed);
-    }
-
-    #[test]
-    fn an_open_palette_is_over_the_inbox() {
-        let mut s = inbox_state();
-        inbox_toggle(&mut s);
-        assert!(s.ibx_view().is_some());
-        s.palette = Some(Palette::open());
-        assert!(s.ibx_view().is_none(), "the palette owns the screen");
-        s.palette = None;
-        assert!(s.ibx_view().is_some());
-    }
-
-    #[test]
-    fn the_status_row_keeps_an_answer_on_hold_while_the_inbox_is_put_away() {
-        use crate::answers::{Hold, Pick, Slot};
-        let mut s = inbox_state();
-        s.ibx.holds.start(Hold {
-            slot: Slot::Agent(1),
-            generation: None,
-            menu_seal: None,
-            seal: 4,
-            pick: Pick::Key("1".into()),
-            label: "Yes".into(),
-            until: std::time::Instant::now() + std::time::Duration::from_secs(3),
-        });
-        s.refresh_ibx();
-        let line = s.ibx_held.clone().expect("a hold has a word");
-        assert!(
-            line.contains("sending in 3 s: Yes") && line.contains("undoes"),
-            "{line}"
-        );
-        assert_eq!(s.frame().message, Some(line.as_str()));
-        // A hold outranks a passing word, so its count and its way out stay readable.
-        s.message = Some("a passing word".to_string());
-        assert_eq!(s.frame().message, Some(line.as_str()));
-        s.message = None;
-        // Open, the Inbox's own bar says it, and the row is left to its other words.
-        inbox_toggle(&mut s);
-        assert_eq!(s.frame().message, None);
-    }
-
-    /// A question handed to qass waits on qass, not on the person: no bell, no line on the
-    /// notice row, as the Inbox does not count it.
-    #[test]
-    fn a_hand_to_qass_is_not_news_for_the_person() {
-        let (mut request, mut dirty) = (0u64, false);
-        let mut rows_after = |with_qass: bool| {
-            let mut s = inbox_state();
-            // qass shows up in the very list that carries the handed agent: the hand is read
-            // off that list, not off the one before it.
-            s.spaces.push(space(3, "qass"));
-            s.was.insert(5, "working".to_string());
-            s.ring = false;
-            s.message = None;
-            let mut row = waiting_row(5, 1, "blocked", 120);
-            row.with_qass = with_qass;
-            let mut agents = s.rows.clone();
-            agents.push(waiting_row(9, 3, "idle", 10));
-            agents.push(row);
-            apply(
-                &mut s,
-                ControlResponse::Agents {
-                    id: "index".into(),
-                    agents,
-                    splits: Vec::new(),
-                    qass_checks: None,
-                },
-                &mut request,
-                &mut dirty,
-            );
-            s
-        };
-        let handed = rows_after(true);
-        assert!(
-            handed.message.is_none() && !handed.ring,
-            "{:?}",
-            handed.message
-        );
-        let own = rows_after(false);
-        assert!(
-            own.message.is_some(),
-            "a blocked agent of the person's is news"
-        );
-    }
-
-    #[test]
-    fn a_drag_or_release_over_the_inbox_is_its_own_unless_another_gesture_is_on() {
-        let mut s = inbox_state();
-        s.cols = 104;
-        s.lines = 30;
-        inbox_toggle(&mut s);
-        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width) as u16;
-        let (row, col) = (5u16, left + 8);
-        let drag = Action::Drag {
-            row,
-            col,
-            shift: false,
-        };
-        let release = Action::Release {
-            row,
-            col,
-            shift: false,
-        };
-        let click = Action::Click {
-            row,
-            col,
-            shift: false,
-            ctrl: false,
-        };
-        // Nothing carried: taken, so no release reaches the terminal under the Inbox.
-        assert!(inbox_mouse(&mut s, &drag).is_some());
-        assert!(inbox_mouse(&mut s, &release).is_some());
-        assert!(inbox_mouse(&mut s, &click).is_some());
-        // A press that began in the column and is carried: the drag and the release go on.
-        s.sidebar_drag = Some(0);
-        assert!(inbox_mouse(&mut s, &drag).is_none());
-        assert!(inbox_mouse(&mut s, &release).is_none());
-        s.sidebar_drag = None;
-    }
-
-    #[test]
-    fn the_inbox_steps_aside_for_a_mode_or_a_close_asking_its_question() {
-        let mut s = inbox_state();
-        inbox_toggle(&mut s);
-        assert!(s.ibx_view().is_some());
-        s.armed = Some(7);
-        assert!(s.ibx_view().is_none(), "over an armed close");
-        let click = Action::Click {
-            row: 3,
-            col: 20,
-            shift: false,
-            ctrl: false,
-        };
-        assert!(
-            inbox_mouse(&mut s, &click).is_none(),
-            "its click is the question's"
-        );
-        s.armed = None;
-        s.modes.resizing = true;
-        assert!(s.ibx_view().is_none(), "over a mode");
-        s.modes.resizing = false;
-        assert!(s.ibx_view().is_some());
-    }
-
-    /// A refusal of an Inbox answer is said under its card, never as the daemon's raw code on the
-    /// status row.
-    #[test]
-    fn a_refusal_of_an_inbox_answer_is_not_said_raw_on_the_status_row() {
-        let (mut request, mut dirty) = (0u64, false);
-        let mut s = inbox_state();
-        s.message = None;
-        s.hint = None;
-        apply(
-            &mut s,
-            ControlResponse::Failed {
-                id: format!("{}1", crate::inbox_pane::ID),
-                reason: "already_answered".into(),
-            },
-            &mut request,
-            &mut dirty,
-        );
-        assert!(
-            s.message.is_none() && s.hint.is_none(),
-            "{:?} {:?}",
-            s.message,
-            s.hint
-        );
-    }
-
-    /// The board page `qoop qass` used to open above qass is qoop's own page in a pane named
-    /// `board`, in the real qass space on this computer: a person's own pane called `board`, an
-    /// agent, a remote one, or a space renamed `qass` is never taken for it.
-    #[test]
-    fn only_qoops_own_board_page_in_the_real_qass_space_is_an_old_board_pane() {
-        let mut s = qass_state();
-        s.split_seen.push(qass_board_split(4));
-        assert_eq!(old_board_panes(&s.rows, &s.spaces, &s.split_seen), vec![4]);
-        // The same name on a person's shell (program zsh), in another space or on an agent.
-        for r in s.rows.iter_mut().filter(|r| r.terminal != 4) {
-            r.name = Some(qoop_runtime::idle::BOARD_PANE.into());
-        }
-        let elsewhere = s.rows.iter_mut().find(|r| r.terminal == 1).expect("a row");
-        elsewhere.agent = false;
-        assert_eq!(old_board_panes(&s.rows, &s.spaces, &s.split_seen), vec![4]);
-        // A person's own `board` shell in qass's space is never closed.
-        let mut shell = agent(8, 9, "zsh", "idle");
-        shell.agent = false;
-        shell.name = Some(qoop_runtime::idle::BOARD_PANE.into());
-        s.rows.push(shell);
-        assert_eq!(old_board_panes(&s.rows, &s.spaces, &s.split_seen), vec![4]);
-        // A space renamed to qass is never touched: only the first so named is qass's.
-        let mut renamed = agent(9, 11, "qoop", "idle");
-        renamed.agent = false;
-        renamed.name = Some(qoop_runtime::idle::BOARD_PANE.into());
-        s.rows.push(renamed);
-        s.spaces.push(space(11, "qass"));
-        assert_eq!(old_board_panes(&s.rows, &s.spaces, &s.split_seen), vec![4]);
-        // On another computer it is none of ours.
-        let board = s
-            .rows
-            .iter_mut()
-            .find(|r| r.terminal == 4)
-            .expect("the board");
-        board.workspace = (1 << 40) | 9;
-        assert!(old_board_panes(&s.rows, &s.spaces, &s.split_seen).is_empty());
-    }
-
-    /// On the way out the interface waits, at most a bound, for the daemon (or the mux, for
-    /// another computer's) to answer the answers it sent last, so one for a remote machine has
-    /// left the process: it returns once each is answered, and gives up at the bound.
-    #[tokio::test]
-    async fn leaving_waits_for_the_answers_sent_last() {
-        use tokio::io::AsyncWriteExt;
-        let mut s = inbox_state();
-        let hold = crate::answers::Hold {
-            slot: crate::answers::Slot::Card("Q9".into()),
-            generation: None,
-            menu_seal: None,
-            seal: 0,
-            pick: crate::answers::Pick::PutAway { card: "Q9".into() },
-            label: "Put away".into(),
-            until: std::time::Instant::now() + std::time::Duration::from_secs(3),
-        };
-        s.ibx.holds.start(hold);
-        let env = ibx_env!(s);
-        s.ibx.flush(&env);
-        assert!(s.ibx.awaiting(), "asked, not yet answered");
-        let id = match s.ibx.take().requests.as_slice() {
-            [ControlRequest::AskWrite { id, .. }] => id.clone(),
-            other => panic!("{other:?}"),
-        };
-        let (mut near, mut far) = tokio::io::duplex(4096);
-        let (mut connection, mut inbuf) = (Connection::new(), BytesMut::new());
-        // Nothing comes: it gives up at the bound, still waiting.
-        let began = std::time::Instant::now();
-        settle_answers(
-            &mut s,
-            &mut near,
-            &mut connection,
-            &mut inbuf,
-            std::time::Duration::from_millis(150),
-        )
-        .await;
-        assert!(began.elapsed() >= std::time::Duration::from_millis(140));
-        assert!(s.ibx.awaiting());
-        // The answer comes: it returns at once, well before the bound.
-        let body = serde_json::to_vec(&ControlResponse::Failed {
-            id,
-            reason: "no_such_card".into(),
-        })
-        .unwrap();
-        for frame in qoop_proto::chunk(
-            qoop_proto::Channel::Control,
-            0,
-            0,
-            None,
-            bytes::Bytes::from(body),
-        ) {
-            let mut buf = BytesMut::new();
-            frame.encode(&mut buf).unwrap();
-            far.write_all(&buf).await.unwrap();
-        }
-        let began = std::time::Instant::now();
-        settle_answers(
-            &mut s,
-            &mut near,
-            &mut connection,
-            &mut inbuf,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
-        assert!(began.elapsed() < std::time::Duration::from_secs(2));
-        assert!(!s.ibx.awaiting(), "answered");
-    }
-
-    /// What follows a command in the same read reaches the right place: after a jump or the
-    /// prefix it is for the ordinary path with the paste's brackets put back, and after the key
-    /// that opens the new agent box the box reads the paste, never a terminal.
-    #[test]
-    fn what_follows_a_command_in_one_read_is_fed_on_or_read_by_the_box() {
-        let pasted = b"\x1b[200~fix it\x1b[201~".to_vec();
-        let mut s = inbox_state();
-        open_inbox(&mut s);
-        let taken = inbox_keys(&mut s, &[b"g".as_slice(), &pasted].concat(), 1);
-        assert!(taken.jump.is_some(), "g went to the agent");
-        assert_eq!(taken.feed, Some(pasted.clone()), "the paste follows it");
-        assert!(!s.ibx.has_rest());
-        let mut s = inbox_state();
-        open_inbox(&mut s);
-        let taken = inbox_keys(&mut s, &[&[1u8][..], &pasted].concat(), 1);
-        assert_eq!(
-            taken.feed,
-            Some([&[1u8][..], &pasted].concat()),
-            "prefix and paste, in order"
-        );
-        // `n` opens the box and the paste after it is its text: nothing is fed to a terminal.
-        let mut s = inbox_state();
-        open_inbox(&mut s);
-        let taken = inbox_keys(&mut s, &[b"n".as_slice(), &pasted].concat(), 1);
-        assert!(taken.feed.is_none() && taken.jump.is_none(), "{taken:?}");
-        assert!(matches!(s.ibx.place, Some(crate::places::Place::New(_))));
-        assert!(!s.ibx.has_rest());
-    }
-
-    /// A board page the person opened themselves stays: in qass's space, named `board`, running
-    /// `qoop`, alone in its tab or in a split of their own (any ratio but the one qass made, or
-    /// beside something other than qass's agent), and not closed by any interface.
-    #[tokio::test]
-    async fn a_board_page_the_person_opened_is_never_closed() {
-        let mut s = qass_state();
-        let (mut control, mut wire) = (0, Vec::new());
-        // Alone in its tab: no tree at all.
-        drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
-        assert!(wire.is_empty(), "{:?}", String::from_utf8_lossy(&wire));
-        // In a split of their own: another ratio, or stacked, or beside a shell.
-        let split = |dir, permille, rest: u32| qoop_runtime::control::Pane::Split {
-            dir,
-            permille,
-            questions: 0,
-            first: Box::new(qoop_runtime::control::Pane::Leaf { terminal: 4 }),
-            second: Box::new(qoop_runtime::control::Pane::Leaf { terminal: rest }),
-        };
-        let mut shell = agent(7, 9, "zsh", "idle");
-        shell.agent = false;
-        s.rows.push(shell);
-        use qoop_runtime::control::SplitDir::{H, V};
-        s.split_seen = vec![split(V, 500, 5), split(H, 700, 5), split(V, 700, 7)];
-        drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
-        assert!(wire.is_empty(), "{:?}", String::from_utf8_lossy(&wire));
-    }
-
-    /// The migration: an interface that finds the old board page closes it, once per terminal,
-    /// under an id no earlier attempt used.
-    #[tokio::test]
-    async fn the_first_list_closes_an_old_board_pane_once() {
-        let mut s = qass_state();
-        s.split_seen.push(qass_board_split(4));
-        let (mut control, mut wire) = (0, Vec::new());
-        drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
-        let said = String::from_utf8_lossy(&wire).to_string();
-        assert!(
-            said.contains("CloseTerminal") && said.contains("board-close-4-1"),
-            "{said}"
-        );
-        wire.clear();
-        drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
-        assert!(
-            wire.is_empty(),
-            "asked again: {:?}",
-            String::from_utf8_lossy(&wire)
-        );
-        // A board page that comes back as another terminal is closed under a new id: the
-        // daemon replays a repeated id without closing anything.
-        let mut again = agent(6, 9, "qoop", "idle");
-        again.agent = false;
-        again.name = Some(qoop_runtime::idle::BOARD_PANE.into());
-        s.rows.push(again);
-        s.split_seen.push(qass_board_split(6));
-        drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
-        let said = String::from_utf8_lossy(&wire).to_string();
-        assert!(said.contains("board-close-6-2"), "{said}");
-        // No pane named board, nothing to close.
-        wire.clear();
-        let mut none = state();
-        none.rows = vec![agent(1, 1, "claude", "idle")];
-        drain_beside(&mut none, &mut control, &mut wire)
-            .await
-            .unwrap();
-        assert!(wire.is_empty());
-    }
-
-    /// `ctrl-a Q` opens qass's ledger over the pane and the same key puts it away; from the
-    /// Inbox, the ledger's `i` goes back to the Inbox on its From qass filter.
-    #[test]
-    fn ctrl_a_capital_q_opens_the_ledger_and_i_goes_to_its_questions() {
-        let mut s = inbox_state();
-        assert!(!s.ibx.open);
-        assert!(!ledger_toggle(&mut s));
-        assert!(s.ibx.open && matches!(s.ibx.place, Some(crate::places::Place::Ledger(_))));
-        let view = s.ibx_view().expect("painted over the pane");
-        assert!(view.plain.join("\n").contains("qass"), "{:?}", view.plain);
-        ledger_toggle(&mut s);
-        assert!(!s.ibx.open && s.ibx.place.is_none());
-        // From the Inbox the ledger's questions link goes back to the Inbox, filtered.
-        open_inbox(&mut s);
-        open_ledger(&mut s);
-        let mut taken = InboxKeys::default();
-        place_out(&mut s, crate::places::PlaceOut::Questions, &mut taken);
-        assert!(s.ibx.open && s.ibx.place.is_none() && s.ibx.filter);
-    }
-
-    /// Start qass is asked once until it answers, and a retry of a computer is a request that
-    /// reaches that machine through one of its spaces.
-    #[test]
-    fn start_qass_is_asked_once_and_a_retry_names_the_machine_through_its_space() {
-        let mut s = inbox_state();
-        let mut taken = InboxKeys::default();
-        place_out(&mut s, crate::places::PlaceOut::StartQass, &mut taken);
-        assert!(s.beside.start_qass);
-        s.beside.start_qass = false;
-        place_out(&mut s, crate::places::PlaceOut::StartQass, &mut taken);
-        assert!(
-            !s.beside.start_qass,
-            "a second press while it starts starts nothing"
-        );
-
-        let remote = (1i64 << 40) | 1;
-        s.spaces.push(space(remote, "build-node:eval"));
-        place_out(&mut s, crate::places::PlaceOut::Retry(1), &mut taken);
-        let [
-            ControlRequest::Via {
-                workspace,
-                request,
-                id,
-            },
-        ] = taken.requests.as_slice()
-        else {
-            panic!("one request: {:?}", taken.requests);
-        };
-        assert_eq!(*workspace, remote);
-        assert!(id.starts_with("retry-1-"), "{id}");
-        assert!(matches!(**request, ControlRequest::ScheduleRead { .. }));
-    }
-
-    /// The `+` of a space offers an agent in a worktree: it opens the new agent box in that
-    /// space, which names the task first.
-    #[test]
-    fn the_plus_menu_opens_the_new_agent_box_in_its_space() {
-        let mut s = inbox_state();
-        s.menu_kind = MenuKind::New {
-            space: 2,
-            name: "webshop".into(),
-        };
-        let rows = menu_rows(&s.menu_kind);
-        assert!(rows.iter().any(|(name, _)| name == "agent in a worktree"));
-        let mut request = 0;
-        assert!(matches!(
-            apply_menu_choice(&mut s, 2, &mut request),
-            MenuSend::Nothing
-        ));
-        assert!(s.ibx.open && matches!(s.ibx.place, Some(crate::places::Place::New(_))));
-        let view = s.ibx_view().expect("painted");
-        assert!(view.plain.join("\n").contains("what should the agent do?"));
-        // The space it was opened for is the one the box starts in.
-        let Some(crate::places::Place::New(new)) = &s.ibx.place else {
-            panic!("the box");
-        };
-        assert_eq!(new.space(), Some(2));
-    }
-
-    /// The left sidebar is the owner's, and stays exactly as it is: whatever the panes do (a
-    /// split, a zoom, the Inbox or qass's ledger over the pane, at 200 or 120 columns), the cells
-    /// of its columns are the same, row for row.
-    #[test]
-    fn the_left_sidebar_paints_the_same_whatever_the_panes_do() {
-        for cols in [200u16, 120] {
-            let make = || {
-                let mut state = tiled_state();
-                state.palette = None;
-                state.cols = cols;
-                state
-            };
-            let left = screen::left_for(cols, false, sidebar::opening_width(cols));
-            let rows = make().lines as usize - screen::STATUS;
-            let sidebar = |state: &State| {
-                let grid = cells_of(
-                    &screen::paint(&state.frame()),
-                    state.cols as usize,
-                    state.lines as usize,
-                );
-                grid.into_iter()
-                    .take(rows)
-                    // Without the rule, which is also the panes' left side.
-                    .map(|row| row[..left - 1].iter().collect::<String>())
-                    .collect::<Vec<_>>()
-            };
-            let mut base_state = make();
-            base_state.sidebar_width = sidebar::opening_width(cols);
-            let base = sidebar(&base_state);
-            assert!(
-                base.iter().any(|row| row.trim().len() > 3),
-                "the sidebar has something in it"
-            );
-            type Change = Box<dyn Fn(&mut State)>;
-            let split = |s: &mut State| {
-                let area = pane_area(s);
-                let mut layout = Layout::single(1);
-                assert!(layout.split_placeholder(1, layout::Dir::V, area));
-                assert!(layout.bind_placeholder(2));
-                s.layouts.insert(1, layout);
-                s.space = Some(1);
-            };
-            let variants: Vec<(&str, Change)> = vec![
-                ("a split", Box::new(move |s| split(s))),
-                (
-                    "a split, zoomed",
-                    Box::new(move |s| {
-                        split(s);
-                        s.layouts.get_mut(&1).unwrap().zoomed = Some(2);
-                    }),
-                ),
-                ("the Inbox open", Box::new(open_inbox)),
-                ("the ledger open", Box::new(open_ledger)),
-            ];
-            for (what, apply) in variants {
-                let mut state = make();
-                state.sidebar_width = sidebar::opening_width(cols);
-                apply(&mut state);
-                assert_eq!(
-                    sidebar(&state),
-                    base,
-                    "{what} at {cols} columns moved the sidebar"
-                );
-            }
-        }
-    }
-
-    /// A zoomed pane says so on the notice row with the key that shows every pane again; the
-    /// note goes with the zoom.
-    #[test]
-    fn a_zoomed_pane_says_so_on_the_notice_row() {
-        let mut state = tiled_state();
-        let area = pane_area(&state);
-        let mut layout = Layout::single(1);
-        assert!(layout.split_placeholder(1, layout::Dir::V, area));
-        assert!(layout.bind_placeholder(2));
-        state.layouts.insert(1, layout);
-        state.space = Some(1);
-        let notice =
-            |state: &State| written_on(&screen::paint(&state.frame()), state.lines as usize - 1);
-        state.layouts.get_mut(&1).unwrap().zoomed = Some(2);
-        let said = notice(&state);
-        assert!(said.contains("zoomed") && said.contains(" z "), "{said}");
-        state.layouts.get_mut(&1).unwrap().zoomed = None;
-        assert!(!notice(&state).contains("zoomed"));
-    }
-
-    /// A line to qass once pasted counts as typing there: asked again at once it is not pasted
-    /// again, it is kept on the ledger's ask line and said.
-    #[tokio::test]
-    async fn a_second_ask_at_once_is_kept_and_not_pasted_again() {
-        let mut state = qass_state();
-        state.refresh_ibx();
-        let qass = state.hand.qass.expect("qass runs").0;
-        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
-        let mut first = InboxKeys::default();
-        place_out(
-            &mut state,
-            crate::places::PlaceOut::Ask("what is T4 doing".into()),
-            &mut first,
-        );
-        let Some((terminal, line)) = first.paste.take() else {
-            panic!("pasted")
-        };
-        assert!(first.send_line && terminal == qass);
-        let mut wire = Vec::new();
-        paste_talk(&mut state, terminal, &line, &mut seqs, &mut wire)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&wire).contains("\"paste\""));
-        let _ = &mut seq;
-        open_ledger(&mut state);
-        let mut again = InboxKeys::default();
-        place_out(
-            &mut state,
-            crate::places::PlaceOut::Ask("and T5".into()),
-            &mut again,
-        );
-        assert_eq!(again.paste, None, "not pasted over what was just typed");
-        assert!(
-            state.message.as_deref().is_some_and(|m| m.contains("busy")),
-            "{:?}",
-            state.message
-        );
-        let Some(crate::places::Place::Ledger(ledger)) = &state.ibx.place else {
-            panic!("the ledger");
-        };
-        assert_eq!(ledger.draft(), "and T5", "kept for the person to send");
-    }
-
-    /// A retry that is refused, a board close another interface made first, and a failed read of
-    /// what qass did are not a refusal on the status row; the last is kept for the ledger.
-    #[test]
-    fn retries_and_board_closes_that_fail_are_quiet_and_a_failed_acts_read_is_kept() {
-        let mut s = state();
-        let (mut request, mut dirty) = (0, false);
-        for id in ["retry-1-3", "retry-read-1-3", "board-close-4-1"] {
-            apply(
-                &mut s,
-                ControlResponse::Failed {
-                    id: id.into(),
-                    reason: "build-node went offline".into(),
-                },
-                &mut request,
-                &mut dirty,
-            );
-            assert_eq!(s.message, None, "{id} said something");
-        }
-        apply(
-            &mut s,
-            ControlResponse::Failed {
-                id: ACTS_ID.into(),
-                reason: "unknown variant `QassActs`, expected one of `X`".into(),
-            },
-            &mut request,
-            &mut dirty,
-        );
-        assert_eq!(s.message, None);
-        assert!(matches!(s.beside.acts_failed, Some((_, true))));
-        // A good read clears it.
-        apply(
-            &mut s,
-            ControlResponse::QassActs {
-                id: ACTS_ID.into(),
-                acts: Vec::new(),
-            },
-            &mut request,
-            &mut dirty,
-        );
-        assert!(s.beside.acts_failed.is_none() && s.beside.acts.is_some());
-    }
-
-    /// While the ledger shows, what qass did is read again every 30 seconds, and not before.
-    #[tokio::test]
-    async fn the_ledger_reads_what_qass_did_again_every_thirty_seconds() {
-        let mut s = state();
-        let (mut control, mut wire) = (0, Vec::new());
-        let asked = |wire: &[u8]| String::from_utf8_lossy(wire).contains("QassActs");
-        drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
-        assert!(
-            !asked(&wire),
-            "nothing is read while the ledger is not shown"
-        );
-        open_ledger(&mut s);
-        drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
-        assert!(asked(&wire), "read when it opens");
-        wire.clear();
-        drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
-        assert!(!asked(&wire), "not again at once");
-        s.beside.acts_asked =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(31));
-        drain_beside(&mut s, &mut control, &mut wire).await.unwrap();
-        assert!(asked(&wire), "read again on the 30 s tick");
-    }
-
-    /// FNV-1a: a hash that stays the same across Rust releases, for bytes pinned in a test.
-    fn fnv(text: &str) -> u64 {
-        text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        })
-    }
-
-    /// The sidebar's cells as a person's terminal shows them: per row, each cell's character after
-    /// the escape in force on it (written only where it changes), columns `0..left - 1`, rows
-    /// above the status rows. The rule in the last column is left out: it is also the panes'
-    /// left side, joined to their lines and in the focused pane's ink. Links and other strings are skipped; the version is masked, so a release
-    /// of the same length leaves the bytes alone.
-    fn sidebar_bytes(painted: &str, cols: usize, lines: usize, left: usize) -> Vec<String> {
-        let mut grid = vec![vec![(' ', String::new()); cols]; lines];
-        let (mut r, mut c, mut sgr) = (0usize, 0usize, String::new());
-        let mut chars = painted.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '\x1b' {
-                if chars.peek() == Some(&']') {
-                    while let Some(ch) = chars.next() {
-                        if ch == '\x07' || (ch == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                let mut seq = String::new();
-                for ch in chars.by_ref() {
-                    seq.push(ch);
-                    if ch.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-                if let Some(at) = seq.strip_prefix('[').and_then(|s| s.strip_suffix('H')) {
-                    let mut it = at.split(';').map(|n| n.parse::<usize>().unwrap_or(1));
-                    r = it.next().unwrap_or(1).saturating_sub(1);
-                    c = it.next().unwrap_or(1).saturating_sub(1);
-                } else if seq.ends_with('m') {
-                    if seq == "[m" || seq.starts_with("[0") {
-                        sgr.clear();
-                    }
-                    sgr.push_str(&seq);
-                }
-                continue;
-            }
-            if let Some(cell) = grid.get_mut(r).and_then(|row| row.get_mut(c)) {
-                *cell = (ch, sgr.clone());
-            }
-            c += crate::width::columns(ch).max(1);
-        }
-        let version = sidebar::VERSION;
-        grid.into_iter()
-            .take(lines - screen::STATUS)
-            .map(|row| {
-                let mut out = String::new();
-                let mut was = None;
-                for (ch, sgr) in &row[..left.saturating_sub(1)] {
-                    if was != Some(sgr) {
-                        out.push_str(&format!("<{sgr}>"));
-                        was = Some(sgr);
-                    }
-                    out.push(*ch);
-                }
-                out.replace(version, &"#".repeat(version.len()))
+    /// `n` cards on the tab's agent (terminal 1), the first with a long question, and one of
+    /// another agent's (terminal 2).
+    fn tab_cards(s: &mut State, n: u32) {
+        let mut cards: Vec<_> = (1..=n)
+            .map(|at| {
+                let mut c = ask_card(1, "claude");
+                c.card = format!("Q{at}");
+                c.body.asks = format!("Question {at} of the tab?");
+                c
             })
-            .collect()
-    }
-
-    /// The tree never cuts a name (QOOP-71, round 5b). At the three sizes the interface is checked
-    /// at, a long space name, title, worktree and activity wrap whole in the column with no
-    /// ellipsis, and every row a name wrapped onto answers a click as the name's first row does:
-    /// the controls and the close are on the first row only.
-    #[test]
-    fn the_tree_wraps_long_names_whole_at_three_sizes_and_every_row_answers_alike() {
-        let space_name = "alpha-bravo-charlie-delta-echo-foxtrot-golf-hotel-india-juliet-kilo-lima";
-        let title = "Implement OAuth scopes and refresh the dispatcher before the release";
-        for (cols, lines) in [(80u16, 24u16), (104, 30), (220, 60)] {
-            let mut state = qass_state();
-            (state.palette, state.menu) = (None, None);
-            (state.cols, state.lines, state.collapsed) = (cols, lines, false);
-            state.view = sidebar::View::Tree;
-            state.sidebar_width = sidebar::opening_width(cols);
-            state.spaces[0].name = space_name.into();
-            state.rows[0].agent_title = Some(title.into());
-            state.rows[0].cwd = Some("/home/u/a-very-long-worktree-name-that-keeps-going".into());
-            state.rows[0].state = "idle".into();
-            let left = screen::left_for(cols, false, state.sidebar_width);
-            let rows = sidebar_bytes(
-                &screen::paint(&state.frame()),
-                cols as usize,
-                lines as usize,
-                left,
-            );
-            // Without the ink marks: what a person reads.
-            let plain: Vec<String> = rows
-                .iter()
-                .map(|row| {
-                    let mut out = String::new();
-                    let mut mark = false;
-                    for ch in row.chars() {
-                        match ch {
-                            '<' => mark = true,
-                            '>' if mark => mark = false,
-                            _ if !mark => out.push(ch),
-                            _ => {}
-                        }
-                    }
-                    out
-                })
-                .collect();
-            assert!(
-                plain.iter().all(|row| !row.contains('\u{2026}')),
-                "{cols}x{lines}: an ellipsis in the tree:\n{}",
-                plain.join("\n")
-            );
-            let letters: String = plain
-                .iter()
-                .flat_map(|row| row.chars())
-                .filter(|c| c.is_alphabetic())
-                .collect();
-            assert!(
-                letters.contains(&space_name.replace('-', "")),
-                "{cols}x{lines}: the space name was cut:\n{}",
-                plain.join("\n")
-            );
-            for word in title.split(' ') {
-                assert!(
-                    plain.iter().any(|row| row.contains(word)),
-                    "{cols}x{lines}: {word:?} lost:\n{}",
-                    plain.join("\n")
-                );
-            }
-            // The click on every row of the space's rule and of the agent's name: the controls
-            // answer on the first row only.
-            let screen_rows = |hit: sidebar::Hit| -> Vec<u16> {
-                (1..=lines)
-                    .filter(|row| {
-                        state
-                            .column_hit_with(*row, None)
-                            .is_some_and(|(h, _)| h == hit)
-                    })
-                    .collect()
-            };
-            let rule_rows = screen_rows(sidebar::Hit::Space(1));
-            assert!(
-                rule_rows.len() >= 2,
-                "{cols}x{lines}: the name did not wrap"
-            );
-            // Every hyphen of the name is on screen: the letters check above cannot see one.
-            let hyphens: usize = rule_rows
-                .iter()
-                .map(|row| plain[*row as usize - 1].matches('-').count())
-                .sum();
-            assert_eq!(hyphens, space_name.matches('-').count(), "{cols}x{lines}");
-            {
-                for row in &rule_rows[1..] {
-                    assert!(
-                        !state
-                            .column_hit_with(*row, None)
-                            .is_some_and(|(_, first)| first)
-                    );
-                    for col in 1..=left as u16 {
-                        assert!(
-                            !matches!(
-                                state.clicked_with(*row, col, None),
-                                Some(Clicked::New(_) | Clicked::Close(_) | Clicked::Drawer(_))
-                            ),
-                            "{cols}x{lines}: row {row} col {col} reached a control"
-                        );
-                    }
-                }
-            }
-            let agent_rows = screen_rows(sidebar::Hit::Terminal(1));
-            assert!(agent_rows.len() >= 3, "{cols}x{lines}: {agent_rows:?}");
-            for row in agent_rows.iter().filter(|row| {
-                state
-                    .column_hit_with(**row, None)
-                    .is_some_and(|(_, first)| !first)
-            }) {
-                for col in 1..=left as u16 {
-                    assert!(
-                        matches!(
-                            state.clicked_with(*row, col, None),
-                            Some(Clicked::Terminal(1)) | None
-                        ),
-                        "{cols}x{lines}: row {row} col {col} reached a control"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The left sidebar is frozen: its cells, characters and inks both, are pinned to recorded
-    /// bytes for a terminal page, with an agent or a space picked, open and folded, at four sizes,
-    /// dark, light and without colour. A palette change that reaches the sidebar fails here even when it moves
-    /// every frame alike, which the test above cannot see. Its rule is left out since
-    /// 2026-10-28, when it became the panes' left side too. The hashes were recorded again on
-    /// 2026-11-24 for the redesign (QOOP-71, round 3b): qass's own page went with its screen, and
-    /// the computers line says since when a machine was not reached.
-    #[test]
-    fn the_left_sidebar_keeps_the_bytes_it_had_at_d4a3518() {
-        use crate::colorlevel::{Level, TEST_LEVEL};
-        use crate::theme::TEST_LIGHT;
-        const PINNED: &[(&str, u64)] = &[
-            ("terminal 200x60 open dark", 0x6fe332952fae76a0),
-            ("terminal 200x60 folded dark", 0x8ba592bd24d453b8),
-            ("terminal 120x40 open dark", 0x2f4bc58b5490364c),
-            ("terminal 120x40 folded dark", 0xf5f8876c8e0e6d94),
-            ("terminal 80x24 open dark", 0x6f9f115871e244dc),
-            ("terminal 80x24 folded dark", 0x6a480b3714ea7124),
-            ("terminal 60x24 open dark", 0xd66d12526b1e331c),
-            ("terminal 60x24 folded dark", 0x6a480b3714ea7124),
-            ("agent picked 200x60 open dark", 0x70826a21d9db3c16),
-            ("agent picked 200x60 folded dark", 0x8d6531bd9fb67418),
-            ("agent picked 120x40 open dark", 0x5c919e322cf96eb2),
-            ("agent picked 120x40 folded dark", 0xecdde9f98d5e0f74),
-            ("agent picked 80x24 open dark", 0xd85c5d2dd8834ec2),
-            ("agent picked 80x24 folded dark", 0x91a55b02a39e2c84),
-            ("agent picked 60x24 open dark", 0x6349e4de2f0cec65),
-            ("agent picked 60x24 folded dark", 0x91a55b02a39e2c84),
-            ("space picked 200x60 open dark", 0x2b0ca29c8bce5bfb),
-            ("space picked 200x60 folded dark", 0xfc99f80d50e88753),
-            ("space picked 120x40 open dark", 0x3d0a7809b14cdbdf),
-            ("space picked 120x40 folded dark", 0xba166e8e16f56b27),
-            ("space picked 80x24 open dark", 0xf5be3bcde6d89a2f),
-            ("space picked 80x24 folded dark", 0x015cc0c105b41377),
-            ("space picked 60x24 open dark", 0xa13cae312cf5771c),
-            ("space picked 60x24 folded dark", 0x015cc0c105b41377),
-            ("terminal 200x60 open light", 0x15aed2be5442c15e),
-            ("terminal 200x60 folded light", 0x31d4b2babfe93908),
-            ("terminal 120x40 open light", 0x0e5a7677a02a0c02),
-            ("terminal 120x40 folded light", 0x0ccce3e8da7523d4),
-            ("terminal 80x24 open light", 0xa81be7cba4dc7c52),
-            ("terminal 80x24 folded light", 0x8a0faf03218351e4),
-            ("terminal 60x24 open light", 0x8830423eae2b7572),
-            ("terminal 60x24 folded light", 0x8a0faf03218351e4),
-            ("agent picked 200x60 open light", 0x4b0dc47e75db04f8),
-            ("agent picked 200x60 folded light", 0xc99b486581a8c8cc),
-            ("agent picked 120x40 open light", 0xf3155fe5455ebfd4),
-            ("agent picked 120x40 folded light", 0xbacda406c67c0a68),
-            ("agent picked 80x24 open light", 0xcfaef844b4bbd3e4),
-            ("agent picked 80x24 folded light", 0x700467d267c1fb78),
-            ("agent picked 60x24 open light", 0x65b7e5235a894b5b),
-            ("agent picked 60x24 folded light", 0x700467d267c1fb78),
-            ("space picked 200x60 open light", 0x4bd4c1128bc0d4d6),
-            ("space picked 200x60 folded light", 0x7c7cd2ebecd64a81),
-            ("space picked 120x40 open light", 0x9c1c152669870ac2),
-            ("space picked 120x40 folded light", 0x096b50c0cb57e43d),
-            ("space picked 80x24 open light", 0xdbb995df7163ea92),
-            ("space picked 80x24 folded light", 0x80ba3cc76ac764cd),
-            ("space picked 60x24 open light", 0x8c14b3ecc64a2a89),
-            ("space picked 60x24 folded light", 0x80ba3cc76ac764cd),
-            ("terminal 200x60 open mono", 0x39f811bd4686f672),
-            ("terminal 200x60 folded mono", 0x7af61d9696861c5b),
-            ("terminal 120x40 open mono", 0xfb93ded47b693512),
-            ("terminal 120x40 folded mono", 0xb82597383e9999ab),
-            ("terminal 80x24 open mono", 0x1d935bb8bbcde092),
-            ("terminal 80x24 folded mono", 0xfea98da227c87feb),
-            ("terminal 60x24 open mono", 0xb3ceda66fc9a9772),
-            ("terminal 60x24 folded mono", 0xfea98da227c87feb),
-            ("agent picked 200x60 open mono", 0xede517cf7568c8ed),
-            ("agent picked 200x60 folded mono", 0x9a9152dd338edf33),
-            ("agent picked 120x40 open mono", 0x49914c04953e78cd),
-            ("agent picked 120x40 folded mono", 0x9599a6e9f6f94043),
-            ("agent picked 80x24 open mono", 0x1f9a2669aad1ca4d),
-            ("agent picked 80x24 folded mono", 0xd9f4c883dea2c183),
-            ("agent picked 60x24 open mono", 0xe07351acbf995383),
-            ("agent picked 60x24 folded mono", 0xd9f4c883dea2c183),
-            ("space picked 200x60 open mono", 0x672bf483d9e9cb8d),
-            ("space picked 200x60 folded mono", 0xe0b93aaef4109dd7),
-            ("space picked 120x40 open mono", 0xee557eeb8db9d76d),
-            ("space picked 120x40 folded mono", 0x163f25aa224f5087),
-            ("space picked 80x24 open mono", 0xd850c78d2b6816ed),
-            ("space picked 80x24 folded mono", 0x4bd4f41aaa6bae47),
-            ("space picked 60x24 open mono", 0xeb7423387a5259e3),
-            ("space picked 60x24 folded mono", 0x4bd4f41aaa6bae47),
-        ];
-        let mut got = Vec::new();
-        for (theme, light, level) in [
-            ("dark", false, None),
-            ("light", true, None),
-            ("mono", false, Some(Level::Mono)),
-        ] {
-            TEST_LIGHT.with(|c| c.set(Some(light)));
-            TEST_LEVEL.with(|c| c.set(level));
-            // The column's own pick raises its row with `theme::selected`: on an agent, and
-            // after `k` up to its space's rule.
-            let picked = |ups: usize| {
-                let mut state = qass_state();
-                enter_side(&mut state, false);
-                for _ in 0..ups {
-                    mode_input(&mut state, b"k", 0x01, &mut 0);
-                }
-                state
-            };
-            let pages: [(&str, &dyn Fn() -> State); 3] = [
-                ("terminal", &qass_state),
-                ("agent picked", &|| picked(0)),
-                ("space picked", &|| picked(9)),
-            ];
-            for (page, make) in pages {
-                for (cols, lines) in [(200u16, 60u16), (120, 40), (80, 24), (60, 24)] {
-                    for collapsed in [false, true] {
-                        let mut state = make();
-                        // The palette the test state opens with would cover the column at 80.
-                        (state.palette, state.menu) = (None, None);
-                        (state.cols, state.lines, state.collapsed) = (cols, lines, collapsed);
-                        state.sidebar_width = sidebar::opening_width(cols);
-                        let left = screen::left_for(cols, collapsed, state.sidebar_width);
-                        let rows = sidebar_bytes(
-                            &screen::paint(&state.frame()),
-                            cols as usize,
-                            lines as usize,
-                            left,
-                        );
-                        let fold = if collapsed { "folded" } else { "open" };
-                        let name = format!("{page} {cols}x{lines} {fold} {theme}");
-                        got.push((name, fnv(&rows.join("\n")), rows));
-                    }
-                }
-            }
-        }
-        TEST_LIGHT.with(|c| c.set(None));
-        TEST_LEVEL.with(|c| c.set(None));
-        let recorded: String = got
-            .iter()
-            .map(|(name, hash, _)| format!("            ({name:?}, {hash:#018x}),\n"))
             .collect();
-        for (name, hash, rows) in &got {
-            let pinned = PINNED.iter().find(|(n, _)| n == name).map(|(_, h)| *h);
-            assert_eq!(
-                pinned,
-                Some(*hash),
-                "the sidebar of {name} moved:\n{}\nnow:\n{recorded}",
-                rows.join("\n")
+        if let Some(first) = cards.first_mut() {
+            first.body.asks = "A long question that runs past one row of the pane, so it is read \
+                               whole: does the migration run tonight on staging, or wait?"
+                .to_string();
+        }
+        let mut other = ask_card(2, "web-app");
+        other.body.asks = "Another agent's question?".to_string();
+        cards.push(other);
+        s.asks.take(cards, Vec::new());
+    }
+
+    /// The open pane as painted, its cells row by row with its side lines taken out and its
+    /// words joined by single blanks.
+    fn pane_text(s: &State) -> String {
+        let rect = s.tabq_open().expect("an open pane").rect;
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let grid = cells_of(
+            &screen::paint(&s.frame()),
+            s.cols as usize,
+            s.lines as usize,
+        );
+        let cells: String = (0..rect.rows)
+            .map(|y| {
+                grid[screen::TABS + rect.y + y][left + rect.x..left + rect.x + rect.cols]
+                    .iter()
+                    .map(|c| if *c == '\u{2502}' { ' ' } else { *c })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        cells.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// `ctrl-a T` unfolds the pane to 52 columns beside the agent, the tiles narrowing once, and
+    /// folds it back the same once; titled with the agent and its count, the keyboard in it.
+    #[test]
+    fn the_pane_unfolds_beside_the_agent_and_folds_back() {
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 1);
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut s, &mut seqs).unwrap();
+        assert_eq!(s.sized.get(&1), Some(&(122, 40)));
+        assert!(fold_key(&mut s));
+        assert!(s.tabq_focused());
+        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_some(), "once");
+        assert_eq!(s.sized.get(&1), Some(&(76, 40)));
+        let open = s.tabq_open().unwrap();
+        assert!(!open.over);
+        assert_eq!(open.rect.cols, crate::tabq::OPEN + 2);
+        let text = pane_text(&s);
+        assert!(
+            text.contains("questions \u{b7} claude \u{2814} 1"),
+            "{text}"
+        );
+        assert!(!text.contains("Another agent"), "{text}");
+        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none());
+        assert!(fold_key(&mut s));
+        assert!(!s.tabq_focused() && s.asks.scope.is_none());
+        assert!(
+            size_terminals(&mut s, &mut seqs).unwrap().is_some(),
+            "once back"
+        );
+        assert_eq!(s.sized.get(&1), Some(&(122, 40)));
+    }
+
+    /// Where the agent would keep under 60 columns (80 by 24), the pane opens over its tile:
+    /// nothing is resized, and the tile under the pane takes no click.
+    #[test]
+    fn a_narrow_tab_opens_the_pane_over_the_agent() {
+        let mut s = agent_tab(80, 24);
+        tab_cards(&mut s, 2);
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut s, &mut seqs).unwrap();
+        assert!(fold_key(&mut s));
+        let (over, rect) = s.tabq_open().map(|o| (o.over, o.rect)).unwrap();
+        assert!(over);
+        assert!(
+            size_terminals(&mut s, &mut seqs).unwrap().is_none(),
+            "no resize"
+        );
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let (row, col) = (
+            (screen::TABS + 1 + rect.y + 3) as u16,
+            (left + 1 + rect.x + 4) as u16,
+        );
+        assert!(s.tile_at_screen(row, col).is_none());
+        assert!(pane_text(&s).contains("questions \u{b7} claude"));
+        assert!(fold_key(&mut s));
+        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none());
+        // `g` over the tile folds the pane: the keys never go to a hidden agent.
+        assert!(fold_key(&mut s));
+        assert_eq!(tabq_keys(&mut s, b"g", 0x01).jump, Some(1));
+        assert!(s.tabq_open().is_none() && !s.tabq_focused());
+    }
+
+    /// In the pane: `1` answers the open card of this agent and no other; `s` and `r` stay
+    /// in the pane, never reaching the agent; a card arriving while one is open leaves it open;
+    /// esc folds the pane, sizes the tiles back and gives the keyboard to the agent.
+    #[test]
+    fn the_panes_keys_answer_this_agents_card_and_esc_folds() {
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 2);
+        assert!(fold_key(&mut s));
+        for key in [&b"s"[..], b"s"] {
+            assert!(tabq_keys(&mut s, key, 0x01).feed.is_none());
+        }
+        assert!(tabq_keys(&mut s, b"\r", 0x01).feed.is_none());
+        let open = s.asks.open_card().unwrap().card.clone();
+        assert_eq!(open, "Q1");
+        let mut cards = s.asks.live.clone();
+        let mut new = ask_card(1, "claude");
+        new.card = "Q9".to_string();
+        cards.insert(0, new);
+        s.asks.take(cards, Vec::new());
+        assert_eq!(s.asks.open_card().unwrap().card, "Q1", "focus not stolen");
+        assert!(s.tabq_focused(), "the keyboard stays in the pane");
+        assert!(tabq_keys(&mut s, b"1", 0x01).feed.is_none());
+        let (sent, _) = s.asks.tick(std::time::Instant::now());
+        assert!(
+            matches!(&sent[..], [ControlRequest::AskWrite { action: qoop_runtime::control::AskOp::Answer { card, .. }, .. }] if card == "Q1"),
+            "{sent:?}"
+        );
+        assert!(tabq_keys(&mut s, b"r", 0x01).feed.is_none());
+        assert!(s.asks.typing(), "r types in the pane");
+        tabq_keys(&mut s, b"\x1b", 0x01);
+        assert_eq!(s.frame().chrome.keys, screen::KeyContext::Questions);
+        let esc = tabq_keys(&mut s, b"\x1b", 0x01);
+        assert_eq!(s.frame().chrome.keys, screen::KeyContext::Pane);
+        assert!(esc.resize && esc.jump == Some(1));
+        assert!(s.tabq.is_none() && !s.tabq_focused() && s.asks.scope.is_none());
+        // Open again, a press on the agent takes the keyboard out of the pane: the router hands
+        // r, q and s to the agent then, and the pane keeps showing.
+        assert!(fold_key(&mut s));
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let (row, col) = ((screen::TABS + 4) as u16, (left + 10) as u16);
+        assert_eq!(s.tile_at_screen(row, col).map(|hit| hit.0), Some(1));
+        assert_eq!(s.tabq_click(row, col), None);
+        assert!(!s.tabq_focused() && s.tabq_open().is_some());
+    }
+
+    /// `q` hands the open card of this agent to qass, with no option and no words, and never
+    /// reaches the agent; the pane then says `handed to qass: Q1`. With no qass the refusal is
+    /// said in the pane.
+    #[test]
+    fn q_hands_the_open_card_to_qass() {
+        use qoop_runtime::control::{AskOp, AskResult, ControlResponse};
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 2);
+        assert!(fold_key(&mut s));
+        assert!(tabq_keys(&mut s, b"q", 0x01).feed.is_none());
+        let (sent, _) = s.asks.tick(std::time::Instant::now());
+        let [ControlRequest::AskWrite { id, action, .. }] = &sent[..] else {
+            panic!("one write: {sent:?}");
+        };
+        assert_eq!(
+            action,
+            &AskOp::Answer {
+                card: "Q1".into(),
+                option: None,
+                text: None,
+                seen: None,
+                to_qass: true,
+            }
+        );
+        assert!(s.asks.answered(&ControlResponse::AskWritten {
+            id: id.clone(),
+            card: "Q1".into(),
+            result: AskResult::Passed,
+        }));
+        assert!(pane_text(&s).contains("handed to qass: Q1"));
+        // No qass to hand it to: the daemon refuses, and the pane says why.
+        tabq_keys(&mut s, b"q", 0x01);
+        let (sent, _) = s.asks.tick(std::time::Instant::now());
+        let [ControlRequest::AskWrite { id, .. }] = &sent[..] else {
+            panic!("one write: {sent:?}");
+        };
+        assert!(s.asks.answered(&ControlResponse::Failed {
+            id: id.clone(),
+            reason: "qass has no tab to hand this to".into(),
+        }));
+        assert!(
+            pane_text(&s).contains("not sent: qass has no tab to hand this to"),
+            "{}",
+            pane_text(&s)
+        );
+    }
+
+    /// A hand-off refused (no qass), then one that went: each answer reaches the pane and the
+    /// rest of the interface as the loop gives it, and the refusal never stands on the status row
+    /// once the pane says the card was handed.
+    #[test]
+    fn a_refused_hand_off_leaves_no_stale_status_after_one_that_went() {
+        use qoop_runtime::control::{AskResult, ControlResponse};
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 1);
+        assert!(fold_key(&mut s));
+        let answer = |s: &mut State, response: ControlResponse| {
+            s.asks.answered(&response);
+            let mut dirty = false;
+            apply(s, response, &mut 0, &mut dirty);
+        };
+        let write = |s: &mut State| {
+            tabq_keys(s, b"q", 0x01);
+            let (sent, _) = s.asks.tick(std::time::Instant::now());
+            let [ControlRequest::AskWrite { id, .. }] = &sent[..] else {
+                panic!("one write: {sent:?}");
+            };
+            id.clone()
+        };
+        let id = write(&mut s);
+        answer(
+            &mut s,
+            ControlResponse::Failed {
+                id,
+                reason: "qass has no tab to hand this to".into(),
+            },
+        );
+        assert!(pane_text(&s).contains("not sent: qass has no tab"));
+        assert_eq!(s.message, None, "said in the pane, not twice");
+        let id = write(&mut s);
+        answer(
+            &mut s,
+            ControlResponse::AskWritten {
+                id,
+                card: "Q1".into(),
+                result: AskResult::Passed,
+            },
+        );
+        let painted: String = cells_of(
+            &screen::paint(&s.frame()),
+            s.cols as usize,
+            s.lines as usize,
+        )
+        .iter()
+        .map(|row| row.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(painted.contains("handed to qass: Q1"), "{painted}");
+        assert!(!painted.contains("no tab to hand this to"), "{painted}");
+    }
+
+    /// The opened card offers the hand-off on its own row under the answers, and it is no
+    /// numbered answer: the number after the last answer sends nothing.
+    #[test]
+    fn the_opened_card_offers_the_hand_off_on_its_own_row() {
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 1);
+        assert!(fold_key(&mut s));
+        tabq_keys(&mut s, b"\r", 0x01);
+        let text = pane_text(&s);
+        assert!(
+            text.contains("[2] pick b")
+                && text.contains("[q] hand to qass qass answers it for you"),
+            "{text}"
+        );
+        assert!(!text.contains("[3]"), "{text}");
+        tabq_keys(&mut s, b"3", 0x01);
+        assert!(s.asks.tick(std::time::Instant::now()).0.is_empty());
+    }
+
+    /// Opened in place, a card shows its whole question and its answers while the other card
+    /// stays one folded row: an accordion of two, one open.
+    #[test]
+    fn the_pane_is_an_accordion_with_the_question_whole() {
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 2);
+        assert!(fold_key(&mut s));
+        tabq_keys(&mut s, b"\r", 0x01);
+        let text = pane_text(&s);
+        assert!(text.contains("pick a"), "the open card's answers: {text}");
+        assert!(text.contains("Question 2"), "the other card folded: {text}");
+        let whole: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            whole.contains("does the migration run tonight on staging, or wait?"),
+            "{whole}"
+        );
+    }
+
+    /// A tab waiting on the owner with no card says so, and `g` gives the keyboard to the agent;
+    /// its rail reads `⠄0` and `waits`.
+    #[test]
+    fn a_waiting_tab_with_no_card_says_so() {
+        let mut s = agent_tab(170, 46);
+        let task = s.rows[0].task.as_mut().unwrap();
+        (task.item, task.steps_done, task.steps_total) = (None, 0, 0);
+        task.stage = "waiting-human".to_string();
+        let cells = rail_cells(&s);
+        assert_eq!(
+            (cells[0].as_str(), cells[37].as_str()),
+            (" \u{2804}0", " waits")
+        );
+        assert!(fold_key(&mut s));
+        let text: String = pane_text(&s)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("waiting on you, no question card"), "{text}");
+        assert!(text.contains("g to the agent"), "{text}");
+        let g = tabq_keys(&mut s, b"g", 0x01);
+        assert_eq!(g.jump, Some(1));
+        assert!(
+            !s.tabq_focused() && s.tabq_open().is_some(),
+            "the pane stays open"
+        );
+    }
+
+    /// The terminal's task read as the daemon answers it: the item's card with `steps` plan
+    /// steps (the first two done, its activity cleared as a terminal's read has it) when
+    /// `item`, and the task's own events with one evidence.
+    fn task_read_answer(id: &str, steps: u32, item: bool) -> ControlResponse {
+        let steps: Vec<_> = (1..=steps)
+            .map(|n| {
+                let text = match n {
+                    3 => "runs on staging".to_string(),
+                    _ => format!("step number {n}"),
+                };
+                match n {
+                    1 | 2 => serde_json::json!({"n": n, "text": text, "done_at": n}),
+                    _ => serde_json::json!({"n": n, "text": text}),
+                }
+            })
+            .collect();
+        let card = item.then(|| {
+            serde_json::json!({
+                "id": 3, "key": "APP-1", "title": "t", "state": "doing",
+                "steps_done": 2, "steps_total": steps.len(), "agents": [], "updated_at": 0,
+                "description": "", "steps": steps, "activity": []
+            })
+        });
+        serde_json::from_value(serde_json::json!({
+            "op": "Tasks", "id": id, "tasks": [],
+            "events": [{"id": 1, "at": 5, "kind": "evidence", "body": "cargo test: ok"}],
+            "item": card,
+        }))
+        .expect("a tasks answer")
+    }
+
+    /// The task part is the terminal's own read, asked once per task, item, stage and count:
+    /// its item's steps ticked, the first undone `now`, and the task's newest evidence.
+    #[test]
+    fn the_pane_shows_the_task_read_from_its_item() {
+        let mut s = agent_tab(170, 46);
+        assert!(fold_key(&mut s));
+        let Some(ControlRequest::TaskRead {
+            task, terminal, id, ..
+        }) = s.tabq_read_request()
+        else {
+            panic!("a read");
+        };
+        assert_eq!((task, terminal), (None, Some(1)), "the terminal's read");
+        assert!(s.tabq_read_request().is_none(), "asked once");
+        assert!(s.tabq_answered(&task_read_answer(&id, 4, true)));
+        let text = pane_text(&s);
+        assert!(text.contains("[x] 1. step number 1"), "{text}");
+        assert!(text.contains("[ ] 3. runs on staging"), "{text}");
+        assert!(text.contains("staging now"), "{text}");
+        assert!(text.contains("cargo test: ok"), "{text}");
+        // `s` folds the task to its line and opens it again.
+        assert!(tabq_keys(&mut s, b"s", 0x01).feed.is_none());
+        let folded = pane_text(&s);
+        assert!(
+            folded.contains("s opens") && !folded.contains("[x] 1."),
+            "{folded}"
+        );
+        tabq_keys(&mut s, b"s", 0x01);
+        assert!(pane_text(&s).contains("[x] 1. step number 1"));
+        s.rows[0].task.as_mut().unwrap().steps_done = 3;
+        assert!(s.tabq_read_request().is_some(), "a tick reads it again");
+    }
+
+    /// A task on no item is read by its terminal, never with its own id taken for an item's:
+    /// it shows its goal and stage, no plan steps, and its own evidence.
+    #[test]
+    fn a_task_on_no_item_shows_no_steps_of_another() {
+        let mut s = agent_tab(170, 46);
+        s.rows[0].task.as_mut().unwrap().item = None;
+        assert!(fold_key(&mut s));
+        let Some(ControlRequest::TaskRead {
+            task, terminal, id, ..
+        }) = s.tabq_read_request()
+        else {
+            panic!("a read");
+        };
+        assert_eq!((task, terminal), (None, Some(1)));
+        assert!(s.tabq_answered(&task_read_answer(&id, 0, false)));
+        let text = pane_text(&s);
+        assert!(text.contains("implementing"), "{text}");
+        assert!(!text.contains("[x]") && !text.contains("[ ]"), "{text}");
+        assert!(text.contains("cargo test: ok"), "{text}");
+    }
+
+    /// A read asked for one key and answered after the task moved on is dropped: only the
+    /// answer to the read for the key now is kept.
+    #[test]
+    fn an_old_task_read_never_lands_under_a_new_key() {
+        let mut s = agent_tab(170, 46);
+        assert!(fold_key(&mut s));
+        let Some(ControlRequest::TaskRead { id: old, .. }) = s.tabq_read_request() else {
+            panic!("a read");
+        };
+        s.rows[0].task.as_mut().unwrap().steps_done = 3;
+        let Some(ControlRequest::TaskRead { id: new, .. }) = s.tabq_read_request() else {
+            panic!("a read for the new key");
+        };
+        assert_ne!(old, new);
+        assert!(s.tabq_answered(&task_read_answer(&old, 4, true)));
+        assert!(s.tabq_read.is_none(), "the old answer dropped");
+        assert!(s.tabq_answered(&task_read_answer(&new, 4, true)));
+        let key = crate::tabq::read_key(s.rows[0].task.as_ref().unwrap());
+        assert_eq!(s.tabq_read.as_ref().map(|(k, _)| k), Some(&key));
+    }
+
+    /// The task part never takes the cards' rows or the key line: at 80 by 24 a plan of twelve
+    /// steps leaves the open card and the keys in sight, and at 170 by 46 it folds to its line
+    /// when the opened card needs the rows, stands whole when they fit.
+    #[test]
+    fn the_task_part_leaves_the_cards_and_the_keys_their_rows() {
+        for (cols, lines) in [(80u16, 24u16), (170, 46)] {
+            let mut s = agent_tab(cols, lines);
+            tab_cards(&mut s, 2);
+            assert!(fold_key(&mut s));
+            tabq_keys(&mut s, b"\r", 0x01);
+            let Some(ControlRequest::TaskRead { id, .. }) = s.tabq_read_request() else {
+                panic!("a read");
+            };
+            assert!(s.tabq_answered(&task_read_answer(&id, 12, true)));
+            let text = pane_text(&s);
+            assert!(text.contains("pick a"), "{cols}x{lines}: {text}");
+            assert!(
+                text.contains("1-9 answer"),
+                "the key line, {cols}x{lines}: {text}"
             );
+            assert!(text.contains("s opens"), "folded, {cols}x{lines}: {text}");
+            assert_eq!(
+                s.tabq_open().map(|o| o.rect.rows),
+                Some(
+                    crate::tabq::pane_view(
+                        &s.tab_rail_paint().unwrap(),
+                        &s.tabq_open().unwrap(),
+                        &s.rows,
+                        &s.spaces,
+                        0,
+                        false
+                    )
+                    .0
+                    .rows
+                    .len()
+                ),
+                "every row drawn, the bottom edge too"
+            );
+        }
+        // Four steps and one card open fit at 170 by 46: the task stands whole.
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 1);
+        assert!(fold_key(&mut s));
+        let Some(ControlRequest::TaskRead { id, .. }) = s.tabq_read_request() else {
+            panic!("a read");
+        };
+        assert!(s.tabq_answered(&task_read_answer(&id, 4, true)));
+        let text = pane_text(&s);
+        assert!(text.contains("pick a") && text.contains("[x] 1."), "{text}");
+    }
+
+    /// The task opened by hand where it does not fit: the card and every step of the task are
+    /// read whole, scrolled with `j`, nothing cut and the pane its exact size.
+    #[test]
+    fn a_task_too_tall_for_the_pane_scrolls_whole_with_the_card() {
+        let mut s = agent_tab(80, 24);
+        tab_cards(&mut s, 1);
+        assert!(fold_key(&mut s));
+        let Some(ControlRequest::TaskRead { id, .. }) = s.tabq_read_request() else {
+            panic!("a read");
+        };
+        assert!(s.tabq_answered(&task_read_answer(&id, 12, true)));
+        assert!(!s.tabq_task_shown(), "folded: it does not fit");
+        tabq_keys(&mut s, b"s", 0x01);
+        assert!(s.tabq_task_shown());
+        let mut seen = String::new();
+        for _ in 0..80 {
+            let t = pane_text(&s);
+            assert!(!t.contains('\u{2026}'), "{t}");
+            seen.push_str(&t);
+            seen.push(' ');
+            tabq_keys(&mut s, b"j", 0x01);
+        }
+        for n in 4..=12 {
+            assert!(
+                seen.contains(&format!("{n}. step number {n}")),
+                "step {n}: {seen}"
+            );
+        }
+        assert!(seen.contains("A long question") && seen.contains("cargo test: ok"));
+    }
+
+    /// The pane gives the keyboard back once the focus moves to another leaf of its tab: a
+    /// shell beside the agent gets its keys, and coming back to that leaf does not take them
+    /// again.
+    #[test]
+    fn the_pane_lets_go_of_the_keys_when_the_focus_moves() {
+        let mut s = shell_beside_agent();
+        assert!(fold_key(&mut s));
+        assert!(s.tabq_focused());
+        (s.focused, s.layouts.get_mut(&1).unwrap().focus) = (1, 1);
+        assert!(!s.tabq_focused(), "the keys follow the focus");
+        assert!(s.tabq_settle(), "drawn again");
+        (s.focused, s.layouts.get_mut(&1).unwrap().focus) = (2, 2);
+        assert!(!s.tabq_focused() && s.tabq_open().is_some());
+    }
+
+    /// The scope follows the screen before it is painted: away from the tab it is gone and a
+    /// repaint is owed, once.
+    #[test]
+    fn the_scope_settles_with_the_screen() {
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 1);
+        assert!(fold_key(&mut s));
+        assert!(!s.tabq_settle(), "settled already");
+        // Another space, a shell in its tab: no rail there.
+        s.spaces.push(space(2, "other"));
+        let mut zsh = agent(5, 2, "zsh", "idle");
+        zsh.agent = false;
+        s.rows.push(zsh);
+        s.layouts.insert(2, Layout::single(5));
+        (s.space, s.focused) = (Some(2), 5);
+        assert!(s.tabq_settle());
+        assert!(s.asks.scope.is_none() && !s.tabq_focused());
+        assert!(!s.tabq_settle());
+        (s.space, s.focused) = (Some(1), 1);
+        assert!(s.tabq_settle());
+        assert_eq!(s.asks.scope, Some(1));
+    }
+
+    /// Two agents in one tab: the keyboard moving between them never resizes a tile, folded
+    /// or with the pane open; the open pane stays with its agent.
+    #[test]
+    fn a_focus_move_between_two_agents_resizes_nothing() {
+        let mut s = shell_beside_agent();
+        s.rows[1].agent = true;
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut s, &mut seqs).unwrap();
+        let mut to = |s: &mut State, t: u32| {
+            (s.focused, s.layouts.get_mut(&1).unwrap().focus) = (t, t);
+            s.tabq_settle();
+            size_terminals(s, &mut seqs).unwrap()
+        };
+        assert!(to(&mut s, 1).is_none() && to(&mut s, 2).is_none(), "folded");
+        assert!(fold_key(&mut s));
+        let open = s.tab_rail_paint().unwrap().terminal;
+        assert_eq!(open, 2);
+        to(&mut s, 2);
+        assert!(to(&mut s, 1).is_none(), "open, to the other agent");
+        assert_eq!(s.tab_rail_paint().unwrap().terminal, open);
+        assert!(s.tabq_open().is_some() && !s.tabq_focused());
+        assert!(to(&mut s, 2).is_none(), "and back");
+    }
+
+    /// The rail never touches the left sidebar: its cells, characters and inks, are the same
+    /// with the rails and without them, one agent or two split with one unfolded.
+    #[test]
+    fn the_rail_leaves_the_sidebar_as_it_is() {
+        type Tab = fn(u16, u16) -> State;
+        let tabs: [(u16, u16, Tab); 4] = [
+            (170, 46, agent_tab),
+            (80, 24, agent_tab),
+            (170, 46, two_agents),
+            (300, 46, two_agents),
+        ];
+        for (cols, lines, tab) in tabs {
+            let mut with = tab(cols, lines);
+            let mut without = tab(cols, lines);
+            without.asks.unsupported = true;
+            if with.layouts[&1].leaf_count() > 1 {
+                // One of the two unfolded too, beside or over its tile.
+                (with.focused, with.layouts.get_mut(&1).unwrap().focus) = (2, 2);
+                (without.focused, without.layouts.get_mut(&1).unwrap().focus) = (2, 2);
+                assert!(fold_key(&mut with));
+            }
+            assert!(with.tab_rail_paint().is_some() && without.tab_rail_paint().is_none());
+            let left = screen::left_for(cols, false, sidebar::WIDTH);
+            let bytes = |s: &State| {
+                sidebar_bytes(
+                    &screen::paint(&s.frame()),
+                    cols as usize,
+                    lines as usize,
+                    left,
+                )
+            };
+            assert_eq!(bytes(&with), bytes(&without), "at {cols}x{lines}");
         }
     }
 }

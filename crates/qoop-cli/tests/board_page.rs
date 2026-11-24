@@ -1,8 +1,8 @@
-//! `qoop qass` opens qass alone (the Board is the interface's Inbox view), and its tab still sleeps.
+//! `qoop qass` puts the board page above qass in its tab, and that tab still sleeps.
 //!
 //! Against a live daemon through the real socket, in a sandbox: a stand-in `claude` that
 //! exits at once (so qass's pane is a shell at its prompt) and qass's skill where `qoop qass`
-//! looks for it. The tab is qass's pane alone: no board pane is made beside it.
+//! looks for it. The board runs for real in its pane, on the daemon's own terminal.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -130,10 +130,8 @@ impl Drop for Daemon {
     }
 }
 
-/// `qoop qass` opens qass alone: the Board is the interface's Inbox view now, so no pane named
-/// `board` is made beside it, and qass's tab still sleeps and wakes as one tab.
 #[test]
-fn qoop_qass_opens_no_board_pane_and_the_tab_still_sleeps() {
+fn qoop_qass_puts_the_board_beside_qass_and_the_tab_still_sleeps() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path());
     let (ok, out, err) = daemon.run(&["task", "add", "--space", "1", "check", "the", "board"]);
@@ -141,6 +139,7 @@ fn qoop_qass_opens_no_board_pane_and_the_tab_still_sleeps() {
 
     let (ok, out, err) = daemon.run(&["qass"]);
     assert!(ok, "qoop qass: {out} {err}");
+    assert!(!err.contains("board did not open"), "{err}");
     let qass: u32 = out
         .split_whitespace()
         .skip_while(|w| *w != "terminal")
@@ -148,42 +147,64 @@ fn qoop_qass_opens_no_board_pane_and_the_tab_still_sleeps() {
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("no terminal in {out:?}"));
 
-    // Qass is listed; give a board pane, were one going to be made, the time it takes.
-    daemon.until("qass listed", &|| format!("{:?}", daemon.index()), || {
-        daemon.index().0.iter().any(|r| r.terminal == qass)
-    });
-    std::thread::sleep(Duration::from_secs(2));
-    let (rows, splits) = daemon.index();
-    assert!(
-        rows.iter().all(|r| r.name.as_deref() != Some("board")),
-        "a board pane was made: {rows:?}"
+    // One tab: the board first, on the left, qass beside it (the interface stacks them in a
+    // narrow pane); the board page running in its pane.
+    let mut board = 0;
+    daemon.until(
+        "the board beside qass",
+        &|| format!("{:?}", daemon.index()),
+        || {
+            let (rows, splits) = daemon.index();
+            let Some(tree) = splits.iter().find(|t| t.leaves().contains(&qass)) else {
+                return false;
+            };
+            let leaves = tree.leaves();
+            board = leaves[0];
+            let first = rows.iter().find(|r| r.terminal == board);
+            matches!(
+                tree,
+                Pane::Split {
+                    dir: qoop_runtime::control::SplitDir::V,
+                    permille: 700,
+                    ..
+                }
+            ) && leaves == [board, qass]
+                && first.is_some_and(|r| {
+                    r.name.as_deref() == Some("board") && r.program.as_deref() == Some("qoop")
+                })
+        },
     );
-    assert!(
-        splits
+    let read = || daemon.run(&["read", &board.to_string()]).1;
+    daemon.until("the board drawn in its pane", &read, || {
+        let screen = read();
+        // The page opens as the list; the lanes are one `b` away.
+        ["Not started", "check the board", "DEFAULT-1", "no agent"]
             .iter()
-            .filter(|t| t.leaves().contains(&qass))
-            .all(|t| t.leaves() == [qass]),
-        "qass is in a split: {splits:?}"
-    );
+            .all(|w| screen.contains(w))
+    });
 
-    // The tab sleeps whole: one tab ended.
+    // The tab sleeps whole, board page and all: qoop's own page is no work a sleep loses.
     let mut said = String::new();
     daemon.until("qass's tab asleep", &|| String::new(), || {
-        let (ok, out, err) = daemon.run(&["sleep", "--tab", &qass.to_string()]);
+        let (ok, out, err) = daemon.run(&["sleep", "--tab", &board.to_string()]);
         said = format!("{out}{err}");
         ok
     });
+    assert!(!said.contains("running in it"), "{said}");
+    // Two panes, one tab.
     assert!(said.contains("is asleep: 1 tab ended"), "{said}");
     let (rows, _) = daemon.index();
-    assert!(
-        rows.iter()
-            .filter(|r| r.terminal == qass)
-            .all(|r| r.state == "sleeping"),
-        "{qass} is still awake after: {said}; {rows:?}"
-    );
+    for t in [board, qass] {
+        assert!(
+            rows.iter()
+                .filter(|r| r.terminal == t)
+                .all(|r| r.state == "sleeping"),
+            "{t} is still awake after: {said}; {rows:?}"
+        );
+    }
 
     // It wakes as one tab; a second wake of its space finds nothing asleep and says so.
-    let (ok, out, err) = daemon.run(&["wake", "--tab", &qass.to_string()]);
+    let (ok, out, err) = daemon.run(&["wake", "--tab", &board.to_string()]);
     assert!(ok && out.contains(": 1 tab awake again"), "{out} {err}");
     let space = out
         .strip_prefix("space ")

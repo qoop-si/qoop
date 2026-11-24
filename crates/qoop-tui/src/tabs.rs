@@ -19,13 +19,15 @@ use qoop_runtime::control::AgentRow;
 /// too many tabs would hide it exactly when somebody is working fast enough to need it.
 const NEW: &str = " + ";
 
-/// The columns a tab's folder is first measured in. A name is never cut, so this does not cap
-/// a label: the tab is as wide as its name needs, and the folder abbreviates its head to fit
-/// beside it, its last name whole.
+/// The most columns one tab's label may take.
+///
+/// A program installed under a long path is already shortened to its last segment, but a
+/// long segment is still possible, and one of them must not be allowed to push every other
+/// terminal off the bar.
 const MAX_LABEL: usize = 12;
 
-/// The most the folder widens a tab to when the bar has the room: spare room goes to folders
-/// before any head is abbreviated, to the widest cap at which every tab of the space still fits.
+/// The most a label takes when the bar has the room: spare room goes to names before any is
+/// cut, to the widest cap at which every tab of the space still fits.
 const ROOMY_LABEL: usize = 32;
 
 /// Rows the bar takes: the tabs' names, and under each the folder it runs in.
@@ -81,23 +83,6 @@ pub fn painted(terminals: &[AgentRow], focused: u32, cols: usize) -> [Vec<(Strin
     if used < cols {
         for row in &mut rows {
             row.push((" ".repeat(cols - used), Ink::Quiet));
-        }
-    }
-    // On a bar narrower than its counts and button, the bar's edge is where the row ends.
-    if used > cols {
-        for row in &mut rows {
-            let mut left = cols;
-            row.retain_mut(|(text, _)| {
-                let wide = crate::width::width(text);
-                if left == 0 {
-                    return false;
-                }
-                if wide > left {
-                    *text = crate::width::text(text, left);
-                }
-                left = left.saturating_sub(wide);
-                true
-            });
         }
     }
     rows
@@ -219,37 +204,6 @@ fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<Segment> {
         close: None,
         hit: Some(Hit::New),
     });
-    // A tab is as wide as its name, so one can be wider than the bar: it ends at the bar's edge,
-    // and the new tab button and the counts keep their columns.
-    let excess = out
-        .iter()
-        .map(|seg| seg.wide)
-        .sum::<usize>()
-        .saturating_sub(cols);
-    if excess > 0
-        && let Some(tab) = out
-            .iter_mut()
-            .rev()
-            .find(|seg| matches!(seg.hit, Some(Hit::Terminal(_))))
-    {
-        let to = tab.wide.saturating_sub(excess);
-        for row in &mut tab.rows {
-            let mut left = to;
-            row.retain_mut(|(text, _)| {
-                let wide = crate::width::width(text);
-                if left == 0 {
-                    return false;
-                }
-                if wide > left {
-                    *text = crate::width::text(text, left);
-                }
-                left = left.saturating_sub(wide);
-                true
-            });
-        }
-        tab.wide = to;
-        tab.close = tab.close.filter(|at| *at < to);
-    }
     out
 }
 
@@ -334,11 +288,6 @@ fn fitting(terminals: &[AgentRow], focused: u32, budget: usize, max: usize) -> (
         used += wide;
         end = at + 1;
     }
-    // A tab wider than the bar is still drawn, as far as the bar goes: the focused tab is the one
-    // thing the bar never stops showing, and a name is not cut to make it fit.
-    if end == first && first < terminals.len() {
-        end = first + 1;
-    }
     (first, end)
 }
 
@@ -380,26 +329,17 @@ fn scrolled(terminals: &[AgentRow], focused: u32, budget: usize, max: usize) -> 
 /// never a width. The label sets the width and the folder is cut to it: a folder wider than
 /// its name made every tab twenty one columns, and three of eight fitted at 120 columns.
 fn tab(row: &AgentRow, position: usize, focused: bool, max: usize) -> Segment {
-    // The name is never cut: the tab is as wide as its name needs.
-    let name = format!(" {}", label(row, position));
+    let name = format!(" {}", label(row, position, max));
     // Two blank columns at least between the name and the close, one after the folder. While
     // every tab fits with room to spare, the folder takes it too, to the same cap as the name.
     let mut inner = crate::width::width(&name) + 3;
     if max > MAX_LABEL {
         inner = inner.max(crate::width::width(&folder(row, max)) + 2);
     }
-    // Someone else at this tab says so where its folder goes, in the same columns. The words
-    // and the folder's last name are whole: the tab widens for them.
+    // Someone else at this tab says so where its folder goes, in the same columns.
     let path = match presence(row, focused, crate::sidebar::now_unix()) {
-        Some(there) => {
-            inner = inner.max(crate::width::width(&there) + 2);
-            format!(" {there}")
-        }
-        None => {
-            let path = folder(row, inner - 2);
-            inner = inner.max(crate::width::width(&path) + 2);
-            format!(" {path}")
-        }
+        Some(there) => format!(" {}", cut(&there, inner - 2)),
+        None => format!(" {}", folder(row, inner - 2)),
     };
     let pad =
         |text: &str, to: usize| format!("{text}{}", " ".repeat(to - crate::width::width(text)));
@@ -477,6 +417,15 @@ pub(crate) fn typing_ends(rows: &[AgentRow], now_unix: i64) -> Option<i64> {
         .min()
 }
 
+/// Words in at most `max` columns, their end given way to an ellipsis when they do not fit.
+fn cut(words: &str, max: usize) -> String {
+    if crate::width::width(words) <= max {
+        return words.to_string();
+    }
+    let kept = crate::width::text(words, max.saturating_sub(1));
+    format!("{}\u{2026}", kept.trim_end())
+}
+
 /// The folder a tab runs in, in at most `max` columns.
 pub(crate) fn folder(row: &AgentRow, max: usize) -> String {
     path_of(
@@ -486,7 +435,11 @@ pub(crate) fn folder(row: &AgentRow, max: usize) -> String {
     )
 }
 
-/// A folder as a path with the home folder as `~`, and past `max` columns its end, from a separator: the end
+/// The most columns a folder takes on a pane's edge before its start gives way to an
+/// ellipsis.
+pub(crate) const MAX_PATH: usize = 20;
+
+/// A folder as a path with the home folder as `~`, and past `max` columns its end: the end
 /// is what tells two worktrees of one repository apart.
 fn path_of(cwd: Option<&str>, home: Option<&str>, max: usize) -> String {
     let Some(cwd) = cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) else {
@@ -510,8 +463,6 @@ fn path_of(cwd: Option<&str>, home: Option<&str>, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    // The head is the part that gives way, at a separator: `…/qoop-wt-x` is an abbreviation like
-    // `~`, never a cut name. The last name is whole, and the tab widens for it when it must.
     let mut end = String::new();
     let mut used = 0;
     for c in path.chars().rev() {
@@ -522,13 +473,10 @@ fn path_of(cwd: Option<&str>, home: Option<&str>, max: usize) -> String {
         used += wide;
         end.insert(0, c);
     }
+    // At a separator when the end holds one, so no folder name is cut mid-word.
     match end.find('/') {
         Some(at) if at > 0 => format!("\u{2026}{}", &end[at..]),
-        Some(_) => format!("\u{2026}{end}"),
-        None => match path.rfind('/') {
-            Some(at) => format!("\u{2026}{}", &path[at..]),
-            None => path,
-        },
+        _ => format!("\u{2026}{end}"),
     }
 }
 
@@ -547,18 +495,15 @@ fn path_of(cwd: Option<&str>, home: Option<&str>, max: usize) -> String {
 ///
 /// One state mark only: a sleeping tab says so (the moon, or `z` without icons) besides its
 /// quiet ink, which colour alone would not; the agents panel says the rest.
-fn label(row: &AgentRow, position: usize) -> String {
+fn label(row: &AgentRow, position: usize, max: usize) -> String {
     let asleep = match (row.state == "sleeping", crate::icons::on()) {
         (false, _) => String::new(),
         (true, true) => format!("{} ", crate::icons::ASLEEP),
         (true, false) => "z ".to_string(),
     };
-    // Cleaned: a name can come from another machine, and a control character in it would be
-    // written to the terminal as one.
-    let clean = |text: String| text.chars().filter(|c| crate::width::drawn(*c)).collect();
     match called(row) {
-        Some(name) => clean(format!("{position} {asleep}{name}")),
-        None => clean(format!("{position} {asleep}").trim_end().to_string()),
+        Some(name) => clip(&format!("{position} {asleep}{name}"), max),
+        None => clip(format!("{position} {asleep}").trim_end(), max),
     }
 }
 
@@ -586,6 +531,11 @@ pub(crate) fn program(row: &AgentRow) -> Option<&str> {
             .filter(|name| !name.is_empty())
             .unwrap_or(program),
     )
+}
+
+/// Cut a label to at most `max` columns.
+fn clip(text: &str, max: usize) -> String {
+    crate::width::fit(text, max.min(crate::width::width(text)))
 }
 
 #[cfg(test)]
@@ -646,6 +596,8 @@ mod tests {
         let [_, folder_row] = rows_of(&[row], 1, 80);
         assert!(folder_row.contains(" computer "), "{folder_row:?}");
         assert!(!folder_row.contains("/tmp/work"), "{folder_row:?}");
+        assert_eq!(cut("phone typing", 7), "phone\u{2026}", "cut, and said so");
+        assert_eq!(cut("phone", 7), "phone");
     }
 
     fn agent(terminal: u32, program: &str) -> AgentRow {
@@ -879,16 +831,15 @@ mod tests {
     #[test]
     fn tabs_past_the_right_edge_are_dropped_and_the_ones_before_them_are_not() {
         let line = render(&sample(), 1, 12);
-        // The first tab, the count of the three it leaves, and the button.
-        assert_eq!(line.text, " \u{256d} 1  +3  + ");
+        // Room for the first tab, ` + `, and nothing else.
+        assert_eq!(line.text, " \u{256d} 1  \u{00d7} +   ");
         assert!(!line.text.contains("tue"));
     }
 
-    /// Tabs with no room are counted at the end they were cut from, and a tab is as wide as its
-    /// name or its folder's last name, whichever is wider: the head of the folder gives way at a
-    /// separator, the last name is whole.
+    /// Tabs with no room are counted at the end they were cut from, and a tab is as wide as
+    /// its name: the folder under it is cut to fit rather than widening it.
     #[test]
-    fn cut_tabs_are_counted_and_a_folder_widens_its_tab_for_its_last_name() {
+    fn cut_tabs_are_counted_and_a_folder_does_not_widen_its_tab() {
         let many: Vec<AgentRow> = (1..=8)
             .map(|n| AgentRow {
                 cwd: Some("/nowhere/work/qoop-private".to_string()),
@@ -897,50 +848,64 @@ mod tests {
             .collect();
         let col = |text: &str, of: &str| crate::width::width(&text[..text.find(of).unwrap()]);
         let [top, under] = rows_of(&many, 1, 80);
-        assert_eq!(col(&top, "2 bash") - col(&top, "1 bash"), 20, "{top:?}");
-        assert!(
-            under.contains("\u{2570} \u{2026}/qoop-private "),
-            "{under:?}"
-        );
-        assert!(top.contains("3 bash") && !top.contains("4 bash"), "{top:?}");
-        assert!(top.contains(" +5 "), "{top:?}");
-        assert_eq!(hit(&many, 1, 80, col(&top, "+5"), 0), None);
+        assert_eq!(col(&top, "2 bash") - col(&top, "1 bash"), 14, "{top:?}");
+        assert!(under.contains("\u{2570} \u{2026}private "), "{under:?}");
+        assert!(top.contains("5 bash") && !top.contains("6 bash"), "{top:?}");
+        assert!(top.contains(" +3 "), "{top:?}");
+        assert_eq!(hit(&many, 1, 80, col(&top, "+3"), 0), None);
         // Scrolled to the last tab, the ones before it are counted at the start.
         let [top, _] = rows_of(&many, 8, 80);
-        assert!(top.starts_with(" +5 \u{256d} 6 bash"), "{top:?}");
+        assert!(top.starts_with(" +3 \u{256d} 4 bash"), "{top:?}");
         assert!(top.contains("8 bash"), "{top:?}");
         // All on the bar: nothing to count.
         let [top, _] = rows_of(&many[..3], 1, 80);
         assert!(!top.contains("+3") && !top.contains(" +0"), "{top:?}");
     }
 
-    /// A folder cut to its tab gives way at a separator, never mid-name, and the last name is
-    /// whole even when it is longer than the room.
+    /// The path under a tab: home as `~`, and a long one keeps its end.
+    #[test]
+    fn the_path_under_a_tab_is_home_relative_and_keeps_its_end() {
+        let home = Some("/Users/me");
+        assert_eq!(path_of(Some("/Users/me"), home, MAX_PATH), "~");
+        assert_eq!(path_of(Some("/Users/me/"), home, MAX_PATH), "~");
+        assert_eq!(
+            path_of(Some("/Users/me/coding/wend"), home, MAX_PATH),
+            "~/coding/wend"
+        );
+        assert_eq!(
+            path_of(Some("/Users/meg/a"), home, MAX_PATH),
+            "/Users/meg/a"
+        );
+        assert_eq!(path_of(Some("/"), home, MAX_PATH), "/");
+        assert_eq!(path_of(None, home, MAX_PATH), "");
+        assert_eq!(path_of(Some("  "), home, MAX_PATH), "");
+        let long = path_of(Some("/Users/me/coding/qoop-wt-events-log"), home, MAX_PATH);
+        assert_eq!(long, "\u{2026}/qoop-wt-events-log");
+        assert_eq!(crate::width::width(&long), MAX_PATH);
+    }
+
+    /// A folder cut to its tab gives way at a separator, never mid-name.
     #[test]
     fn a_cut_folder_gives_way_at_a_separator() {
         let home = Some("/Users/me");
         let cut = path_of(Some("/Users/me/coding/qoop/qoop-private"), home, 16);
         assert_eq!(cut, "\u{2026}/qoop-private");
-        // One name longer than the room is whole, behind the abbreviated head: the tab widens.
-        assert_eq!(
-            path_of(Some("/x/abcdefghij"), None, 6),
-            "\u{2026}/abcdefghij"
-        );
-        assert_eq!(path_of(Some("abcdefghij"), None, 6), "abcdefghij");
+        // One name longer than the room is cut, there is no separator to give way at.
+        assert_eq!(path_of(Some("/x/abcdefghij"), None, 6), "\u{2026}fghij");
     }
 
-    /// Names are never cut: a long name reads whole on a wide bar and on a narrow one (the tab
-    /// is as wide as its name); a sleeping tab carries its mark, not its ink alone.
+    /// Spare room goes to names: on a wide bar a long name reads whole, on a narrow one it is
+    /// cut to the plain cap; a sleeping tab carries its mark, not its ink alone.
     #[test]
     fn names_take_the_spare_room_and_a_sleeping_tab_says_so() {
         let long = "mobile-release-build";
         let rows = vec![agent(1, long), agent(2, "codex")];
         assert!(render(&rows, 1, 200).text.contains(&format!("1 {long}")));
-        assert!(render(&rows, 1, 40).text.contains(long));
+        assert!(!render(&rows, 1, 40).text.contains(long));
         let mut asleep = agent(3, "simulator");
         asleep.state = "sleeping".into();
         assert!(render(&[asleep], 0, 80).text.contains("1 z simulator"));
-        // Room for both names: both read whole.
+        // Room for some of it, not all: the names share it before any is cut to the plain cap.
         let rows = vec![agent(1, "rail-preview-long"), agent(2, "release-build-x")];
         let bar = render(&rows, 1, 60).text;
         assert!(
@@ -954,26 +919,18 @@ mod tests {
         assert!(wide.contains("/work/mobile-app/apps/expo-dock"), "{wide}");
         let crowd = [short, agent(5, &"x".repeat(30)), agent(6, &"y".repeat(30))];
         let [_, tight] = rows_of(&crowd, 0, 40);
-        assert!(tight.contains("\u{2026}/expo-dock"), "{tight}");
+        assert!(
+            tight.contains("dock") && !tight.contains("expo-dock"),
+            "{tight}"
+        );
     }
 
-    /// A long program name is the tab's own width and is never cut to spare the others: the
-    /// bar scrolls to the focused tab, counts the ones it leaves, and a tab wider than the bar
-    /// ends at the bar's edge, still the exact width it was given.
     #[test]
-    fn a_long_program_name_takes_its_tab_and_the_bar_scrolls_to_the_focused_one() {
-        let long = "z".repeat(40);
-        let rows = vec![agent(1, &long), agent(2, "codex")];
-        let on_codex = render(&rows, 2, 40);
-        assert!(on_codex.text.contains("2 codex"), "{:?}", on_codex.text);
-        assert!(on_codex.text.contains("+1"), "{:?}", on_codex.text);
-        // On the long tab it fills the bar, from its first letter to the edge.
-        let on_long = render(&rows, 1, 60);
-        assert!(on_long.text.contains(&long), "{:?}", on_long.text);
-        for cols in [10usize, 25, 40, 60] {
-            let line = render(&rows, 1, cols);
-            assert_eq!(crate::width::width(&line.text), cols, "{:?}", line.text);
-        }
+    fn a_long_program_name_cannot_push_every_other_tab_off_the_bar() {
+        let rows = vec![agent(1, &"z".repeat(40)), agent(2, "codex")];
+        let line = render(&rows, 1, 40);
+        assert!(line.text.contains("codex"), "{:?}", line.text);
+        assert!(!line.text.contains(&"z".repeat(30)), "{:?}", line.text);
     }
 
     #[test]
@@ -988,9 +945,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter_map(|(at, r)| {
-                    // The curve and the tab's place: a tab at the bar's edge ends there, so its
-                    // whole label is not always on the bar.
-                    let byte = text.find(&format!("\u{256d} {} ", at + 1))?;
+                    let byte = text.find(&format!("\u{256d} {} ", label(r, at + 1, MAX_LABEL)))?;
                     Some((crate::width::width(&text[..byte]), r.terminal))
                 })
                 .collect();
@@ -1089,30 +1044,5 @@ mod tests {
         let line = render(&[], 1, 10);
         assert_eq!(line.text, "  +       ");
         assert_eq!(hit(&[], 1, 10, 1, 0), Some(Hit::New));
-    }
-
-    /// The widest path a test names under a tab.
-    const PATH_MAX: usize = 20;
-
-    /// The path under a tab: home as `~`, and a long one keeps its end.
-    #[test]
-    fn the_path_under_a_tab_is_home_relative_and_keeps_its_end() {
-        let home = Some("/Users/me");
-        assert_eq!(path_of(Some("/Users/me"), home, PATH_MAX), "~");
-        assert_eq!(path_of(Some("/Users/me/"), home, PATH_MAX), "~");
-        assert_eq!(
-            path_of(Some("/Users/me/coding/wend"), home, PATH_MAX),
-            "~/coding/wend"
-        );
-        assert_eq!(
-            path_of(Some("/Users/meg/a"), home, PATH_MAX),
-            "/Users/meg/a"
-        );
-        assert_eq!(path_of(Some("/"), home, PATH_MAX), "/");
-        assert_eq!(path_of(None, home, PATH_MAX), "");
-        assert_eq!(path_of(Some("  "), home, PATH_MAX), "");
-        let long = path_of(Some("/Users/me/coding/qoop-wt-events-log"), home, PATH_MAX);
-        assert_eq!(long, "\u{2026}/qoop-wt-events-log");
-        assert_eq!(crate::width::width(&long), PATH_MAX);
     }
 }

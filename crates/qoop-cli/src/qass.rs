@@ -672,15 +672,15 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
         }
         None => {}
     }
-    let terminal = start()?;
+    let terminal = start(true)?;
     // Shown where the person is looking; with no interface open, the number says where.
     let _ = run(&["focus", &terminal.to_string()]);
     Ok(())
 }
 
 /// qass, running: said when it already runs, woken when it sleeps, else started on `[qass]
-/// agent`; its terminal. The board is the Inbox's, so nothing opens beside it.
-pub(crate) fn start() -> std::io::Result<u64> {
+/// agent`; its terminal. With `board`, the board opens above it.
+pub(crate) fn start(board: bool) -> std::io::Result<u64> {
     let folder = paths::qass_data_dir()
         .ok_or_else(|| std::io::Error::other("no HOME to keep qass's folder under"))?;
     // Before a start and a wake alike: a woken qass reads its folder settings again. A file
@@ -770,6 +770,11 @@ pub(crate) fn start() -> std::io::Result<u64> {
         println!("qass {how} in terminal {opened} on {}", read.qass_agent);
         u64::from(opened)
     };
+    // The board on top of it; qass is there without it, so a board that cannot open is said
+    // and nothing more.
+    if board && let Err(why) = show_board(terminal, &folder) {
+        eprintln!("qoop: the board did not open above qass: {why}");
+    }
     Ok(terminal)
 }
 
@@ -989,6 +994,77 @@ pub(crate) fn send(terminal: u64, text: &str) -> std::io::Result<()> {
     Err(std::io::Error::other(
         said.trim().trim_start_matches("qoop: ").to_string(),
     ))
+}
+
+/// Put the board beside qass in its tab (decision 12): `qoop task board --page` in a pane of
+/// its own, the tab's first, left of qass through the split the interface keeps. A tab
+/// that has a board pane is left as it is, even one at a shell: the wake that brought it back
+/// typed its page (`restore_rows`), and typing it here too would put the second line into the
+/// page as a new item.
+fn show_board(qass: u64, folder: &Path) -> std::io::Result<()> {
+    use qoop_runtime::control::{ControlRequest, ControlResponse, Pane, SplitDir};
+    use qoop_runtime::idle::{BOARD_PANE, has_board, lone_board};
+
+    let qass = u32::try_from(qass).map_err(std::io::Error::other)?;
+    let patience = std::time::Duration::from_secs(10);
+    let ControlResponse::Agents { agents, splits, .. } = crate::task::ask(
+        ControlRequest::ListAgents {
+            id: crate::request_id("qass"),
+        },
+        patience,
+    )?
+    else {
+        return Err(std::io::Error::other(
+            "unexpected answer to the agent listing",
+        ));
+    };
+    let left = lone_board(&agents, &splits, qass);
+    let tree = splits.into_iter().find(|t| t.leaves().contains(&qass));
+    let panes = tree.as_ref().map(|t| t.leaves()).unwrap_or_default();
+    if has_board(agents.iter().filter(|r| panes.contains(&r.terminal)), qass) {
+        return Ok(());
+    }
+    // A board an earlier qass left behind is taken back: one board in the space, never two.
+    let board = match left {
+        Some(board) => board,
+        None => {
+            let me = std::env::current_exe()?.display().to_string();
+            let page = ["exec", &me, "task", "board", "--page"];
+            let opts = supervise::NewOpts {
+                name: Some(BOARD_PANE.into()),
+                cwd: Some(folder.to_path_buf()),
+                space: Some(SPACE.into()),
+                command: page.iter().map(|w| w.to_string()).collect(),
+                typed: None,
+                spawned: false,
+            };
+            let mut board = 0;
+            supervise::open_terminal(&opts, |t| board = t)?;
+            board
+        }
+    };
+    // The board first, so the tab is still one tab and the board is on the left; the
+    // interface stacks it over qass when the pane is too narrow for the two side by side.
+    let tree = Pane::Split {
+        dir: SplitDir::V,
+        permille: 700,
+        questions: 0,
+        first: Box::new(Pane::Leaf { terminal: board }),
+        second: Box::new(tree.unwrap_or(Pane::Leaf { terminal: qass })),
+    };
+    match crate::task::ask(
+        ControlRequest::SetSplit {
+            id: crate::request_id("qass"),
+            tree,
+        },
+        patience,
+    )? {
+        ControlResponse::SplitSaved { .. } => Ok(()),
+        ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+        other => Err(std::io::Error::other(format!(
+            "unexpected answer: {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]

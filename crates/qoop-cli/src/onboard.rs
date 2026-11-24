@@ -627,8 +627,8 @@ fn command_key(prefix: u8) -> String {
 /// What onboarding ends on without qass: the next thing to do, with the command key just chosen.
 fn last_line(key: &str) -> String {
     format!(
-        "qoop is set up. Next: start qoop, then {key} Q and s start qass, which sets up your \
-         projects with you (settings: qoop settings)"
+        "qoop is set up. Next: start qoop, then {key} Q opens qass, which sets up your projects \
+         with you (settings: qoop settings)"
     )
 }
 
@@ -706,8 +706,8 @@ fn claude_warns(json: Option<&Path>, settings: Option<&Path>) -> bool {
 fn claude_warning(key: &str) -> String {
     format!(
         "claude may ask a few first questions. At its warning choose \"Yes, I accept\":\nqass then \
-         runs commands without asking each time, inside its own rules. If it exits, {key} Q and s \
-         start qass again."
+         runs commands without asking each time, inside its own rules. If it exits, {key} Q starts \
+         qass again."
     )
 }
 
@@ -718,7 +718,7 @@ fn open_qass(agent: &str, inside: bool) -> std::io::Result<()> {
     config::set(&config::path(), "qass.agent", agent).map_err(std::io::Error::other)?;
     let dir = qoop_runtime::paths::runtime_dir().map_err(std::io::Error::other)?;
     crate::ensure_daemon(&qoop_runtime::paths::socket_path(&dir))?;
-    let terminal = crate::qass::start()?;
+    let terminal = crate::qass::start(false)?;
     if inside {
         let _ = crate::qass::run(&["focus", &terminal.to_string()]);
         return Ok(());
@@ -830,7 +830,7 @@ mod tests {
 
     #[test]
     fn it_ends_on_qass_with_the_chosen_key() {
-        assert!(last_line(&command_key(2)).contains("ctrl-b Q and s start qass"));
+        assert!(last_line(&command_key(2)).contains("ctrl-b Q opens qass"));
         assert!(last_line(&command_key(1)).contains("ctrl-a Q"));
     }
 
@@ -904,7 +904,7 @@ mod tests {
     fn the_warning_line_says_what_to_choose_what_it_means_and_the_way_back() {
         let line = claude_warning("ctrl-b");
         assert!(line.contains("\"Yes, I accept\"") && line.contains("without asking"));
-        assert!(line.ends_with("ctrl-b Q and s start qass again."), "{line}");
+        assert!(line.ends_with("ctrl-b Q starts qass again."), "{line}");
     }
 
     /// Claude's local install counts; an agent in an install folder off `PATH` does not, as the

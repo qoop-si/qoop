@@ -28,7 +28,7 @@ impl Desk {
     }
 
     /// Read qass's lessons file again (on opening the page): small, on this Mac only, by the
-    /// reader the TUI's ledger uses (a file that is not there is none written yet).
+    /// shared reader (a file that is not there is none written yet).
     pub(crate) fn read_lessons(&mut self) {
         self.lessons = qoop_tui::places::rules_read_at(&self.lessons_path);
     }
@@ -68,8 +68,8 @@ impl Desk {
             .is_some_and(|until| self.now < until)
     }
 
-    /// `qoop qass`, as the TUI's Start qass in its ledger runs it: it starts qass in its own space,
-    /// or wakes it. Off the window's thread; what it says when it cannot is shown.
+    /// `qoop qass`, as the TUI's `ctrl-a Q` runs it: it starts qass in its own space, or wakes
+    /// it. Off the window's thread; what it says when it cannot is shown.
     pub(crate) fn start_qass(&mut self, cx: &mut Context<Self>) {
         if self.qass_starting() {
             return;
@@ -129,7 +129,7 @@ impl Desk {
         cx.notify();
     }
 
-    /// Say `text` to qass, as the TUI's ask line does: pasted into its terminal and sent with
+    /// Say `text` to qass, as the TUI's talk line does: pasted into its terminal and sent with
     /// Enter when it is at rest (idle or done, ready, and nobody typing in it); else the words
     /// stay where they were typed and the line says why. True when qass has them.
     pub(crate) fn tell_qass(

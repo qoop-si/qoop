@@ -72,7 +72,7 @@ after it (`online` in green, `offline` in orange, `local` in grey; `online` and 
 web app), `menu`, the settings cog and `«` at the right (a click on the cog opens the settings
 page; where icons are not drawn it is `set`, from 24 columns), and the q sits on the four rows
 right above it. The picked pet stands at the right, five rows of half blocks level with the q,
-its feet on the row above the menu (a click on any cell of it is `ctrl-a Q`: qass's ledger, or back), and
+its feet on the row above the menu (a click on any cell of it is `ctrl-a Q`: qass, or back), and
 the inbox count stands over it as a chip, `[ 2 ]` in the search chip's ember brackets flush with
 the pet's right edge, warm while anything waits. The foot is the same seven rows with or without
 the pet, so the pet never takes a row from the agent list, which scrolls above it; only a column

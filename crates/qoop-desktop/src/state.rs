@@ -1341,7 +1341,7 @@ pub fn work_space(
     }
 }
 
-/// How qass stands on This Mac, as the TUI's ledger says it (`qoop_tui::ledger::Stand`): it
+/// How qass stands on This Mac (`qoop_tui::ledger::Stand`): it
 /// runs (paused when its watching switch is off, else watching the agents of the computers
 /// reached, `lost` being the ones not), its agent sleeps, it does not run, or it was never set
 /// up here.
