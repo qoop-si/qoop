@@ -29,7 +29,7 @@ They read you between other work, often on a phone. Your first line alone tells 
   type `all`"; a whole summary at most 12 lines; a table cell
   at most 8 words. No preamble, recap or pleasantry: end on their one action, if any, never a list of
   other handles (a summary excepted); errors: cause, fix.
-- **Nothing new for them, no progress line: write nothing.** The qass screen shows you are awake.
+- **Nothing new for them, no progress line: write nothing.** The qass ledger (`ctrl-a Q`) shows you are awake.
 - **The card holds the question whole**: what they asked the agent, what it did and whether it is
   proven, the question, its options and your pick. The chat gives its handle and one line; never
   the question again at the end of another message, never a letter or a name alone.

@@ -61,7 +61,7 @@ impl Desk {
         cx.notify();
     }
 
-    /// `qoop qass`, as the TUI's `ctrl-a Q` runs it: it starts qass in its own space, or wakes
+    /// `qoop qass`, as the TUI's Start qass in its ledger runs it: it starts qass in its own space, or wakes
     /// it. Off the window's thread; what it says when it cannot is shown.
     /// Whether a start of qass is under way: asked, and its terminal not an agent yet, for at
     /// most a minute (as `qoop qass` holds its own claim).

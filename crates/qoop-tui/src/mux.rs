@@ -3006,6 +3006,19 @@ mod tests {
         }];
         let (hand, ctx, typed) = (HandInput::default(), Context::default(), BTreeMap::new());
         let now = Instant::now();
+        let (board, reach) = (
+            crate::board::Board::default(),
+            crate::places::Reach::default(),
+        );
+        let beside = crate::places::Beside {
+            board: &board,
+            acts: None,
+            acts_failed: None,
+            schedules: None,
+            rules: None,
+            reach: &reach,
+            offers: &[],
+        };
         let env = Env {
             rows: std::slice::from_ref(&row),
             spaces: &spaces,
@@ -3015,6 +3028,7 @@ mod tests {
             now,
             now_unix: 0,
             typed: &typed,
+            beside: &beside,
         };
         let mut pane = Pane::new();
         pane.open();

@@ -25,7 +25,8 @@ use crate::answers::{
 use crate::asks::wrap_whole;
 use crate::inbox::{Context, Inbox, Item, ItemKind, OwnAnswer};
 use crate::mux::machine_of;
-use crate::qass_screen::{Seg, bold, line, seg};
+use crate::places::{Beside, Place, PlaceOut};
+use crate::segs::{Seg, bold, line, seg};
 use crate::theme::Role;
 use crate::width;
 
@@ -68,6 +69,8 @@ pub struct Env<'a> {
     /// When the person last typed into each terminal: a reply is never typed into a line they
     /// began after it was held.
     pub typed: &'a BTreeMap<u32, Instant>,
+    /// What the places beside the Inbox read: the board, what qass did, the schedules.
+    pub beside: &'a Beside<'a>,
 }
 
 impl Env<'_> {
@@ -84,7 +87,7 @@ impl Env<'_> {
     }
 
     /// The space an agent is in, as a person names it.
-    fn space_name(&self, workspace: i64) -> String {
+    pub(crate) fn space_name(&self, workspace: i64) -> String {
         self.spaces
             .iter()
             .find(|s| s.id == workspace)
@@ -152,6 +155,10 @@ pub enum Out {
     Talk(Box<AskInfo>),
     /// Not the Inbox's: the prefix, a mouse report or a detach, for the ordinary path.
     Pass(Vec<u8>),
+    /// A place beside the Inbox asks something of the client.
+    Place(PlaceOut),
+    /// `n`: the box that starts a new agent.
+    NewAgent,
 }
 
 /// Bytes to put into an agent's terminal: a reply, or the key of an answer an older machine
@@ -196,6 +203,32 @@ pub enum Hit {
     Filter,
     /// A quiet row (with qass, finished): go to its agent.
     Go(u32),
+    /// The Board chip of the header (true), or the list's (false).
+    Board(bool),
+    /// Something on one of the places beside the Inbox (qass's ledger, a computer, the new
+    /// agent box).
+    Place(PlaceHit),
+}
+
+/// What a click on a place beside the Inbox lands on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaceHit {
+    /// qass's Pause, or Resume while it is paused.
+    Watch,
+    /// Start qass.
+    Start,
+    /// The link to qass's questions in the Inbox.
+    Questions,
+    /// qass's own terminal.
+    Terminal,
+    /// The ask line.
+    Ask,
+    /// Retry a computer that is not reached.
+    Retry,
+    /// Start the new agent.
+    Submit,
+    /// Leave without starting.
+    Cancel,
 }
 
 /// A cell range on one row of the pane that a click answers.
@@ -240,10 +273,19 @@ pub enum Act {
 pub struct Pane {
     /// Shown over the pane, with the keyboard.
     pub open: bool,
+    /// What was left on qass's ask line when the ledger was put away, for the next one.
+    pub ask_draft: String,
     /// The left column was folded to its strip by opening the Inbox (below 100 columns).
     pub folded: bool,
     /// Only what qass wrote (a card of its own, a plan to approve).
     pub filter: bool,
+    /// The Board in place of the list (`tab`).
+    pub board: bool,
+    /// A place beside the Inbox that has the pane: qass's ledger, a computer, the new agent
+    /// box. The Inbox is under it and comes back when it is put away.
+    pub place: Option<Place>,
+    /// The place was opened from the Inbox, so putting it away goes back there.
+    pub from_inbox: bool,
     sel: Option<Slot>,
     /// The selected card read whole, in place of the list.
     whole: bool,
@@ -286,17 +328,56 @@ impl Pane {
 
     /// Open the Inbox over the pane.
     pub fn open(&mut self) {
+        self.stash_place();
         self.open = true;
         self.whole = false;
+        self.board = false;
+        self.place = None;
+        self.from_inbox = false;
         self.follow.set(true);
+    }
+
+    /// Open a place beside the Inbox over the pane. `from_inbox`: putting it away goes back to
+    /// the Inbox rather than to what was under it.
+    pub fn open_place(&mut self, place: Place, from_inbox: bool) {
+        self.stash_typing();
+        self.stash_place();
+        self.open = true;
+        self.whole = false;
+        self.place = Some(place);
+        self.from_inbox = from_inbox;
+    }
+
+    /// Put the place away: back to the Inbox when it came from there, else everything goes.
+    /// True when the Inbox was put away with it.
+    pub fn leave_place(&mut self) -> bool {
+        self.stash_place();
+        self.place = None;
+        if std::mem::take(&mut self.from_inbox) {
+            self.follow.set(true);
+            return false;
+        }
+        self.close();
+        true
     }
 
     /// Put the Inbox away. What is held stays held and is sent when its time is up.
     pub fn close(&mut self) {
+        self.stash_place();
         self.open = false;
         self.whole = false;
+        self.board = false;
+        self.place = None;
+        self.from_inbox = false;
         self.stash_typing();
         self.said.clear();
+    }
+
+    /// The words left on qass's ask line are kept when its ledger goes, for the next one.
+    fn stash_place(&mut self) {
+        if let Some(Place::Ledger(ledger)) = &self.place {
+            self.ask_draft = ledger.draft().to_string();
+        }
     }
 
     /// Stop typing: the words stay as a draft for their card, to come back with `r`.
@@ -1121,6 +1202,9 @@ impl Pane {
     }
 
     fn own_keys(&mut self, bytes: &[u8], env: &Env) -> Out {
+        if self.place.is_some() {
+            return self.place_keys(bytes, env);
+        }
         if self.typing.is_some() {
             return self.type_key(bytes, env);
         }
@@ -1133,6 +1217,8 @@ impl Pane {
                 (Key::Down, 3)
             } else if rest == b"\x1b" {
                 (Key::Esc, 1)
+            } else if rest[0] == b'\t' {
+                (Key::Tab, 1)
             } else if rest[0] == 0x1b {
                 // Some other sequence: not ours, and not worth reading as a letter.
                 return Out::Stay;
@@ -1148,12 +1234,78 @@ impl Pane {
         Out::Stay
     }
 
+    /// A place beside the Inbox has the keys.
+    fn place_keys(&mut self, bytes: &[u8], env: &Env) -> Out {
+        let out = match self.place.as_mut() {
+            Some(Place::Ledger(ledger)) => ledger.key(bytes, env),
+            Some(Place::Computer(computer)) => computer.key(bytes),
+            Some(Place::New(new)) => new.key(bytes),
+            None => return Out::Stay,
+        };
+        self.placed(out)
+    }
+
+    /// What a place asked: put away (back to the Inbox when it came from there), or the loop's.
+    fn placed(&mut self, out: PlaceOut) -> Out {
+        match out {
+            PlaceOut::Stay => Out::Stay,
+            PlaceOut::Closed => {
+                if self.leave_place() {
+                    Out::Closed
+                } else {
+                    Out::Stay
+                }
+            }
+            PlaceOut::Jump(terminal) => Out::Jump(terminal),
+            other => Out::Place(other),
+        }
+    }
+
+    /// The Board has the keys: it only reads, so a key that answers does nothing here.
+    fn board_key(&mut self, key: Key) -> Out {
+        match key {
+            Key::Esc => Out::Closed,
+            Key::Tab => {
+                self.show_board(false);
+                Out::Stay
+            }
+            Key::Char(b'j') | Key::Down => {
+                self.offset
+                    .set((self.offset.get() + 1).min(self.max_offset.get()));
+                Out::Stay
+            }
+            Key::Char(b'k') | Key::Up => {
+                self.offset.set(self.offset.get().saturating_sub(1));
+                Out::Stay
+            }
+            Key::Char(b'n') => Out::NewAgent,
+            Key::Char(_) => Out::Stay,
+        }
+    }
+
+    /// Show the Board in place of the list, or the list again.
+    pub fn show_board(&mut self, on: bool) {
+        self.board = on;
+        self.whole = false;
+        self.stash_typing();
+        self.offset.set(0);
+        self.follow.set(!on);
+    }
+
     fn act(&mut self, key: Key, env: &Env) -> Out {
+        if self.board {
+            return self.board_key(key);
+        }
         let inbox = self.inbox(env);
         let item = self.item(&inbox);
         let order = self.order(&inbox);
         let slot = self.selected(&order);
         match key {
+            Key::Tab => {
+                self.show_board(true);
+                Out::Stay
+            }
+            Key::Char(b'n') => Out::NewAgent,
             Key::Esc if self.whole => {
                 self.whole = false;
                 Out::Stay
@@ -1263,8 +1415,7 @@ impl Pane {
                 self.sel = None;
                 Out::Stay
             }
-            // `n` (a new agent) and tab (the Board) are not here yet: taken, so they type
-            // nothing into the agent behind.
+            // Taken, so a key that means nothing here types nothing into the agent behind.
             Key::Char(_) => Out::Stay,
         }
     }
@@ -1360,12 +1511,33 @@ impl Pane {
                 self.follow.set(true);
             }
             Hit::Go(terminal) => return Out::Jump(terminal),
+            Hit::Board(on) => self.show_board(on),
+            Hit::Place(hit) => {
+                let out = match self.place.as_mut() {
+                    Some(Place::Ledger(ledger)) => ledger.click(hit, env),
+                    Some(Place::Computer(computer)) => computer.click(hit),
+                    Some(Place::New(new)) => new.click(hit),
+                    None => PlaceOut::Stay,
+                };
+                return self.placed(out);
+            }
         }
         Out::Stay
     }
 
     /// The wheel: three rows a notch, the view no longer following the selection.
     pub fn scroll(&mut self, down: bool) {
+        match &self.place {
+            Some(Place::Ledger(ledger)) => {
+                ledger.scroll(down);
+                return;
+            }
+            Some(Place::Computer(computer)) => {
+                computer.scroll(down);
+                return;
+            }
+            _ => {}
+        }
         self.follow.set(false);
         let off = self.offset.get();
         self.offset.set(if down {
@@ -1373,6 +1545,13 @@ impl Pane {
         } else {
             off.saturating_sub(3)
         });
+    }
+
+    /// A line for qass that could not be sent now comes back to the ledger's ask line.
+    pub fn keep_ask(&mut self, text: String) {
+        if let Some(Place::Ledger(ledger)) = &mut self.place {
+            ledger.keep(text);
+        }
     }
 
     /// Whether the person is typing their own words.
@@ -1414,7 +1593,7 @@ fn hold_words(hold: &Hold, secs: u64, who: &str) -> String {
 }
 
 /// The person's local wall clock at `unix`, "16:04".
-fn clock(unix: i64) -> String {
+pub(crate) fn clock(unix: i64) -> String {
     let at = (qoop_runtime::schedule::system_zone().local)(unix);
     format!("{:02}:{:02}", at.hour, at.minute)
 }
@@ -1524,6 +1703,7 @@ enum Key {
     Esc,
     Up,
     Down,
+    Tab,
     Char(u8),
 }
 
@@ -1531,34 +1711,34 @@ enum Key {
 
 /// One row of the pane before it is painted: its pieces, and where each click lands.
 #[derive(Clone, Debug, Default)]
-struct Row {
-    segs: Vec<Seg>,
-    hits: Vec<(usize, usize, Hit)>,
+pub(crate) struct Row {
+    pub(crate) segs: Vec<Seg>,
+    pub(crate) hits: Vec<(usize, usize, Hit)>,
 }
 
 impl Row {
-    fn plain(role: Role, text: impl Into<String>) -> Row {
+    pub(crate) fn plain(role: Role, text: impl Into<String>) -> Row {
         Row {
             segs: vec![seg(role, text)],
             hits: Vec::new(),
         }
     }
 
-    fn blank() -> Row {
+    pub(crate) fn blank() -> Row {
         Row::plain(Role::Text, "")
     }
 }
 
 /// A piece that is never split across two rows (an option with its number, a key with its
 /// word), and what a click on it does.
-struct Unit {
-    role: Role,
-    bold: bool,
-    text: String,
-    hit: Option<Hit>,
+pub(crate) struct Unit {
+    pub(crate) role: Role,
+    pub(crate) bold: bool,
+    pub(crate) text: String,
+    pub(crate) hit: Option<Hit>,
 }
 
-fn unit(role: Role, text: impl Into<String>, hit: Option<Hit>) -> Unit {
+pub(crate) fn unit(role: Role, text: impl Into<String>, hit: Option<Hit>) -> Unit {
     Unit {
         role,
         bold: false,
@@ -1570,7 +1750,7 @@ fn unit(role: Role, text: impl Into<String>, hit: Option<Hit>) -> Unit {
 /// `units` laid out in rows of `cols` columns behind `indent` blank columns, `gap` blank
 /// columns between two, breaking only between units; a unit wider than the row is wrapped on
 /// its words.
-fn flow(units: Vec<Unit>, indent: usize, gap: usize, cols: usize) -> Vec<Row> {
+pub(crate) fn flow(units: Vec<Unit>, indent: usize, gap: usize, cols: usize) -> Vec<Row> {
     let room = cols.saturating_sub(indent).max(1);
     let mut rows: Vec<Row> = Vec::new();
     let mut used = 0usize;
@@ -1636,7 +1816,13 @@ fn flow(units: Vec<Unit>, indent: usize, gap: usize, cols: usize) -> Vec<Row> {
 }
 
 /// `text` wrapped whole behind `indent` columns of `cols`, in one ink.
-fn wrapped(text: &str, indent: usize, cols: usize, role: Role, bold_it: bool) -> Vec<Row> {
+pub(crate) fn wrapped(
+    text: &str,
+    indent: usize,
+    cols: usize,
+    role: Role,
+    bold_it: bool,
+) -> Vec<Row> {
     let room = cols.saturating_sub(indent).max(1);
     let lead = " ".repeat(indent);
     wrap_whole(text, room)
@@ -1665,6 +1851,12 @@ impl Pane {
     /// The Inbox painted into `cols` by `rows`, from `env`.
     pub fn view(&self, env: &Env, cols: usize, rows: usize) -> View {
         let inbox = self.inbox(env);
+        match &self.place {
+            Some(Place::Ledger(ledger)) => return ledger.view(env, &inbox, cols, rows),
+            Some(Place::Computer(computer)) => return computer.view(env, cols, rows),
+            Some(Place::New(new)) => return new.view(cols, rows),
+            None => {}
+        }
         let order = self.order(&inbox);
         let selected = self.selected(&order);
 
@@ -1680,7 +1872,10 @@ impl Pane {
                 .find(|s| machine_of(s.id) == *machine)
                 .map_or_else(|| "a computer".to_string(), |s| env.machine_name(s.id));
             head.extend(wrapped(
-                &format!("{name} is not reached: what shows from it is as of its last answer"),
+                &format!(
+                    "{name} is {}: what shows from it is as of its last answer",
+                    env.beside.reach.not_reached(*machine)
+                ),
                 1,
                 cols,
                 Role::Blocked,
@@ -1727,7 +1922,10 @@ impl Pane {
         }
 
         let height = rows.saturating_sub(head.len() + foot.len()).max(1);
-        let (body, range) = if self.whole {
+        let (body, range) = if self.board {
+            let handed: BTreeSet<u32> = inbox.with_qass.iter().copied().collect();
+            (crate::board::rows(env.beside.board, &handed, cols), None)
+        } else if self.whole {
             (self.whole_rows(item, env, cols), None)
         } else {
             self.body(&inbox, &order, &selected, env, cols)
@@ -1777,28 +1975,7 @@ impl Pane {
         }
         shown.truncate(rows.max(1));
 
-        let mut targets = Vec::new();
-        let mut painted = Vec::new();
-        let mut plain = Vec::new();
-        for (at, row) in shown.iter().enumerate() {
-            for (x0, x1, hit) in &row.hits {
-                targets.push(Target {
-                    row: at,
-                    x0: *x0,
-                    x1: *x1,
-                    hit: hit.clone(),
-                });
-            }
-            painted.push(line(&row.segs, cols, false));
-            let text: String = row.segs.iter().map(|s| s.text.as_str()).collect();
-            plain.push(width::fit(&text, cols));
-        }
-        View {
-            rows: painted,
-            plain,
-            targets,
-            cursor,
-        }
+        paint(&shown, cols, cursor)
     }
 
     /// The title row: the one count, qass, the From qass chip.
@@ -1811,10 +1988,14 @@ impl Pane {
             Some(_) => "\u{25c6} qass not running",
         };
         let mut units = vec![Unit {
-            role: Role::Title,
-            bold: true,
+            role: if self.board {
+                Role::FaintText
+            } else {
+                Role::Title
+            },
+            bold: !self.board,
             text: "inbox".into(),
-            hit: None,
+            hit: Some(Hit::Board(false)),
         }];
         units.push(if n > 0 {
             Unit {
@@ -1840,6 +2021,16 @@ impl Pane {
             },
             hit: Some(Hit::Filter),
         });
+        units.push(Unit {
+            role: if self.board {
+                Role::Focused
+            } else {
+                Role::FaintText
+            },
+            bold: self.board,
+            text: "board".into(),
+            hit: Some(Hit::Board(true)),
+        });
         units.push(unit(Role::FaintText, qass, None));
         flow(units, 1, 3, cols)
     }
@@ -1848,6 +2039,18 @@ impl Pane {
     fn hints(&self, item: Option<&Item>, env: &Env) -> Vec<Unit> {
         let faint = |t: &str| unit(Role::FaintText, t, None);
         let mut out = Vec::new();
+        if self.board {
+            return vec![
+                unit(
+                    Role::FaintText,
+                    "tab back to the list",
+                    Some(Hit::Board(false)),
+                ),
+                faint("j k scroll"),
+                faint("n new agent"),
+                faint("esc closes"),
+            ];
+        }
         if self.whole {
             let mut out = vec![faint("j k scroll")];
             if !self.holds.held.is_empty() {
@@ -1887,6 +2090,8 @@ impl Pane {
         } else {
             "f from qass"
         }));
+        out.push(unit(Role::FaintText, "tab board", Some(Hit::Board(true))));
+        out.push(faint("n new agent"));
         out.push(faint("esc back"));
         out
     }
@@ -2299,7 +2504,7 @@ impl Pane {
     }
 }
 
-fn rule_row(cols: usize, more: &str) -> Row {
+pub(crate) fn rule_row(cols: usize, more: &str) -> Row {
     if more.is_empty() || width::width(more) + 4 > cols {
         return Row::plain(Role::Rule, "\u{2500}".repeat(cols));
     }
@@ -2314,6 +2519,32 @@ fn rule_row(cols: usize, more: &str) -> Row {
             seg(Role::Rule, "\u{2500}"),
         ],
         hits: Vec::new(),
+    }
+}
+
+/// `shown` painted into rows of exactly `cols` columns, with where a click lands.
+pub(crate) fn paint(shown: &[Row], cols: usize, cursor: Option<(usize, usize)>) -> View {
+    let mut targets = Vec::new();
+    let mut painted = Vec::new();
+    let mut plain = Vec::new();
+    for (at, row) in shown.iter().enumerate() {
+        for (x0, x1, hit) in &row.hits {
+            targets.push(Target {
+                row: at,
+                x0: *x0,
+                x1: *x1,
+                hit: hit.clone(),
+            });
+        }
+        painted.push(line(&row.segs, cols, false));
+        let text: String = row.segs.iter().map(|s| s.text.as_str()).collect();
+        plain.push(width::fit(&text, cols));
+    }
+    View {
+        rows: painted,
+        plain,
+        targets,
+        cursor,
     }
 }
 
@@ -2355,6 +2586,21 @@ mod tests {
         ctx: Context,
         now_unix: i64,
         typed: BTreeMap<u32, Instant>,
+        /// What the places beside the Inbox read: nothing, kept for the life of the test.
+        beside: &'static Beside<'static>,
+    }
+
+    /// The places' data with nothing read.
+    fn nothing_beside() -> &'static Beside<'static> {
+        Box::leak(Box::new(Beside {
+            board: Box::leak(Box::default()),
+            acts: None,
+            acts_failed: None,
+            schedules: None,
+            rules: None,
+            reach: Box::leak(Box::default()),
+            offers: &[],
+        }))
     }
 
     fn space(id: i64, name: String) -> WorkspaceRow {
@@ -2401,6 +2647,7 @@ mod tests {
             ctx: state.context,
             now_unix: state.now,
             typed: BTreeMap::new(),
+            beside: nothing_beside(),
         }
     }
 
@@ -2414,6 +2661,7 @@ mod tests {
             now,
             now_unix: w.now_unix,
             typed: &w.typed,
+            beside: w.beside,
         }
     }
 
@@ -3077,9 +3325,19 @@ mod tests {
             press(&mut pane, &w, ready, b"\x11"),
             Out::Pass(b"\x11".to_vec())
         );
-        // `n` and tab are kept for later: taken, never typed into the agent behind.
-        assert_eq!(press(&mut pane, &w, ready, b"n"), Out::Stay);
+        // A letter that means nothing here is taken, never typed into the agent behind.
+        assert_eq!(press(&mut pane, &w, ready, b"z"), Out::Stay);
+        // `n` starts a new agent, and tab turns to the Board and back.
+        assert_eq!(press(&mut pane, &w, ready, b"n"), Out::NewAgent);
         assert_eq!(press(&mut pane, &w, ready, b"\t"), Out::Stay);
+        assert!(pane.board);
+        assert_eq!(
+            press(&mut pane, &w, ready, b"n"),
+            Out::NewAgent,
+            "n works on the Board too"
+        );
+        assert_eq!(press(&mut pane, &w, ready, b"\t"), Out::Stay);
+        assert!(!pane.board);
     }
 
     #[test]
