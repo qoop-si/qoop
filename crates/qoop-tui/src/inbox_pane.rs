@@ -47,9 +47,6 @@ const RETRY: Duration = Duration::from_millis(300);
 /// card; a menu's is larger).
 const TEXT_MAX: usize = 400;
 
-/// The own answers kept for Answered today.
-const OWN_MOST: usize = 50;
-
 /// The columns of a card's own words, in from the pane's edge, and of its title.
 const BODY: usize = 5;
 const TITLE: usize = 3;
@@ -945,18 +942,7 @@ impl Pane {
         }
         self.say(said, env);
         self.notice_slot = Some(hold.slot.clone());
-        self.own.push(OwnAnswer {
-            at: env.now_unix,
-            label: hold.label.clone(),
-            to: item_who,
-            card: match &hold.slot {
-                Slot::Card(id) => Some(id.clone()),
-                Slot::Agent(_) => None,
-            },
-        });
-        if self.own.len() > OWN_MOST {
-            self.own.remove(0);
-        }
+        crate::inbox::record_own(&mut self.own, hold, item_who, env.now_unix);
     }
 
     /// The daemon's answer to something this pane asked. True when the screen changed.

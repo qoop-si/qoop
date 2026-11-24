@@ -28,6 +28,7 @@ pub enum Icon {
     Chevron,
     Close,
     Phone,
+    Server,
 }
 
 impl Icon {
@@ -42,6 +43,7 @@ impl Icon {
             Icon::Chevron => "icons/chevron.svg",
             Icon::Close => "icons/close.svg",
             Icon::Phone => "icons/phone.svg",
+            Icon::Server => "icons/server.svg",
         }
     }
 
@@ -65,6 +67,9 @@ impl Icon {
             "icons/close.svg" => r#"<path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/>"#,
             "icons/phone.svg" => {
                 r#"<rect x="7" y="3" width="10" height="18" rx="2.5"/><path d="M11 18h2"/>"#
+            }
+            "icons/server.svg" => {
+                r#"<rect x="4" y="4" width="16" height="6.5" rx="1.5"/><rect x="4" y="13.5" width="16" height="6.5" rx="1.5"/><path d="M7.5 7.25h.01M7.5 16.75h.01"/>"#
             }
             _ => return None,
         })
@@ -752,15 +757,6 @@ pub fn tag(text: &str, t: &Theme) -> Div {
         .child(text.to_string())
 }
 
-/// A card: the raised ground of a group.
-pub fn card(t: &Theme) -> Div {
-    div()
-        .bg(c(t.card))
-        .rounded(px(14.))
-        .border_1()
-        .border_color(ca(t.hair))
-}
-
 /// A tooltip: a line of text on the popover ground, shown beside the control it explains.
 pub struct Tip {
     text: SharedString,
@@ -789,17 +785,6 @@ pub fn tip_text(text: String, t: Theme) -> impl Fn(&mut Window, &mut App) -> Any
     move |_, cx| {
         cx.new(|_| Tip {
             text: text.clone(),
-            t,
-        })
-        .into()
-    }
-}
-
-/// What `.tooltip()` takes to show `text`.
-pub fn tip(text: &'static str, t: Theme) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-    move |_, cx| {
-        cx.new(|_| Tip {
-            text: text.into(),
             t,
         })
         .into()

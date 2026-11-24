@@ -18,7 +18,7 @@ use qoop_runtime::control::{
 
 use crate::app::{Desk, Page};
 use crate::field::Field;
-use crate::link;
+use crate::link::{self, Up};
 use crate::state::{self, Hold, Kind, Offer, Pick, Slot};
 use crate::theme::{MONO_FONT, Theme, c, ca};
 use crate::ui::{self, Icon};
@@ -75,16 +75,17 @@ impl Desk {
         self.model.qass_reason(row)
     }
 
-    /// This Mac's hand id, made the first time a remote agent's question is handed.
+    /// This Mac's hand id: read when the window opens, and made (as the terminal interface does)
+    /// the first time a remote row or a hand needs it.
     fn hand_id(&mut self) -> Option<String> {
-        if self.model.hand_id.is_none() {
-            self.model.hand_id = qoop_runtime::paths::hand_id().ok();
+        if self.model.hand.hand_id.is_none() {
+            self.model.hand.hand_id = qoop_runtime::paths::hand_id().ok();
         }
-        self.model.hand_id.clone()
+        self.model.hand.hand_id.clone()
     }
 
     /// Whether `row` takes typed answers: its machine has not refused them as too old.
-    fn takes_words(&self, row: &AgentRow) -> bool {
+    pub(crate) fn takes_words(&self, row: &AgentRow) -> bool {
         !self.too_old.contains(&state::machine_of(row.workspace))
     }
 
@@ -114,6 +115,7 @@ impl Desk {
         let hold = Hold {
             slot: Slot::Agent(terminal),
             generation: row.generation,
+            menu_seal: row.menu_seal,
             seal: menu.seal,
             pick: offer.pick.clone(),
             label: offer.label.clone(),
@@ -122,7 +124,7 @@ impl Desk {
         self.hold(hold, window, cx);
         // Picked on the session's card: the keys go back to its terminal, as after a typed
         // answer, so the next question's digit works and `u` still undoes.
-        if !self.inbox && self.term_drawn() {
+        if self.term_drawn() {
             window.focus(&self.term_focus, cx);
         }
     }
@@ -164,7 +166,7 @@ impl Desk {
     }
 
     /// A pick on card `card`, held under the card.
-    fn hold_card(
+    pub(crate) fn hold_card(
         &mut self,
         card: &str,
         pick: Pick,
@@ -175,6 +177,7 @@ impl Desk {
         let hold = Hold {
             slot: Slot::Card(card.to_string()),
             generation: None,
+            menu_seal: None,
             seal: 0,
             pick,
             label,
@@ -224,37 +227,6 @@ impl Desk {
         cx.notify();
     }
 
-    /// Hand every agent that needs the owner to qass, under one shared Undo.
-    pub(crate) fn hand_all(
-        &mut self,
-        terminals: &[TerminalStream],
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let until = Instant::now() + state::HOLD;
-        for &terminal in terminals {
-            let Some(row) = self.model.row(terminal) else {
-                continue;
-            };
-            if self.qass_reason(row).is_some() {
-                continue;
-            }
-            let hold = Hold {
-                slot: Slot::Agent(terminal),
-                generation: row.generation,
-                seal: row.menu.as_ref().map_or(0, |m| m.seal),
-                pick: Pick::Qass,
-                label: "Let qass handle it".into(),
-                until,
-            };
-            self.said.remove(&hold.slot);
-            self.holds.start(hold);
-        }
-        let _ = window;
-        self.after_hold(cx);
-        cx.notify();
-    }
-
     /// Wake once a second while anything is on hold: its count goes down, and what is due is
     /// sent. One timer for every hold, which keeps waking until nothing is held, so a timer that
     /// runs a moment early only delays a send by a tick.
@@ -296,9 +268,11 @@ impl Desk {
         self.send(all);
     }
 
-    /// The hand-off line's Undo: the agents held for qass, and no other pick.
-    pub(crate) fn undo_hand_off(&mut self, cx: &mut Context<Self>) {
-        if self.holds.undo_hand_off() {
+    /// Send now: `slot`'s pick (or the newest one, with every pick held with it) goes at once.
+    pub(crate) fn send_now(&mut self, slot: Option<&Slot>, cx: &mut Context<Self>) {
+        let taken = self.holds.send_now(slot);
+        if !taken.is_empty() {
+            self.send(taken);
             cx.notify();
         }
     }
@@ -358,6 +332,53 @@ impl Desk {
         }
     }
 
+    /// A held reply goes into the agent's terminal, unless the person typed in that terminal
+    /// since it was held (their line is theirs) or the machine is not reached (nothing typed
+    /// while it is away): the words are then kept as the card's draft, and the card says so.
+    fn send_reply(&mut self, hold: &Hold, text: &str) {
+        let Some(terminal) = hold.terminal() else {
+            return;
+        };
+        let began = hold.until.checked_sub(state::HOLD);
+        let typed = self
+            .typed_at
+            .get(&terminal)
+            .is_some_and(|at| began.is_none_or(|b| *at > b));
+        let away = !self.connected
+            || self
+                .model
+                .row(terminal)
+                .is_some_and(|r| self.as_of(r.workspace).is_some());
+        if typed || away {
+            self.drafts.insert(hold.slot.clone(), text.to_string());
+            let why = if typed {
+                "You typed in that terminal; your reply is kept here."
+            } else {
+                "That computer is not reached, so nothing was typed; your reply is kept here."
+            };
+            self.said
+                .insert(hold.slot.clone(), Said::Refused(why.into()));
+            return;
+        }
+        let _ = self.up.send(Up::Paste(terminal, text.as_bytes().to_vec()));
+        let _ = self.up.send(Up::Input(terminal, b"\r".to_vec()));
+        let at = crate::app::unix_now();
+        self.record(hold, at);
+        self.said.insert(
+            hold.slot.clone(),
+            Said::Sent {
+                label: hold.label.clone(),
+                at,
+            },
+        );
+    }
+
+    /// Keep a sent hold for Answered today, by the one rule the terminal interface shares.
+    fn record(&mut self, hold: &Hold, at: i64) {
+        let to = self.who_of(&hold.slot);
+        qoop_tui::inbox::record_own(&mut self.own_answers, hold, to, at);
+    }
+
     fn send_one(&mut self, hold: Hold, retried: bool) {
         let id = link::fresh_id("answer");
         let terminal = hold.terminal().unwrap_or_default();
@@ -414,6 +435,18 @@ impl Desk {
                     to_qass: true,
                 },
             },
+            Pick::PutAway { card } => ControlRequest::AskWrite {
+                id: id.clone(),
+                terminal: None,
+                token: None,
+                action: AskOp::Dismiss { card: card.clone() },
+            },
+            // Words for an agent that waits on them: pasted into its terminal and submitted with
+            // a separate Enter, as the terminal interface does.
+            Pick::Reply { text, .. } => {
+                self.send_reply(&hold, text);
+                return;
+            }
             Pick::Qass => return,
         };
         self.ask(request);
@@ -449,10 +482,11 @@ impl Desk {
             // The agent put up its next question before this answer came back: what happened
             // to the old one is not said under the new card.
             let moved_on = hold.seal != 0
-                && terminal
-                    .and_then(|t| self.model.row(t))
-                    .and_then(|r| r.menu.as_ref())
-                    .is_some_and(|m| m.seal != hold.seal);
+                && terminal.and_then(|t| self.model.row(t)).is_some_and(|r| {
+                    r.menu.as_ref().is_some_and(|m| m.seal != hold.seal)
+                        // The same question asked again is another turn of the menu.
+                        || matches!((hold.menu_seal, r.menu_seal), (Some(a), Some(b)) if a != b)
+                });
             if moved_on {
                 self.said.remove(&hold.slot);
                 continue;
@@ -513,12 +547,13 @@ impl Desk {
                     let older = hold.pick == Pick::Qass
                         && m != 0
                         // Only a hand that went with this Mac's id (`away`) says the far qoop is older.
-                        && self.model.hand_id.is_some()
+                        && self.model.hand.hand_id.is_some()
                         && (reason == "qass_not_running"
                             || reason == "not_watching"
                             || reason.contains("unknown variant"));
                     if older {
                         self.model.no_hands.insert(m);
+                        self.note_hand();
                         Said::Refused(state::refusal_words(
                             "unknown variant",
                             &machine,
@@ -530,6 +565,9 @@ impl Desk {
                 }
                 _ => continue,
             };
+            if let Said::Sent { at, .. } = &said {
+                self.record(&hold, *at);
+            }
             self.said.insert(hold.slot.clone(), said);
         }
         cx.notify();
@@ -538,7 +576,7 @@ impl Desk {
 
     /// After a new agent list: a pick whose menu changed or went is dropped, and the card says
     /// who answered; the digits of a new menu wait out their arming.
-    pub(crate) fn menus_changed(&mut self) {
+    pub(crate) fn menus_changed(&mut self, cx: &Context<Self>) {
         let dropped = self.holds.menus(&self.model.rows, Instant::now());
         for hold in dropped {
             let by = hold
@@ -561,19 +599,34 @@ impl Desk {
             None => !self
                 .model
                 .row(own.terminal)
-                .is_some_and(|r| r.menu.is_some()),
+                .is_some_and(|r| r.menu.is_some() || Kind::of(r).needs_you()),
         });
-        if gone {
-            self.own = None;
+        if gone && let Some(own) = self.own.take() {
+            // What was typed is never thrown away: it waits as the card's draft, and the card
+            // says why its field closed.
+            let words = own.field.read(cx).text.trim().to_string();
+            if !words.is_empty() {
+                let slot = match own.card {
+                    Some(card) => Slot::Card(card),
+                    None => Slot::Agent(own.terminal),
+                };
+                self.drafts.insert(slot.clone(), words);
+                self.said.insert(
+                    slot,
+                    Said::Refused(
+                        "That question is gone; your words are kept for the next one.".into(),
+                    ),
+                );
+            }
         }
     }
 
     /// A digit typed while a question card is on screen: that answer, once the menu is armed.
     pub(crate) fn digit(&mut self, digit: u8, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some((terminal, offers, seal)) = self.card_offers() else {
+        let Some((terminal, offers, seal, menu_seal)) = self.card_offers() else {
             return false;
         };
-        if !self.holds.armed(terminal, seal, Instant::now()) {
+        if !self.holds.armed(terminal, seal, menu_seal, Instant::now()) {
             // Taken, and dropped: a key meant for the screen before this menu.
             return true;
         }
@@ -585,13 +638,13 @@ impl Desk {
     }
 
     /// The question card's agent, its answers and its menu, when one is on screen.
-    pub(crate) fn card_offers(&self) -> Option<(TerminalStream, Vec<Offer>, u64)> {
+    pub(crate) fn card_offers(&self) -> Option<(TerminalStream, Vec<Offer>, u64, Option<u64>)> {
         let Page::Session(terminal) = self.page else {
             return None;
         };
         let row = self.model.row(terminal)?;
         let menu = row.menu.as_ref().filter(|_| Kind::of(row).needs_you())?;
-        Some((terminal, state::offers(menu), menu.seal))
+        Some((terminal, state::offers(menu), menu.seal, row.menu_seal))
     }
 
     /// Open the field for the owner's own answer to `terminal`'s menu, or to its card `card`.
@@ -602,7 +655,21 @@ impl Desk {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let field = cx.new(|cx| Field::new("Type your own answer", cx));
+        let slot = match &card {
+            Some(card) => Slot::Card(card.clone()),
+            None => Slot::Agent(terminal),
+        };
+        let kept = self.drafts.remove(&slot);
+        let field = cx.new(|cx| {
+            let mut field = Field::new("Type your own answer", cx);
+            if let Some(words) = &kept {
+                field.set_text(words);
+            }
+            field
+        });
+        if kept.is_some() {
+            self.said.remove(&slot);
+        }
         let focus = field.read(cx).focus.clone();
         cx.observe(&field, |_, _, cx| cx.notify()).detach();
         window.focus(&focus, cx);
@@ -627,7 +694,7 @@ impl Desk {
         // A card's own words: held under the card; the daemon says when they are too long.
         if let Some(card) = own.card.clone() {
             if !text.is_empty() {
-                let label = format!("\"{}\"", short(&text, 40));
+                let label = text.clone();
                 self.own = None;
                 self.hold_card(
                     &card,
@@ -639,7 +706,28 @@ impl Desk {
                     window,
                     cx,
                 );
-                window.focus(&self.term_focus, cx);
+                self.focus_after_own(window, cx);
+            }
+            return true;
+        }
+        // An agent that ended its turn waiting for words has no menu: its reply is held like
+        // any answer, keyed by its turn, and typed into its terminal.
+        if let Some(row) = self.model.row(terminal).filter(|r| r.menu.is_none()) {
+            if !text.is_empty() {
+                let hold = Hold {
+                    slot: Slot::Agent(terminal),
+                    generation: row.generation,
+                    menu_seal: None,
+                    seal: 0,
+                    pick: Pick::Reply {
+                        text: text.clone(),
+                        turn: row.stop.clone(),
+                    },
+                    label: text.clone(),
+                    until: Instant::now() + state::HOLD,
+                };
+                self.own = None;
+                self.hold(hold, window, cx);
             }
             return true;
         }
@@ -660,14 +748,24 @@ impl Desk {
         }
         let offer = Offer {
             digit: None,
-            label: format!("\"{}\"", short(&text, 40)),
+            label: text.clone(),
             detail: None,
             pick: Pick::Text { key, text },
         };
         self.own = None;
         self.pick(terminal, &offer, window, cx);
-        window.focus(&self.term_focus, cx);
+        self.focus_after_own(window, cx);
         true
+    }
+
+    /// The keys go back where they were once words are held: the terminal when one is on
+    /// screen, else the window (never a terminal that is not drawn).
+    fn focus_after_own(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.term_drawn() {
+            window.focus(&self.term_focus, cx);
+        } else {
+            window.focus(&self.focus, cx);
+        }
     }
 
     /// One answer as a button: its digit, its words, and what it does when pressed.
@@ -753,7 +851,23 @@ impl Desk {
         t: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        self.said_line_in(slot, true, t, cx)
+    }
+
+    /// [`Self::said_line`], with the hold drawn here (`held`) or left to the Inbox's hold bar,
+    /// which names the pick and its target once for the whole page.
+    pub(crate) fn said_line_in(
+        &self,
+        slot: &Slot,
+        held: bool,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let number = slot_number(slot);
+        // The newest pick is the hold bar's; another pick on hold keeps its line on its card.
+        if !held && self.holds.held.last().is_some_and(|h| &h.slot == slot) {
+            return None;
+        }
         if let Some(hold) = self.holds.of(slot) {
             let left = hold
                 .until
@@ -1156,13 +1270,4 @@ fn by_word(kind: &str) -> &str {
         "attach" => "terminal",
         other => other,
     }
-}
-
-/// At most `most` characters of `text`, with an ellipsis when cut.
-fn short(text: &str, most: usize) -> String {
-    if text.chars().count() <= most {
-        return text.to_string();
-    }
-    let cut: String = text.chars().take(most).collect();
-    format!("{cut}\u{2026}")
 }

@@ -69,6 +69,14 @@ const MATCHED: &[(&str, &str)] = &[
     ("qoop-desktop/src/tests.rs", "şıüか"),
 ];
 
+/// Glyphs only the desktop window draws, which is built for macOS only (CI's Linux job does not
+/// compile it) and draws them through the system's font fallback: the Command key's sign, in a
+/// key cap beside the shortcut it names.
+const MAC_ONLY: &[(&str, &str)] = &[
+    ("qoop-desktop/src/shell.rs", "\u{2318}"),
+    ("qoop-desktop/src/inbox.rs", "\u{2318}"),
+];
+
 /// Files that make a character from a number, and why what they make is safe.
 const COMPUTED: &[(&str, &str)] = &[
     (
@@ -327,12 +335,16 @@ fn violations(rel: &str, src: &str) -> Vec<String> {
         .iter()
         .find(|(file, _)| *file == rel)
         .map_or("", |(_, chars)| *chars);
+    let mac_only = MAC_ONLY
+        .iter()
+        .find(|(file, _)| *file == rel)
+        .map_or("", |(_, chars)| *chars);
     let mut out = Vec::new();
     for Lit { line, ch } in lits {
         let ok = if icon(ch) {
             rel == ICONS
         } else {
-            safe(ch) || matched.contains(ch)
+            safe(ch) || matched.contains(ch) || mac_only.contains(ch)
         };
         if !ok {
             let why = if icon(ch) {

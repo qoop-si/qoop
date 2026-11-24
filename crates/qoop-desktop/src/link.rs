@@ -632,7 +632,7 @@ mod tests {
     /// home: the daemon lists it under its space, not as an agent row.
     #[tokio::test]
     async fn a_sleeping_agent_tab_of_a_real_daemon_is_on_home() {
-        use crate::state::{Chip, Kind, Model};
+        use crate::state::{Kind, Model};
         isolated_remotes();
         let d = qoop_testkit::TestDaemon::start().await;
         let mut c = d.attach("sleeper").await;
@@ -721,7 +721,7 @@ mod tests {
             "not an awake agent row"
         );
         let group = model
-            .groups(Chip::All)
+            .groups()
             .into_iter()
             .find(|g| g.space.id == space)
             .expect("the sleeping space is on home");
@@ -731,6 +731,13 @@ mod tests {
             .map(|e| (e.terminal(), e.kind()))
             .collect();
         assert_eq!(kinds, [(tab, Kind::Sleeping)]);
-        assert_eq!(model.count(Chip::Sleeping), 1);
+        assert_eq!(
+            model
+                .agents()
+                .iter()
+                .filter(|e| e.kind() == Kind::Sleeping)
+                .count(),
+            1
+        );
     }
 }

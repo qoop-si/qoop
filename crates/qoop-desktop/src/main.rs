@@ -10,8 +10,6 @@ mod element;
 #[cfg(target_os = "macos")]
 mod field;
 #[cfg(target_os = "macos")]
-mod home;
-#[cfg(target_os = "macos")]
 mod inbox;
 #[cfg(target_os = "macos")]
 mod keys;
@@ -33,6 +31,8 @@ mod schedules;
 mod session;
 #[cfg(target_os = "macos")]
 mod settings;
+#[cfg(target_os = "macos")]
+mod shell;
 #[cfg(all(target_os = "macos", feature = "bench"))]
 mod spike_link;
 #[cfg(target_os = "macos")]
