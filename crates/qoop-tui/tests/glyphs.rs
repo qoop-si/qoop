@@ -72,8 +72,9 @@ const MATCHED: &[(&str, &str)] = &[
 
 /// Glyphs only the desktop window draws, which is built for macOS only (CI's Linux job does not
 /// compile it) and draws them through the system's font fallback: the Command key's sign, in a
-/// key cap beside the shortcut it names.
+/// key cap or a line beside the shortcut it names ("No agents yet. ⌘N starts one.").
 const MAC_ONLY: &[(&str, &str)] = &[
+    ("qoop-desktop/src/column.rs", "\u{2318}"),
     ("qoop-desktop/src/shell.rs", "\u{2318}"),
     ("qoop-desktop/src/inbox.rs", "\u{2318}"),
     ("qoop-desktop/src/session.rs", "\u{2318}"),

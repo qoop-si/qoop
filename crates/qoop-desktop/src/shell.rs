@@ -17,7 +17,7 @@ use qoop_runtime::avatar::Avatar;
 use qoop_tui::inbox::Inbox;
 
 use crate::app::{Desk, Page};
-use crate::state::{self, Entry, Group, Kind, MachineState};
+use crate::state::{self, Entry, Kind, MachineState};
 use crate::theme::{Theme, UI_FONT, c, ca};
 use crate::ui::{self, Icon};
 
@@ -779,19 +779,34 @@ impl Desk {
             self.shown_kind(Entry::Live(r))
         });
         let (qass_note, qass_spoken) = self.qass_note();
-        let qass_face = ui::avatar(
-            self.qass_program(),
-            qass_kind,
-            20.,
-            !self.nav_on(Page::Qass),
-            t,
-        )
-        .into_any_element();
+        let qass_ring = !self.nav_on(Page::Qass);
+        let qass_face = div()
+            .when(qass_ring, |d| d.debug_selector(|| "qass-ring".to_string()))
+            .child(ui::avatar(
+                self.qass_program(),
+                qass_kind,
+                20.,
+                qass_ring,
+                t,
+            ))
+            .into_any_element();
+        let drawn = self.drawn_column(inbox);
         div()
             .id("sidebar")
             .debug_selector(|| "sidebar".to_string())
             .role(Role::Navigation)
             .aria_label("qoop")
+            // The hold's region: the pointer over it, or the keys driving inside it.
+            .track_focus(&self.side_focus)
+            // Where the pointer is, typing or not: a name typed in a space field leaves it
+            // over the column.
+            .hover_listener_mode(gpui::HoverListenerMode::InputModalityIndependent)
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if this.side_hovered != *hovered {
+                    this.side_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
             .flex_none()
             .w(px(width))
             .h_full()
@@ -840,16 +855,57 @@ impl Desk {
                     .child(ui::kbd("\u{2318}N", t))
                     .on_click(cx.listener(|this, _, window, cx| this.new_work(None, window, cx))),
             )
-            .child(nav(
-                "nav-inbox",
-                icon(Icon::Inbox),
-                "Inbox",
-                Page::Inbox,
-                inbox.count,
-                None,
-                None,
-                cx,
-            ))
+            // The Inbox, and its first rows folded under it by its chevron.
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(
+                        nav(
+                            "nav-inbox",
+                            icon(Icon::Inbox),
+                            "Inbox",
+                            Page::Inbox,
+                            inbox.count,
+                            None,
+                            None,
+                            cx,
+                        )
+                        .flex_1()
+                        .min_w_0(),
+                    )
+                    .child(
+                        ui::control(
+                            "side-inbox-fold",
+                            Role::Button,
+                            "Show the first waiting items",
+                            t,
+                        )
+                        .debug_selector(|| "side-inbox-fold".to_string())
+                        .aria_expanded(self.inbox_open)
+                        .size(px(26.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .hover(|s| ui::paint(s, t.hover()))
+                        .child({
+                            let chevron = ui::icon(Icon::Chevron, 12., c(t.t3));
+                            if self.inbox_open {
+                                chevron.with_transformation(gpui::Transformation::rotate(
+                                    gpui::percentage(0.25),
+                                ))
+                            } else {
+                                chevron
+                            }
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_small_inbox(cx))),
+                    ),
+            )
+            .when_some(self.small_inbox(&drawn, inbox, t, cx), |d, small| {
+                d.child(small)
+            })
             .child(nav(
                 "nav-board",
                 icon(Icon::Board),
@@ -878,247 +934,46 @@ impl Desk {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .pt(px(8.))
+                    .pt(px(4.))
                     .child(ui::scroll(
                         div()
                             .id("sidebar-list")
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .child(self.tree(inbox, t, cx)),
+                            .child(self.agent_list(&drawn, inbox, t, cx)),
                     )),
             )
             .child(self.computers(t, cx))
-    }
-
-    /// The spaces with the agents that wait and the one on screen, the rest behind "N more",
-    /// and a space where nothing waits as one line.
-    fn tree(&self, inbox: &Inbox, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let open = match self.page {
-            Page::Session(terminal) => Some(terminal),
-            _ => None,
-        };
-        let waiting = inbox.terminals();
-        let groups = self.model.groups();
-        let nothing = self.listed && groups.is_empty();
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .when(!self.listed, |d| {
-                d.children((0..4).map(|n| crate::inbox::skeleton(n, t)))
-            })
-            .when(nothing, |d| {
-                d.child(
-                    div()
-                        .id("side-empty")
-                        .px(px(10.))
-                        .py(px(8.))
-                        .text_size(px(12.5))
-                        .text_color(c(t.t2))
-                        .child("No agents yet. \u{2318}N starts one."),
-                )
-            })
-            .children(
-                groups
-                    .into_iter()
-                    .map(|g| self.space_block(g, inbox, &waiting, open, t, cx)),
-            )
-    }
-
-    /// One space: its header, the agents it lists and its fold; or one line when quiet.
-    fn space_block(
-        &self,
-        g: Group<'_>,
-        inbox: &Inbox,
-        waiting: &[u32],
-        open: Option<u32>,
-        t: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = g.space.id;
-        let m = state::machine_of(id);
-        let expanded = self.expanded.contains(&id);
-        let fold = state::fold(&g, waiting, open, expanded);
-        let slot = state::space_slot(g.space);
-        let name = if m == 0 {
-            g.space.name.clone()
-        } else {
-            state::short_space(g.space)
-        };
-        let machine = (m != 0).then(|| state::machine_name(g.space));
-        let label = match &machine {
-            Some(machine) => format!("{name}, on {machine}"),
-            None => name.clone(),
-        };
-        let toggle = move |this: &mut Desk, _: &mut Window, cx: &mut Context<Desk>| {
-            if !this.expanded.remove(&id) {
-                this.expanded.insert(id);
-            }
-            cx.notify();
-        };
-        if fold.quiet {
-            let agents = state::count(g.count, "agent");
-            return ui::control(
-                ("side-space", id as u64),
-                Role::Button,
-                format!("{label}, {agents}, show them"),
-                t,
-            )
-            .debug_selector(move || format!("side-space-{id}"))
-            .aria_expanded(false)
-            .flex()
-            .items_baseline()
-            .flex_wrap()
-            .gap_x(px(6.))
-            .mt(px(6.))
-            .px(px(10.))
-            .py(px(3.))
-            .rounded(px(8.))
-            .hover(|s| ui::paint(s, t.hover()))
-            .child(
-                div()
-                    .text_size(px(12.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(t.space(slot))
-                    .child(name),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(12.))
-                    .text_color(c(t.t2))
-                    .child(match &machine {
-                        Some(machine) => format!("{agents}, {machine}"),
-                        None => agents,
-                    }),
-            )
-            .child(ui::icon(Icon::Chevron, 12., c(t.t3)))
-            .on_click(cx.listener(move |this, _, window, cx| toggle(this, window, cx)))
-            .into_any_element();
-        }
-        let more = fold.more;
-        div()
-            .id(("side-group", id as u64))
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .id(("side-space", id as u64))
-                    .debug_selector(move || format!("side-space-{id}"))
-                    .role(Role::Heading)
-                    .aria_level(2)
-                    .aria_label(label)
-                    .flex()
-                    .flex_wrap()
-                    .items_baseline()
-                    .gap_x(px(6.))
-                    .pt(px(10.))
-                    .pb(px(3.))
-                    .px(px(10.))
-                    .child(
-                        div()
-                            .text_size(px(12.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.space(slot))
-                            .child(name),
-                    )
-                    .when_some(machine, |d, machine| {
-                        d.child(div().text_size(px(12.)).text_color(c(t.t2)).child(machine))
-                    }),
-            )
-            .children(
-                fold.shown
-                    .iter()
-                    .map(|entry| self.tree_row(*entry, inbox, t, cx)),
-            )
-            .when(more > 0, |d| {
-                d.child(
-                    ui::link_button(("side-more", id as u64), &format!("{more} more"), t)
-                        .debug_selector(move || format!("side-more-{id}"))
-                        .ml(px(28.))
-                        .on_click(cx.listener(move |this, _, window, cx| toggle(this, window, cx))),
-                )
-            })
-            .when(expanded, |d| {
-                d.child(
-                    ui::link_button(("side-fewer", id as u64), "Show fewer", t)
-                        .ml(px(28.))
-                        .on_click(cx.listener(move |this, _, window, cx| toggle(this, window, cx))),
-                )
-            })
-            .into_any_element()
     }
 
     /// The age a sidebar row shows. How long a waiting agent has waited is the Inbox's own wait
     /// (the card says the same), not when the agent was last active; the others keep their last
     /// activity.
     pub(crate) fn side_age(&self, entry: Entry<'_>, inbox: &Inbox) -> Option<String> {
-        inbox
-            .since_of(entry.terminal())
-            .map(|at| state::short_span(self.now.saturating_sub(at).max(0)))
-            .or_else(|| entry.age(self.now))
+        self.side_secs(entry, inbox).map(state::short_span)
     }
 
-    /// One agent of the sidebar: its mark and its title (wrapped whole), how many question
-    /// cards it waits on, and its age. A handed agent wears qass's eye.
-    fn tree_row(
-        &self,
-        entry: Entry<'_>,
-        inbox: &Inbox,
-        t: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let kind = self.shown_kind(entry);
-        let terminal = entry.terminal();
-        let on = self.page == Page::Session(terminal);
+    /// The seconds [`Self::side_age`] draws: the Inbox's wait, else the last activity.
+    fn side_secs(&self, entry: Entry<'_>, inbox: &Inbox) -> Option<i64> {
+        inbox
+            .since_of(entry.terminal())
+            .or_else(|| state::active_at(entry))
+            .map(|at| self.now.saturating_sub(at).max(0))
+    }
+
+    /// An agent row's name to a screen reader: its title, agent, space and state in words, the
+    /// age the row draws said as words ("22 minutes", never "22m"), and qass's cards on it.
+    pub(crate) fn row_name(&self, entry: Entry<'_>, inbox: &Inbox) -> String {
+        let spoken = self.side_secs(entry, inbox).map(state::spoken_span);
+        let label = self.model.row_label_aged(entry, spoken);
         let handed = matches!(entry, Entry::Live(r) if self.model.with_qass(r));
-        let age = self.side_age(entry, inbox);
-        ui::control(
-            ("tree-row", u64::from(terminal)),
-            Role::Link,
-            self.model.row_label(entry, self.now),
-            t,
-        )
-        .debug_selector(move || format!("tree-row-{terminal}"))
-        .flex()
-        .items_start()
-        .gap(px(8.))
-        .min_h(px(28.))
-        .px(px(10.))
-        .py(px(4.))
-        .rounded(px(10.))
-        .text_size(px(13.))
-        .when(on, |d| ui::current(d, t))
-        .hover(|s| ui::paint(s, t.hover()))
-        .child(div().pt(px(4.)).child(if handed {
-            ui::icon(Icon::Eye, 11., c(t.t2)).into_any_element()
+        let cards = self.cards_of(entry.terminal(), entry.workspace()).len();
+        if handed || cards > 0 {
+            format!("{label}, qass holds {}", state::count(cards, "card"))
         } else {
-            ui::mark(kind, t, 11.).into_any_element()
-        }))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .whitespace_normal()
-                .child(entry.title()),
-        )
-        .when_some(self.card_count(entry, "tree", t), |d, n| d.child(n))
-        .when_some(age, |d, age| {
-            d.child(
-                div()
-                    .flex_none()
-                    .pt(px(1.))
-                    .text_size(px(11.5))
-                    .text_color(c(t.t2))
-                    .child(age),
-            )
-        })
-        .on_click(
-            cx.listener(move |this, _, window, cx| this.open(Page::Session(terminal), window, cx)),
-        )
-        .into_any_element()
+            label
+        }
     }
 
     /// The computers, pinned under the spaces: This Mac and every other machine with how it is
@@ -1406,11 +1261,14 @@ impl Desk {
             ),
         };
         let groups = self.model.groups();
-        let rows: Vec<Entry<'_>> = groups
+        let mut rows: Vec<Entry<'_>> = groups
             .iter()
             .filter(|g| state::machine_of(g.space.id) == m)
             .flat_map(|g| g.rows.iter().copied())
             .collect();
+        // What asks for the person first (the column's spaces sort by activity; this list is
+        // about what needs doing on that machine), newest first within each state.
+        rows.sort_by_key(|e| e.kind().rank());
         let retry = m != 0
             && (away || reach == MachineState::Retrying || reach == MachineState::Parked)
             && !matches!(reach, MachineState::Behind { .. });

@@ -145,6 +145,12 @@ impl Field {
         self.undo = None;
     }
 
+    /// Select everything typed: a name opened for renaming is replaced by what is typed next.
+    pub fn select_all(&mut self) {
+        self.anchor = 0;
+        self.head = self.text.len();
+    }
+
     pub fn selection(&self) -> Range<usize> {
         self.anchor.min(self.head)..self.anchor.max(self.head)
     }

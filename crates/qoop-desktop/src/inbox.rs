@@ -260,6 +260,28 @@ impl Desk {
         }
     }
 
+    /// What an Inbox item asks, as one line: the agent's question on its menu, the card's ask,
+    /// else the agent's title (an agent that waits for words asks nothing in particular).
+    pub(crate) fn item_question(&self, item: &Item) -> String {
+        let row = item.terminal.and_then(|t| self.model.row(t));
+        let asked = match &item.slot {
+            Slot::Agent(t) => self
+                .model
+                .row(*t)
+                .and_then(|r| r.menu.as_ref())
+                .map(|m| m.question.trim().to_string()),
+            Slot::Card(id) => self
+                .asks
+                .iter()
+                .find(|a| &a.card == id)
+                .map(|a| a.body.asks.trim().to_string()),
+        };
+        asked
+            .filter(|q| !q.is_empty())
+            .or_else(|| row.map(state::title_of))
+            .unwrap_or_else(|| "qass asks".to_string())
+    }
+
     /// An agent as the cards say it: its space and its title, as words.
     fn who_text(&self, row: &AgentRow) -> String {
         match self.model.space(row.workspace) {

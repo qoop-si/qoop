@@ -183,6 +183,8 @@ impl Desk {
         };
         let program = qoop_tui::answers::program_of(command);
         if let Some(terminal) = state::landed(&self.model.rows, &sheet.before, space, program) {
+            // The person's own: at the top of its space in the column, held or not.
+            self.own_new = Some(terminal);
             self.close_sheet(false, window, cx);
             self.open(Page::Session(terminal), window, cx);
         }

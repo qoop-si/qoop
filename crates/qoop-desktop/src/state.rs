@@ -172,12 +172,107 @@ impl<'a> Entry<'a> {
     }
 }
 
-/// One space header and its agents, as home lists them.
+/// When an agent was last active: since it slept, else its last activity. None after a
+/// daemon restart, from an older daemon, and for a sleeping tab, whose list carries no time.
+pub fn active_at(entry: Entry<'_>) -> Option<i64> {
+    match entry {
+        Entry::Live(row) => row.slept_at_unix.or(row.last_active_at_unix),
+        Entry::Asleep(..) => None,
+    }
+}
+
+/// Newest activity first, no time last; a stable sort, so ties keep the daemon's order.
+fn newest_first(rows: &mut [Entry<'_>]) {
+    rows.sort_by_key(|e| std::cmp::Reverse(active_at(*e)));
+}
+
+/// The column's order: the spaces, or one list by what each agent asks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SideView {
+    #[default]
+    Spaces,
+    Priority,
+}
+
+/// One tab of the column's state filter, as the TUI's inbox tabs name them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StateTab {
+    #[default]
+    All,
+    Wants,
+    Failed,
+    Done,
+    Saved,
+    Working,
+    Asleep,
+}
+
+impl StateTab {
+    pub const ORDER: [StateTab; 7] = [
+        StateTab::All,
+        StateTab::Wants,
+        StateTab::Failed,
+        StateTab::Done,
+        StateTab::Saved,
+        StateTab::Working,
+        StateTab::Asleep,
+    ];
+
+    pub fn word(self) -> &'static str {
+        match self {
+            StateTab::All => "all",
+            StateTab::Wants => "wants",
+            StateTab::Failed => "failed",
+            StateTab::Done => "done",
+            StateTab::Saved => "saved",
+            StateTab::Working => "working",
+            StateTab::Asleep => "asleep",
+        }
+    }
+
+    /// The state whose mark the tab wears: none for all, and saved has a mark of its own.
+    pub fn kind(self) -> Option<Kind> {
+        match self {
+            StateTab::Wants => Some(Kind::Status(Status::Blocked)),
+            StateTab::Failed => Some(Kind::Status(Status::Failed)),
+            StateTab::Done => Some(Kind::Status(Status::Done)),
+            StateTab::Working => Some(Kind::Status(Status::Working)),
+            StateTab::Asleep => Some(Kind::Sleeping),
+            StateTab::All | StateTab::Saved => None,
+        }
+    }
+}
+
+/// The dots of the saved mark (a person put the agent aside): the TUI's.
+pub const SAVED_DOTS: [(u8, u8); 7] = [(0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2), (2, 2)];
+
+/// Whether a line of the column is on `tab`'s list, by the daemon's state: wants is Needs you,
+/// working is a turn going or starting, saved is a parked agent that neither waits on the
+/// person nor failed (one that works is in working and in saved, as the TUI keeps it).
+pub fn in_filter(entry: &Entry<'_>, tab: StateTab) -> bool {
+    let kind = entry.kind();
+    match tab {
+        StateTab::All => true,
+        StateTab::Wants => kind.needs_you(),
+        StateTab::Failed => kind == Kind::Status(Status::Failed),
+        StateTab::Done => kind == Kind::Status(Status::Done),
+        StateTab::Working => {
+            matches!(kind, Kind::Status(Status::Working | Status::Starting))
+        }
+        StateTab::Asleep => kind == Kind::Sleeping,
+        StateTab::Saved => match entry {
+            Entry::Live(row) => {
+                row.parked && !matches!(kind, Kind::Status(Status::Blocked | Status::Failed))
+            }
+            Entry::Asleep(..) => false,
+        },
+    }
+}
+
+/// One space header and all its agents, as home lists them.
 pub struct Group<'a> {
     pub space: &'a WorkspaceRow,
     pub rows: Vec<Entry<'a>>,
-    /// All its agents, whatever the chip shows.
-    pub count: usize,
 }
 
 impl Model {
@@ -216,11 +311,14 @@ impl Model {
         out
     }
 
-    /// The spaces in the daemon's order, each with its agents by rank and then in the daemon's
-    /// order (oldest first), as the TUI lists them. An empty space is left out.
+    /// The spaces, the one with the newest activity first, each with its agents newest first;
+    /// what has no time (a daemon restarted, an older daemon, a sleeping tab) last, ties in the
+    /// daemon's order. An empty space is listed too, but never qass's nor the session's empty
+    /// default.
     pub fn groups(&self) -> Vec<Group<'_>> {
         let agents = self.agents();
-        self.spaces
+        let mut groups: Vec<Group<'_>> = self
+            .spaces
             .iter()
             .filter(|w| w.name != QASS_SPACE)
             .filter_map(|space| {
@@ -229,15 +327,22 @@ impl Model {
                     .copied()
                     .filter(|e| e.workspace() == space.id)
                     .collect();
-                all.sort_by_key(|e| e.kind().rank());
-                let count = all.len();
-                (!all.is_empty()).then_some(Group {
-                    space,
-                    rows: all,
-                    count,
-                })
+                newest_first(&mut all);
+                (!all.is_empty() || !empty_default(space)).then_some(Group { space, rows: all })
             })
-            .collect()
+            .collect();
+        // A space is as new as its newest agent, which the sort put first.
+        groups.sort_by_key(|g| std::cmp::Reverse(g.rows.first().and_then(|e| active_at(*e))));
+        groups
+    }
+
+    /// Every agent in one list: Needs you, then Failed, then the other states by the daemon's
+    /// rank, newest first inside each.
+    pub fn priority(&self) -> Vec<Entry<'_>> {
+        let mut all = self.agents();
+        newest_first(&mut all);
+        all.sort_by_key(|e| e.kind().rank());
+        all
     }
 
     pub fn space(&self, id: i64) -> Option<&WorkspaceRow> {
@@ -260,15 +365,18 @@ impl Model {
     /// What a screen reader says for a row: "README Coupons section, claude, acme-web,
     /// Needs you, 4m".
     pub fn row_label(&self, entry: Entry<'_>, now: i64) -> String {
+        self.row_label_aged(entry, entry.age(now))
+    }
+
+    /// [`Self::row_label`] ending in `age` as given: the column says it in words.
+    pub fn row_label_aged(&self, entry: Entry<'_>, age: Option<String>) -> String {
         let mut parts = vec![entry.title()];
         if let Some(program) = entry.program() {
             parts.push(program.to_string());
         }
         parts.push(self.space_name(entry.workspace()));
         parts.push(entry.kind().word().to_string());
-        if let Some(ago) = entry.age(now) {
-            parts.push(ago);
-        }
+        parts.extend(age);
         parts.join(", ")
     }
 
@@ -435,43 +543,14 @@ impl Model {
     }
 }
 
-/// How many waiting agents the sidebar lists under a space before its "N more".
-pub const SIDE_SHOWN: usize = 2;
-
-/// What the sidebar lists of one space.
-#[derive(Debug)]
-pub struct Fold<'a> {
-    pub shown: Vec<Entry<'a>>,
-    /// The agents of the space that are not listed: its "N more".
-    pub more: usize,
-    /// Nothing waits here and the open agent is elsewhere: the space is one line.
-    pub quiet: bool,
-}
-
-/// A space as the sidebar folds it: the agent on screen (`open`) first, then the agents that
-/// wait for the person (`waiting`, oldest first, at most [`SIDE_SHOWN`]), the rest behind
-/// "N more". Expanded, every agent of the space, sleepers included.
-pub fn fold<'a>(group: &Group<'a>, waiting: &[u32], open: Option<u32>, expanded: bool) -> Fold<'a> {
-    if expanded {
-        return Fold {
-            shown: group.rows.clone(),
-            more: 0,
-            quiet: false,
-        };
-    }
-    let find = |t: u32| group.rows.iter().find(|e| e.terminal() == t).copied();
-    let mut shown: Vec<Entry<'a>> = open.and_then(find).into_iter().collect();
-    for entry in waiting.iter().filter_map(|t| find(*t)) {
-        let held = shown.iter().any(|e| e.terminal() == entry.terminal());
-        if !held && shown.len() < SIDE_SHOWN + usize::from(open.and_then(find).is_some()) {
-            shown.push(entry);
-        }
-    }
-    Fold {
-        more: group.rows.len() - shown.len(),
-        quiet: shown.is_empty(),
-        shown,
-    }
+/// Whether a space is open in the column before the person folds or opens it: when something
+/// in it waits on them (`waiting`) or it holds the agent on screen (`open`). Open, it lists
+/// all its agents; folded, only its heading.
+pub fn opens_by_default(group: &Group<'_>, waiting: &[u32], open: Option<u32>) -> bool {
+    group
+        .rows
+        .iter()
+        .any(|e| waiting.contains(&e.terminal()) || Some(e.terminal()) == open)
 }
 
 /// The task strip of the tab on screen, from the `Tasks` answer to `TaskRead { terminal }`: its
@@ -1705,7 +1784,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn home_groups_by_space_and_orders_by_rank_then_oldest() {
+    fn home_groups_by_space_without_qass_and_with_each_sleeping_tab_once() {
         let m = fixture();
         let groups = m.groups();
         let names: Vec<&str> = groups.iter().map(|g| g.space.name.as_str()).collect();
@@ -1714,17 +1793,11 @@ pub(crate) mod tests {
             ["acme-web", "api", "staging:billing-api"],
             "qass's space is left out"
         );
-        let titles: Vec<String> = groups[0].rows.iter().map(|e| e.title()).collect();
         assert_eq!(
-            titles,
-            [
-                "README Coupons section",
-                "Coupon.ts test suggestion",
-                "Bun test suite status"
-            ]
+            groups[0].rows.len(),
+            3,
+            "acme-web's three, in the daemon's order"
         );
-        let api: Vec<u32> = groups[1].rows.iter().map(|e| e.terminal()).collect();
-        assert_eq!(api, [4, 5], "done before working");
         assert_eq!(
             groups[2].rows.len(),
             2,
@@ -1759,28 +1832,135 @@ pub(crate) mod tests {
         );
     }
 
-    /// The sidebar lists what waits and the open agent, folds the rest behind "N more", and
-    /// leaves a space where nothing waits as one line; expanded it lists every agent.
+    /// A space opens by itself when something in it waits or it holds the agent on screen;
+    /// a quiet one starts folded.
     #[test]
-    fn the_sidebar_fold_lists_what_waits_and_the_open_agent() {
+    fn a_space_opens_by_default_only_when_something_waits_or_is_on_screen() {
         let m = fixture();
         let groups = m.groups();
-        let (web, api) = (&groups[0], &groups[1]);
-        let ids = |f: &Fold<'_>| f.shown.iter().map(|e| e.terminal()).collect::<Vec<_>>();
-        let f = fold(web, &[2], None, false);
-        assert_eq!((ids(&f), f.more, f.quiet), (vec![2], 2, false));
-        let f = fold(api, &[], None, false);
-        assert_eq!((ids(&f), f.more, f.quiet), (vec![], 2, true), "one line");
-        // The open agent is always listed, so its space is never a quiet line.
-        let f = fold(api, &[], Some(5), false);
-        assert_eq!((ids(&f), f.more, f.quiet), (vec![5], 1, false));
-        // Open and waiting at once is listed once; a waiting one beyond the cap is folded.
-        let f = fold(web, &[2, 3, 1], Some(2), false);
-        assert_eq!(ids(&f), vec![2, 3, 1][..SIDE_SHOWN + 1].to_vec());
-        let f = fold(web, &[2, 3, 1], None, false);
-        assert_eq!((ids(&f), f.more), (vec![2, 3], 1));
-        let f = fold(web, &[2], None, true);
-        assert_eq!((ids(&f), f.more), (vec![2, 3, 1], 0), "expanded: all");
+        let web = groups.iter().find(|g| g.space.id == 1).expect("acme-web");
+        let api = groups.iter().find(|g| g.space.id == 2).expect("api");
+        assert!(opens_by_default(web, &[2], None), "2 waits");
+        assert!(!opens_by_default(api, &[2], None), "quiet");
+        assert!(opens_by_default(api, &[], Some(5)), "the agent on screen");
+    }
+
+    /// Spaces by their newest agent, agents newest first inside each; what has no time sinks,
+    /// and ties keep the daemon's order.
+    #[test]
+    fn groups_sort_spaces_and_agents_by_newest_activity() {
+        let mut m = fixture();
+        let at = |m: &mut Model, t: u32, when: i64| {
+            m.rows
+                .iter_mut()
+                .filter(|r| r.terminal == t)
+                .for_each(|r| r.last_active_at_unix = Some(when));
+        };
+        // api's 5 is the newest of all; in acme-web 3 is newer than 1, and 2 has no time.
+        at(&mut m, 5, 900);
+        at(&mut m, 3, 500);
+        at(&mut m, 1, 100);
+        let groups = m.groups();
+        let names: Vec<&str> = groups.iter().map(|g| g.space.name.as_str()).collect();
+        assert_eq!(names, ["api", "acme-web", "staging:billing-api"]);
+        let web: Vec<u32> = groups[1].rows.iter().map(|e| e.terminal()).collect();
+        assert_eq!(web, [3, 1, 2], "newest first, the one with no time last");
+        let api: Vec<u32> = groups[0].rows.iter().map(|e| e.terminal()).collect();
+        assert_eq!(api, [5, 4]);
+        // No times at all: the daemon's order, spaces and agents.
+        let plain = fixture();
+        let names: Vec<&str> = plain
+            .groups()
+            .iter()
+            .map(|g| g.space.name.as_str())
+            .collect();
+        assert_eq!(names, ["acme-web", "api", "staging:billing-api"]);
+    }
+
+    /// Priority is one list: Needs you, then Failed, then the rest by rank, newest first in
+    /// each.
+    #[test]
+    fn priority_puts_needs_you_then_failed_then_newest() {
+        let mut m = fixture();
+        for r in &mut m.rows {
+            match r.terminal {
+                4 => {
+                    r.status = Some("failed".into());
+                    r.state = "failed".into();
+                }
+                1 => r.last_active_at_unix = Some(100),
+                5 => r.last_active_at_unix = Some(900),
+                _ => {}
+            }
+        }
+        let order: Vec<u32> = m.priority().iter().map(|e| e.terminal()).collect();
+        assert_eq!(order[..2], [2, 4], "Needs you, then Failed: {order:?}");
+        let working: Vec<u32> = order
+            .iter()
+            .copied()
+            .filter(|t| [1, 5, 0x8100_0001].contains(t))
+            .collect();
+        assert_eq!(
+            working,
+            [5, 1, 0x8100_0001],
+            "newest first among the working"
+        );
+        assert!(!order.contains(&9), "qass is not listed");
+    }
+
+    /// An empty space is listed, folded by the column, but never qass's own space nor the
+    /// session's empty default.
+    #[test]
+    fn an_empty_space_is_listed_but_not_qass_or_the_empty_default() {
+        let mut m = fixture();
+        m.spaces.push(space(8, "ideas"));
+        let mut default: WorkspaceRow = serde_json::from_value(
+            serde_json::json!({"id": 7, "name": "default", "terminals": 0, "closable": false}),
+        )
+        .expect("space");
+        default.sleeping.clear();
+        m.spaces.push(default);
+        m.spaces.push(space(9, QASS_SPACE));
+        let ids: Vec<i64> = m.groups().iter().map(|g| g.space.id).collect();
+        assert!(ids.contains(&8), "{ids:?}");
+        assert!(!ids.contains(&7) && !ids.contains(&9) && !ids.contains(&3));
+        let ideas = m
+            .groups()
+            .into_iter()
+            .find(|g| g.space.id == 8)
+            .expect("ideas");
+        assert!(ideas.rows.is_empty());
+    }
+
+    /// The filter counts by the daemon's state, and saved by `parked`: a parked agent that
+    /// works is in working and in saved; a parked one that waits is only in wants.
+    #[test]
+    fn the_filter_counts_by_kind_and_saved_by_parked() {
+        let mut m = fixture();
+        for r in &mut m.rows {
+            if r.terminal == 1 || r.terminal == 2 {
+                r.parked = true;
+            }
+        }
+        let count =
+            |m: &Model, tab: StateTab| m.agents().iter().filter(|e| in_filter(e, tab)).count();
+        assert_eq!(count(&m, StateTab::All), m.agents().len());
+        assert_eq!(count(&m, StateTab::Wants), 1, "2 waits");
+        assert_eq!(count(&m, StateTab::Done), 2, "3 and 4");
+        assert_eq!(count(&m, StateTab::Working), 3, "1, 5 and the remote one");
+        assert_eq!(
+            count(&m, StateTab::Saved),
+            1,
+            "1 works and is saved; 2 waits, so not"
+        );
+        assert_eq!(count(&m, StateTab::Asleep), 1, "the remote's sleeping tab");
+        assert_eq!(count(&m, StateTab::Failed), 0);
+        let one = m
+            .agents()
+            .into_iter()
+            .find(|e| e.terminal() == 1)
+            .expect("1");
+        assert!(in_filter(&one, StateTab::Working) && in_filter(&one, StateTab::Saved));
     }
 
     /// The state word table: never "blocked" anywhere a person reads.
