@@ -214,6 +214,8 @@ pub struct Desk {
     pinged: HashMap<usize, i64>,
     /// The machine states last drawn: the clock draws again when one changes.
     drawn_states: Vec<state::MachineState>,
+    /// The marks' clock: the frame of the working breath, and whether its timer runs.
+    pub(crate) beat: shell::Beat,
     /// No `qoop` on this Mac (`state::qoop_bin`), looked at when the window opens.
     pub(crate) qoop_missing: bool,
     /// The agent list came at least once: before it, the Inbox and the sidebar draw skeletons.
@@ -381,6 +383,7 @@ impl Desk {
             sent_to: Default::default(),
             pinged: HashMap::new(),
             drawn_states: Vec::new(),
+            beat: Default::default(),
             listed: false,
             fresh: false,
             qoop_missing: state::qoop_bin().is_none(),
@@ -865,6 +868,7 @@ impl Desk {
         if !k.modifiers.control
             && !k.modifiers.platform
             && !k.modifiers.alt
+            && !keys::newline(k)
             && self.board_key(&k.key, window, cx)
         {
             cx.stop_propagation();
@@ -968,7 +972,7 @@ impl Desk {
         if k.modifiers.control || k.modifiers.platform || k.modifiers.alt {
             return;
         }
-        if k.key == "enter" && self.own_enter(window, cx) {
+        if k.key == "enter" && !keys::newline(k) && self.own_enter(window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -1129,6 +1133,7 @@ impl Desk {
             .screen
             .as_ref()
             .is_some_and(|s| s.modes.application_cursor);
+        let kitty = term.screen.as_ref().map_or(0, |s| s.modes.kitty_keyboard);
         let press = Press {
             key: &k.key,
             key_char: k.key_char.as_deref(),
@@ -1137,6 +1142,7 @@ impl Desk {
             shift: k.modifiers.shift,
             cmd: k.modifiers.platform,
             option_is_meta: false,
+            kitty,
         };
         if let Some(bytes) = keys::encode(press, app_cursor) {
             let terminal = term.terminal;
@@ -1374,6 +1380,7 @@ impl Desk {
         let redraw = now != self.now && (fresh || now / 30 != self.now / 30);
         self.now = now;
         self.ping_machines();
+        self.keep_beating(window, cx);
         let board_moved = self.board_tick(now);
         let states: Vec<state::MachineState> = state::machines(&self.model.spaces)
             .into_iter()

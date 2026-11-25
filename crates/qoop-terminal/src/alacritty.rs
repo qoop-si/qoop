@@ -99,6 +99,10 @@ impl AlacrittyEngine {
                 shape: alacritty_terminal::vte::ansi::CursorShape::Hidden,
                 blinking: false,
             },
+            // Off by default in alacritty_terminal, which then drops `CSI > 1 u` and never
+            // answers `CSI ? u`: an agent concludes there is no kitty keyboard, and a client
+            // never learns it should send Shift+Enter as `CSI 13;2u`.
+            kitty_keyboard: true,
             ..Config::default()
         };
         Self {
@@ -1318,6 +1322,25 @@ mod tests {
             kitty_flags(TermMode::KITTY_KEYBOARD_PROTOCOL | TermMode::SHOW_CURSOR),
             0b11111
         );
+    }
+
+    /// A program that asks for the kitty keyboard protocol (`CSI > 1 u`) is heard, and told it
+    /// is on when it asks (`CSI ? u`): without the engine honouring it, a client never sees
+    /// the flags and sends Shift+Enter as a plain return, which sends the line.
+    #[test]
+    fn the_kitty_keyboard_protocol_is_taken_and_reported() {
+        let mut e = engine();
+        let (_, effects) = e.feed(b"\x1b[?u");
+        assert!(
+            effects
+                .iter()
+                .any(|f| matches!(f, TerminalEffect::Reply(b) if b.as_ref() == &b"\x1b[?0u"[..])),
+            "{effects:?}"
+        );
+        e.feed(b"\x1b[>1u");
+        assert_eq!(e.snapshot().modes.kitty_keyboard, 1);
+        e.feed(b"\x1b[<u");
+        assert_eq!(e.snapshot().modes.kitty_keyboard, 0);
     }
 
     /// The cursor a program asks for and the title it sets reach the snapshot, so a client

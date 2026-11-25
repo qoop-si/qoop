@@ -6,13 +6,16 @@
 //! sized by dragging (or the arrow keys on a focused divider), within the clamps below, and
 //! text wraps whole inside whatever width it has.
 
+use std::time::Duration;
+
 use gpui::{
     AnyElement, Context, FontWeight, KeyDownEvent, MouseButton, Role, Window, div, prelude::*, px,
 };
+use qoop_domain::status::Status;
 use qoop_tui::inbox::Inbox;
 
 use crate::app::{Desk, Page};
-use crate::state::{self, Entry, Group, MachineState};
+use crate::state::{self, Entry, Group, Kind, MachineState};
 use crate::theme::{Theme, UI_FONT, c, ca};
 use crate::ui::{self, Icon};
 
@@ -34,6 +37,30 @@ pub const CHROME: f32 = 38.;
 /// One arrow key on a focused divider, and with shift.
 const NUDGE: f32 = 16.;
 const NUDGE_FAR: f32 = 64.;
+
+/// One frame of the working mark's breath: two of the TUI's 80 ms ticks, so a breath takes
+/// about 1.3 seconds there and here.
+pub const FRAME: Duration = Duration::from_millis(160);
+
+/// The marks' clock: the frame the working breath is at, and whether the timer that steps it
+/// runs. The timer runs only while a mark moves.
+#[derive(Debug, Default)]
+pub struct Beat {
+    pub frame: u32,
+    running: bool,
+}
+
+impl Beat {
+    #[cfg(test)]
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+}
+
+/// Whether a state's mark moves: a turn going, or work running in the background.
+pub fn moves(kind: Kind) -> bool {
+    matches!(kind, Kind::Status(Status::Working | Status::Background))
+}
 
 /// The sidebar width `want` asks for in a window `window` wide.
 pub fn clamp_side(want: f32, window: f32) -> f32 {
@@ -60,6 +87,48 @@ pub enum Edge {
 }
 
 impl Desk {
+    /// Whether any agent's mark moves now, and motion is on.
+    pub(crate) fn animating(&self) -> bool {
+        ui::motion_on()
+            && self
+                .model
+                .live()
+                .any(|r| moves(self.shown_kind(Entry::Live(r))))
+    }
+
+    /// Start the marks' clock when a mark moves and it is not running. Asked every second by
+    /// the window's tick; the timer ends by itself on the first frame where nothing moves,
+    /// so an idle window draws nothing extra.
+    pub(crate) fn keep_beating(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.beat.running || !self.animating() {
+            return;
+        }
+        self.beat.running = true;
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(FRAME).await;
+                match this.update_in(cx, |this, _, cx| this.step_beat(cx)) {
+                    Ok(true) => {}
+                    _ => return,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// One frame on, and the window drawn again; false, with the clock stopped, when no mark
+    /// moves any more.
+    fn step_beat(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.animating() {
+            self.beat.running = false;
+            return false;
+        }
+        self.beat.frame = self.beat.frame.wrapping_add(1);
+        ui::set_beat(self.beat.frame);
+        cx.notify();
+        true
+    }
+
     /// The sidebar's width in the window as it is now.
     pub(crate) fn side_px(&self) -> f32 {
         clamp_side(self.side_w, self.win_w)
