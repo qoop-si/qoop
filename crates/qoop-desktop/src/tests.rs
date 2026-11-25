@@ -1794,7 +1794,7 @@ fn the_inbox_and_its_badge_count_qass_cards_once(cx: &mut TestAppContext) {
     // The header and the sidebar's badge read the same list.
     vcx.update(|_, cx| desk.update(cx, |_, cx| cx.notify()));
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("inbox-card-E2").is_some());
+    assert!(vcx.debug_bounds("inbox-row-E2").is_some());
 }
 
 /// A question from a machine not reached is the last one seen: neutral, with when it was seen,
@@ -3338,14 +3338,15 @@ fn the_inbox_lists_one_card_per_agent_oldest_first(cx: &mut TestAppContext) {
             .origin
             .y
     };
-    let ys = ["inbox-card-t3", "inbox-card-t1", "inbox-card-Q9"].map(|s| y(&mut vcx, s));
+    // The list rows, in that order.
+    let ys = ["inbox-row-t3", "inbox-row-t1", "inbox-row-Q9"].map(|s| y(&mut vcx, s));
     assert!(
         ys.windows(2).all(|w| w[0] < w[1]),
         "drawn in that order: {ys:?}"
     );
     assert!(
-        vcx.debug_bounds("inbox-card-t2").is_none(),
-        "no second card for agent 2"
+        vcx.debug_bounds("inbox-row-t2").is_none(),
+        "no second row for agent 2"
     );
 }
 
@@ -3475,7 +3476,7 @@ fn the_chips_filter_the_list_and_the_active_one_clears(cx: &mut TestAppContext) 
     });
     vcx.run_until_parked();
     let drawn = |vcx: &mut VisualTestContext, what: &'static str| vcx.debug_bounds(what).is_some();
-    assert!(drawn(&mut vcx, "inbox-card-E5") && drawn(&mut vcx, "inbox-card-t1"));
+    assert!(drawn(&mut vcx, "inbox-row-E5") && drawn(&mut vcx, "inbox-row-t1"));
     let click = |vcx: &mut VisualTestContext, what: &'static str| {
         let at = vcx
             .debug_bounds(what)
@@ -3485,13 +3486,13 @@ fn the_chips_filter_the_list_and_the_active_one_clears(cx: &mut TestAppContext) 
         vcx.run_until_parked();
     };
     click(&mut vcx, "chip-qass");
-    assert!(drawn(&mut vcx, "inbox-card-E5"), "qass's card stays");
-    assert!(!drawn(&mut vcx, "inbox-card-t1") && !drawn(&mut vcx, "inbox-card-t2"));
+    assert!(drawn(&mut vcx, "inbox-row-E5"), "qass's card stays");
+    assert!(!drawn(&mut vcx, "inbox-row-t1") && !drawn(&mut vcx, "inbox-row-t2"));
     click(&mut vcx, "chip-qass");
-    assert!(drawn(&mut vcx, "inbox-card-t1"), "pressed again it clears");
+    assert!(drawn(&mut vcx, "inbox-row-t1"), "pressed again it clears");
     click(&mut vcx, "chip-failed");
-    assert!(drawn(&mut vcx, "inbox-card-t1"));
-    assert!(!drawn(&mut vcx, "inbox-card-E5") && !drawn(&mut vcx, "inbox-card-t2"));
+    assert!(drawn(&mut vcx, "inbox-row-t1"));
+    assert!(!drawn(&mut vcx, "inbox-row-E5") && !drawn(&mut vcx, "inbox-row-t2"));
 }
 
 /// The sidebar and a drawer follow a drag of their divider and never leave their clamp: the
@@ -4291,15 +4292,17 @@ fn text_fields_keep_their_keys_and_a_sheet_keeps_the_page(cx: &mut TestAppContex
     );
 }
 
-/// The ring follows the keyboard: Tab into a card's controls gives that card the ring, so the
-/// digit answers the card the person is on.
+/// The ring follows the keyboard: the list picks the second card, Tab goes on into the reader's
+/// controls, the ring stays on that card, and the digit answers the card the person is on.
 #[gpui::test]
 fn the_ring_follows_tab_into_a_card(cx: &mut TestAppContext) {
     let (desk, mut vcx, _rx) = open(cx);
     answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100), (1, 11, 1, 300)]));
     std::thread::sleep(qoop_tui::answers::ARMING);
     let second = crate::state::Slot::Agent(1);
-    // Through the column's controls first: its rows, strip, filter and headings.
+    vcx.update(|_, cx| desk.update(cx, |d, _| d.set_cursor(second.clone(), 1)));
+    vcx.run_until_parked();
+    // Through the column's controls and the list first.
     for _ in 0..120 {
         vcx.simulate_keystrokes("tab");
         let on = vcx.update(|window, cx| {
@@ -7378,4 +7381,651 @@ fn the_avatar_draws_its_ring_only_when_asked(cx: &mut TestAppContext) {
         vcx.run_until_parked();
         assert_eq!(vcx.debug_bounds("avatar-ring").is_some(), ring, "{ring}");
     }
+}
+
+// The desktop redesign, P3: the Inbox as mail.
+
+/// The pointer over the Inbox's list (the main column's left part).
+fn pointer_on_list(vcx: &mut VisualTestContext) {
+    vcx.simulate_mouse_move(
+        gpui::point(gpui::px(420.), gpui::px(300.)),
+        None,
+        gpui::Modifiers::none(),
+    );
+    vcx.run_until_parked();
+}
+
+/// Agents 3 and 1 ask (3 oldest), and 2 waits on a dialog: the list is 3, 1, 2.
+fn three_waiting(desk: &Entity<Desk>, vcx: &mut VisualTestContext) {
+    answer(desk, vcx, asking(&[(3, 33, 1, 100), (1, 11, 1, 300)]));
+    let order = desk.read_with(vcx, |d, _| {
+        d.inbox()
+            .items
+            .iter()
+            .map(|i| i.slot.clone())
+            .collect::<Vec<_>>()
+    });
+    use crate::state::Slot;
+    assert_eq!(order, [Slot::Agent(3), Slot::Agent(1), Slot::Agent(2)]);
+}
+
+/// A click on a list row puts its card in the reader, and only that card.
+#[gpui::test]
+fn a_list_row_opens_its_card_in_the_reader(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    assert!(
+        vcx.debug_bounds("inbox-card-t3").is_some(),
+        "the oldest at first"
+    );
+    assert!(vcx.debug_bounds("inbox-card-t1").is_none());
+    click_on(&mut vcx, "inbox-row-t1");
+    assert!(vcx.debug_bounds("inbox-card-t1").is_some(), "its card");
+    assert!(vcx.debug_bounds("inbox-card-t3").is_none(), "one at a time");
+    let reader = vcx.debug_bounds("inbox-reader").expect("the reader");
+    let list = vcx.debug_bounds("inbox-list").expect("the list");
+    assert!(reader.left() >= list.right(), "on the right");
+}
+
+/// `⌘J` moves the reader to the next item, and so does Down while the list has the keys; under
+/// the card, "⌘J next:" names the one after.
+#[gpui::test]
+fn cmd_j_and_down_move_the_reader_to_the_next_item(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    assert!(
+        vcx.debug_bounds("inbox-next").is_some(),
+        "cmd-J next: named"
+    );
+    vcx.simulate_keystrokes("cmd-j");
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("inbox-card-t1").is_some(),
+        "cmd-J: the next"
+    );
+    let list = desk.read_with(&vcx, |d, _| d.inbox_list_focus.clone());
+    vcx.update(|window, cx| window.focus(&list, cx));
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("inbox-card-t2").is_some(),
+        "Down: the next"
+    );
+    vcx.simulate_keystrokes("up");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("inbox-card-t1").is_some(), "Up: back");
+}
+
+/// A digit answers the card in the reader: held 3 s with Undo, as today.
+#[gpui::test]
+fn a_digit_answers_the_card_in_the_reader(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    std::thread::sleep(qoop_tui::answers::ARMING);
+    click_on(&mut vcx, "inbox-row-t1");
+    vcx.update(|window, cx| {
+        let root = desk.read(cx).focus.clone();
+        window.focus(&root, cx);
+    });
+    vcx.simulate_keystrokes("1");
+    vcx.run_until_parked();
+    assert_eq!(
+        held_slot(&desk, &vcx),
+        Some(crate::state::Slot::Agent(1)),
+        "the reader's card, not the first"
+    );
+    assert!(vcx.debug_bounds("hold-bar").is_some(), "held, with Undo");
+    vcx.simulate_keystrokes("u");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.holds.held.is_empty()),
+        "undone"
+    );
+}
+
+/// "Not waiting on you" lists the other agents by the Priority order, and no agent twice: not
+/// one an item names, nor one With qass or Finished lists.
+#[gpui::test]
+fn not_waiting_on_you_lists_the_other_agents_by_priority_and_none_twice(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    // 5 waits, handed to qass, which runs and watches.
+    answer(
+        &desk,
+        &mut vcx,
+        listed_changed(|r| {
+            if r.terminal == 5 {
+                r.status = Some("blocked".into());
+                r.state = "blocked".into();
+                r.with_qass = true;
+            }
+        }),
+    );
+    desk.update(&mut vcx, |d, cx| {
+        d.model.qass_watch = Some(true);
+        d.note_hand();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let (others, list) = desk.read_with(&vcx, |d, _| {
+        let list = d.inbox();
+        (d.not_waiting(&list), list)
+    });
+    assert!(list.with_qass.contains(&5), "5 is with qass");
+    assert!(vcx.debug_bounds("quiet-row-5").is_some(), "under With qass");
+    assert!(
+        vcx.debug_bounds("inbox-other-5").is_none(),
+        "and only there"
+    );
+    for t in [2, 3, 4] {
+        assert!(!others.contains(&t), "{t} is an item or Finished");
+    }
+    assert!(vcx.debug_bounds("inbox-other-1").is_some(), "1 works");
+    let priority: Vec<u32> = desk.read_with(&vcx, |d, _| {
+        d.model
+            .priority()
+            .iter()
+            .map(|e| e.terminal())
+            .filter(|t| others.contains(t))
+            .collect()
+    });
+    assert_eq!(others, priority, "in the Priority order");
+}
+
+/// The reader's item leaves (answered elsewhere): the next one takes the reader and the keys;
+/// none left, the reader says so and the keys go to the list.
+#[gpui::test]
+fn the_focus_moves_to_the_next_item_when_one_leaves(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    let card = |desk: &Entity<Desk>, vcx: &VisualTestContext, t: u32| {
+        desk.read_with(vcx, |d, _| {
+            d.card_focus
+                .borrow()
+                .get(&crate::state::Slot::Agent(t))
+                .cloned()
+        })
+    };
+    let first = card(&desk, &vcx, 3).expect("3's card");
+    vcx.update(|window, cx| window.focus(&first, cx));
+    // 3 is answered elsewhere: 1 is next.
+    answer(&desk, &mut vcx, asking(&[(1, 11, 1, 300)]));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("inbox-card-t1").is_some(),
+        "the next in the reader"
+    );
+    let next = card(&desk, &vcx, 1).expect("1's card");
+    assert!(
+        vcx.update(|window, _| next.is_focused(window)),
+        "and the keys"
+    );
+    // Nothing waits any more.
+    answer(
+        &desk,
+        &mut vcx,
+        listed_changed(|r| {
+            if r.terminal == 2 {
+                r.status = Some("working".into());
+                r.state = "working".into();
+            }
+        }),
+    );
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("inbox-reader-empty").is_some(),
+        "Nothing to answer."
+    );
+    let list = desk.read_with(&vcx, |d, _| d.inbox_list_focus.clone());
+    assert!(
+        vcx.update(|window, _| list.is_focused(window)),
+        "the list has the keys"
+    );
+}
+
+/// Held under the pointer, Down walks the drawn rows and skips one that left; `⌘J` to an item
+/// the hold has not drawn ends the hold, so its row is there when the reader shows it.
+#[gpui::test]
+fn keys_over_a_held_list_skip_dimmed_rows_and_cmd_j_ends_the_hold_for_an_undrawn_item(
+    cx: &mut TestAppContext,
+) {
+    use crate::state::Slot;
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    pointer_on_list(&mut vcx);
+    assert!(desk.read_with(&vcx, |d, _| d.inbox_held.is_some()), "held");
+    // 1 is answered elsewhere: its row stays, dimmed. A card lands between 3 and 2 in the live
+    // order (opened at 400), not drawn while held: walking the live list would pick it.
+    answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100)]));
+    desk.update(&mut vcx, |d, cx| {
+        let mut card = tab_card("Q4", 4, "open");
+        card.opened_at = 400;
+        d.asks = vec![card];
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("inbox-row-t1").is_some(),
+        "dimmed in place"
+    );
+    assert!(vcx.debug_bounds("inbox-row-Q4").is_none(), "not drawn");
+    let live = desk.read_with(&vcx, |d, _| {
+        let list = d.inbox();
+        d.live_list(&list).items
+    });
+    assert_eq!(
+        live,
+        [Slot::Agent(3), Slot::Card("Q4".into()), Slot::Agent(2)]
+    );
+    let list = desk.read_with(&vcx, |d, _| d.inbox_list_focus.clone());
+    vcx.update(|window, cx| window.focus(&list, cx));
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.inbox_cursor.clone()),
+        Some(Slot::Agent(2)),
+        "over the dimmed row"
+    );
+    // A new card lands: newest, after 2, not drawn while held.
+    desk.update(&mut vcx, |d, cx| {
+        d.asks = vec![tab_card("Q5", 5, "open")];
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("inbox-row-Q5").is_none(), "not drawn yet");
+    assert!(vcx.debug_bounds("inbox-new").is_some(), "counted");
+    vcx.simulate_keystrokes("cmd-j");
+    vcx.run_until_parked();
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.inbox_cursor.clone()),
+        Some(Slot::Card("Q5".into()))
+    );
+    assert!(
+        vcx.debug_bounds("inbox-row-Q5").is_some(),
+        "its row is drawn"
+    );
+    assert!(vcx.debug_bounds("inbox-card-Q5").is_some(), "its card read");
+}
+
+/// A main column too narrow for the list and the reader at their least puts the list over the
+/// reader; wide, they sit side by side.
+#[gpui::test]
+fn the_inbox_list_stacks_when_the_main_column_is_narrow(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    vcx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(800.)));
+    desk.update(&mut vcx, |d, cx| {
+        d.side_w = crate::shell::SIDE_MAX;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let (list, reader) = (
+        vcx.debug_bounds("inbox-list").expect("list"),
+        vcx.debug_bounds("inbox-reader").expect("reader"),
+    );
+    assert!(
+        reader.top() >= list.bottom(),
+        "stacked: {list:?} {reader:?}"
+    );
+    assert!(desk.read_with(&vcx, |d, _| d.inbox_stacked()));
+    // The sidebar folded: the same window has room for both.
+    desk.update(&mut vcx, |d, cx| {
+        d.side_open = false;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let (list, reader) = (
+        vcx.debug_bounds("inbox-list").expect("list"),
+        vcx.debug_bounds("inbox-reader").expect("reader"),
+    );
+    assert!(
+        reader.left() >= list.right(),
+        "side by side: {list:?} {reader:?}"
+    );
+}
+
+/// The list widens and narrows by its divider, by the mouse and by the arrows, within its
+/// bounds, the reader keeping its least.
+#[gpui::test]
+fn the_inbox_list_widens_by_its_divider(cx: &mut TestAppContext) {
+    use crate::shell::{LIST_DEFAULT, LIST_MAX};
+    let (_desk, mut vcx, _rx) = open(cx);
+    let width = |vcx: &mut VisualTestContext| {
+        vcx.debug_bounds("inbox-list-scroll")
+            .expect("the list")
+            .size
+            .width
+    };
+    assert_eq!(width(&mut vcx), gpui::px(LIST_DEFAULT));
+    let grip = vcx
+        .debug_bounds("divider-inbox")
+        .expect("its divider")
+        .center();
+    vcx.simulate_mouse_down(grip, gpui::MouseButton::Left, gpui::Modifiers::none());
+    let to = gpui::point(grip.x + gpui::px(200.), grip.y);
+    vcx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+    vcx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(width(&mut vcx), gpui::px(LIST_MAX), "wider, to its most");
+    vcx.simulate_keystrokes("left");
+    vcx.run_until_parked();
+    assert_eq!(
+        width(&mut vcx),
+        gpui::px(LIST_MAX - 16.),
+        "an arrow narrows it"
+    );
+}
+
+/// The Inbox page's states: nothing waiting (the list says so, the reader has nothing to
+/// answer, "Not waiting on you" still lists the agents), loading (skeletons, the reader says
+/// Loading) and the first run (no agents yet, no reader).
+#[gpui::test]
+fn the_inbox_draws_nothing_waiting_loading_and_first_run(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    answer(
+        &desk,
+        &mut vcx,
+        listed_changed(|r| {
+            if r.terminal == 2 {
+                r.status = Some("working".into());
+                r.state = "working".into();
+            }
+        }),
+    );
+    assert!(
+        vcx.debug_bounds("inbox-none").is_some(),
+        "Nothing waits on you."
+    );
+    assert!(
+        vcx.debug_bounds("inbox-reader-empty").is_some(),
+        "Nothing to answer."
+    );
+    assert!(
+        vcx.debug_bounds("inbox-other-1").is_some(),
+        "the others still listed"
+    );
+    assert!(vcx.debug_bounds("inbox-count").is_some(), "0 waiting");
+    desk.update(&mut vcx, |d, cx| {
+        d.listed = false;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("inbox-reader-loading").is_some(),
+        "Loading"
+    );
+    assert!(
+        vcx.debug_bounds("inbox-count").is_none(),
+        "no count before the Inbox is read"
+    );
+    desk.update(&mut vcx, |d, cx| {
+        d.listed = true;
+        d.model.rows.retain(|r| r.terminal == 9);
+        d.model
+            .spaces
+            .retain(|w| w.name == crate::state::QASS_SPACE);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("empty-new").is_some(),
+        "No agents yet, with New agent"
+    );
+    assert!(vcx.debug_bounds("inbox-reader").is_none(), "no reader");
+    assert!(
+        vcx.debug_bounds("inbox-count").is_none(),
+        "no count on the first run"
+    );
+}
+
+// The P3 code review's findings.
+
+/// `asking(menus)` with `change` made to its rows.
+fn asking_and(
+    menus: &[(u32, u64, u64, i64)],
+    change: impl Fn(&mut qoop_runtime::control::AgentRow),
+) -> ControlResponse {
+    let mut response = asking(menus);
+    if let ControlResponse::Agents { agents, .. } = &mut response {
+        agents.iter_mut().for_each(change);
+    }
+    response
+}
+
+/// Agent `terminal`'s row says `state`.
+fn now_is(terminal: u32, state: &'static str) -> impl Fn(&mut qoop_runtime::control::AgentRow) {
+    move |r| {
+        if r.terminal == terminal {
+            r.state = state.into();
+            r.status = Some(state.into());
+        }
+    }
+}
+
+/// The focus handle of agent `terminal`'s card, if one is made.
+fn card_of(
+    desk: &Entity<Desk>,
+    vcx: &VisualTestContext,
+    terminal: u32,
+) -> Option<gpui::FocusHandle> {
+    desk.read_with(vcx, |d, _| {
+        d.card_focus
+            .borrow()
+            .get(&crate::state::Slot::Agent(terminal))
+            .cloned()
+    })
+}
+
+fn has_keys(vcx: &mut VisualTestContext, handle: &gpui::FocusHandle) -> bool {
+    vcx.update(|window, _| handle.is_focused(window))
+}
+
+fn cursor(desk: &Entity<Desk>, vcx: &VisualTestContext) -> Option<crate::state::Slot> {
+    desk.read_with(vcx, |d, _| d.inbox_cursor.clone())
+}
+
+/// #1: the keys on the reader's card after a digit answer, `⌘J` moves the pick and the keys
+/// to the next item (its card not drawn before), and the pick stays there.
+#[gpui::test]
+fn cmd_j_from_the_readers_card_moves_the_pick_and_the_keys(cx: &mut TestAppContext) {
+    use crate::state::Slot;
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    std::thread::sleep(qoop_tui::answers::ARMING);
+    let three = card_of(&desk, &vcx, 3).expect("3's card");
+    vcx.update(|window, cx| window.focus(&three, cx));
+    vcx.simulate_keystrokes("1");
+    vcx.run_until_parked();
+    assert_eq!(held_slot(&desk, &vcx), Some(Slot::Agent(3)), "answered");
+    assert!(has_keys(&mut vcx, &three), "the keys on its card");
+    assert!(card_of(&desk, &vcx, 1).is_none(), "1's card is not drawn");
+    vcx.simulate_keystrokes("cmd-j");
+    vcx.run_until_parked();
+    assert_eq!(cursor(&desk, &vcx), Some(Slot::Agent(1)), "the next");
+    let one = card_of(&desk, &vcx, 1).expect("1's card");
+    assert!(has_keys(&mut vcx, &one), "and the keys");
+    desk.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert_eq!(cursor(&desk, &vcx), Some(Slot::Agent(1)), "it stays");
+    assert!(vcx.debug_bounds("inbox-card-t1").is_some(), "in the reader");
+}
+
+/// #2: the Inbox left by a click inside its list (an agent's row opens its page) and opened
+/// again with the pointer elsewhere: the list is not held.
+#[gpui::test]
+fn leaving_the_inbox_from_its_list_lets_the_list_go(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    pointer_on_list(&mut vcx);
+    assert!(desk.read_with(&vcx, |d, _| d.inbox_held.is_some()), "held");
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(5), window, cx)));
+    vcx.run_until_parked();
+    pointer_on_column(&mut vcx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Inbox, window, cx)));
+    vcx.run_until_parked();
+    assert!(
+        desk.read_with(&vcx, |d, _| d.inbox_held.is_none()),
+        "not held"
+    );
+}
+
+/// #3: held, an agent under "Not waiting on you" that finishes stays in place, dimmed and
+/// not a link, and Finished leaves it out until the hold ends: never on the page twice.
+#[gpui::test]
+fn a_held_agent_that_finishes_stays_dimmed_and_is_listed_once(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    pointer_on_list(&mut vcx);
+    let menus = [(3, 33, 1, 100), (1, 11, 1, 300)];
+    answer(&desk, &mut vcx, asking_and(&menus, now_is(5, "done")));
+    assert!(
+        desk.read_with(&vcx, |d, _| d.inbox().finished.contains(&5)),
+        "5 finished"
+    );
+    assert!(vcx.debug_bounds("inbox-other-5").is_some(), "in place");
+    assert!(vcx.debug_bounds("quiet-row-5").is_none(), "not twice");
+    click_on(&mut vcx, "inbox-other-5");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.page == Page::Inbox),
+        "not a link"
+    );
+    pointer_away(&mut vcx);
+    assert!(vcx.debug_bounds("quiet-row-5").is_some(), "under Finished");
+    assert!(
+        vcx.debug_bounds("inbox-other-5").is_none(),
+        "and only there"
+    );
+}
+
+/// #4: held, the picked item leaves while a new one waits undrawn after it: the reader goes
+/// to the drawn row before it, never to one with no row.
+#[gpui::test]
+fn the_reader_stays_on_drawn_rows_when_the_pick_leaves_a_held_list(cx: &mut TestAppContext) {
+    use crate::state::Slot;
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    pointer_on_list(&mut vcx);
+    desk.update(&mut vcx, |d, cx| {
+        d.set_cursor(Slot::Agent(2), 2);
+        d.asks = vec![tab_card("Q5", 5, "open")];
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("inbox-card-t2").is_some(), "2 read");
+    assert!(vcx.debug_bounds("inbox-row-Q5").is_none(), "Q5 not drawn");
+    let menus = [(3, 33, 1, 100), (1, 11, 1, 300)];
+    answer(&desk, &mut vcx, asking_and(&menus, now_is(2, "working")));
+    assert_eq!(cursor(&desk, &vcx), Some(Slot::Agent(1)));
+    assert!(vcx.debug_bounds("inbox-card-t1").is_some(), "1 read");
+    assert!(vcx.debug_bounds("inbox-card-Q5").is_none(), "not Q5");
+}
+
+/// #4: not held, items above the pick leave, then the pick: the reader goes to the one right
+/// after it, not one further on.
+#[gpui::test]
+fn the_reader_goes_to_the_next_item_when_the_pick_leaves(cx: &mut TestAppContext) {
+    use crate::state::Slot;
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    pointer_away(&mut vcx);
+    desk.update(&mut vcx, |d, cx| {
+        d.asks = vec![tab_card("Q5", 5, "open")];
+        d.set_cursor(Slot::Agent(2), 2);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    // 3 and 1 are answered elsewhere, a later card lands, then 2 goes back to work.
+    answer(&desk, &mut vcx, asking(&[]));
+    desk.update(&mut vcx, |d, cx| {
+        let mut later = tab_card("Q6", 4, "open");
+        later.opened_at = 2000;
+        d.asks.push(later);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    answer(&desk, &mut vcx, asking_and(&[], now_is(2, "working")));
+    assert_eq!(cursor(&desk, &vcx), Some(Slot::Card("Q5".into())));
+    assert!(vcx.debug_bounds("inbox-card-Q5").is_some(), "Q5 read");
+}
+
+/// #5: the list box holds the item rows only; "Not waiting on you" sits outside it. GPUI's
+/// test platform drops the accessibility tree, so the active descendant is not read here.
+#[gpui::test]
+fn the_inbox_list_box_holds_only_the_item_rows(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    let listbox = vcx.debug_bounds("inbox-listbox").expect("the list box");
+    let row = vcx.debug_bounds("inbox-row-t1").expect("an item row");
+    let other = vcx
+        .debug_bounds("inbox-other-5")
+        .expect("an agent not waiting");
+    assert!(listbox.contains(&row.center()), "the rows in it");
+    assert!(!listbox.contains(&other.center()), "the others not");
+}
+
+/// #6: stacked, the reader sits right under the item rows, above "Not waiting on you" and
+/// the quiet sections, so a pick is in sight.
+#[gpui::test]
+fn stacked_the_reader_sits_under_the_item_rows(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    vcx.simulate_resize(gpui::size(gpui::px(1024.), gpui::px(800.)));
+    desk.update(&mut vcx, |d, cx| {
+        d.side_w = crate::shell::SIDE_MAX;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(desk.read_with(&vcx, |d, _| d.inbox_stacked()), "stacked");
+    let rows = vcx.debug_bounds("inbox-listbox").expect("the rows");
+    let reader = vcx.debug_bounds("inbox-reader").expect("the reader");
+    let other = vcx
+        .debug_bounds("inbox-other-5")
+        .expect("an agent not waiting");
+    assert!(reader.top() >= rows.bottom(), "{rows:?} {reader:?}");
+    assert!(reader.bottom() <= other.top(), "{reader:?} {other:?}");
+}
+
+/// #7: held, an item answered elsewhere moves its agent to the others; it is not new.
+#[gpui::test]
+fn a_held_item_answered_elsewhere_is_not_counted_new(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    pointer_on_list(&mut vcx);
+    answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100)]));
+    assert!(
+        desk.read_with(&vcx, |d, _| d.live_list(&d.inbox()).others.contains(&1)),
+        "1 is with the others now"
+    );
+    assert!(vcx.debug_bounds("inbox-row-t1").is_some(), "dimmed");
+    assert!(vcx.debug_bounds("inbox-new").is_none(), "not new");
+}
+
+/// #10: a held item that left names its agent and says its state now, not "Answered".
+#[gpui::test]
+fn a_held_item_that_left_names_its_agent_and_its_state(cx: &mut TestAppContext) {
+    use crate::state::Slot;
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    pointer_on_list(&mut vcx);
+    answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100)]));
+    let (name, word) = desk.read_with(&vcx, |d, _| {
+        let list = d.inbox();
+        let drawn = d.drawn_list(&list);
+        d.left_item(&drawn, &Slot::Agent(1))
+    });
+    assert!(name.contains("Bun test suite status"), "{name}");
+    assert_eq!(word, "Working");
+}
+
+/// #11: a row clicked, then its item answered elsewhere: the keys go to the next card, not
+/// to the window.
+#[gpui::test]
+fn after_a_row_click_the_keys_follow_to_the_next_card(cx: &mut TestAppContext) {
+    use crate::state::Slot;
+    let (desk, mut vcx, _rx) = open(cx);
+    three_waiting(&desk, &mut vcx);
+    pointer_away(&mut vcx);
+    click_on(&mut vcx, "inbox-row-t1");
+    answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100)]));
+    assert_eq!(cursor(&desk, &vcx), Some(Slot::Agent(2)));
+    let two = card_of(&desk, &vcx, 2).expect("2's card");
+    assert!(has_keys(&mut vcx, &two), "the keys on it");
 }

@@ -115,6 +115,24 @@ pub enum Edge {
     Side,
     /// The left edge of the drawer beside the terminal.
     Drawer,
+    /// The Inbox list's right edge, between it and the reader.
+    InboxList,
+}
+
+/// The Inbox list: its width at first, and the least and most it is dragged to; the reader
+/// beside it keeps at least [`READER_MIN`]. A divider's width.
+pub const LIST_DEFAULT: f32 = 420.;
+pub const LIST_MIN: f32 = 280.;
+pub const LIST_MAX: f32 = 560.;
+pub const READER_MIN: f32 = 360.;
+const DIVIDER: f32 = 7.;
+
+/// The Inbox list width `want` asks for in a main column `main` wide.
+pub fn clamp_list(want: f32, main: f32) -> f32 {
+    want.clamp(
+        LIST_MIN,
+        LIST_MAX.min(main - READER_MIN - DIVIDER).max(LIST_MIN),
+    )
 }
 
 impl Desk {
@@ -178,10 +196,36 @@ impl Desk {
         clamp_drawer(want, self.win_w, self.side_px())
     }
 
+    /// Where the main column starts in the window, and how wide it is: what is left of the
+    /// sidebar and its divider.
+    pub(crate) fn main_left(&self) -> f32 {
+        if self.side_open {
+            self.side_px() + DIVIDER
+        } else {
+            0.
+        }
+    }
+
+    pub(crate) fn main_w(&self) -> f32 {
+        self.win_w - self.main_left()
+    }
+
+    /// The Inbox list's width in the main column as it is now.
+    pub(crate) fn list_px(&self) -> f32 {
+        clamp_list(self.inbox_list_w, self.main_w())
+    }
+
+    /// Whether the Inbox page puts its list over its reader: the main column (not the window:
+    /// the sidebar's width counts) has no room for both at their least.
+    pub(crate) fn inbox_stacked(&self) -> bool {
+        self.main_w() < LIST_MIN + READER_MIN + DIVIDER
+    }
+
     /// The divider `edge` is dragged to the window's `x`.
     pub(crate) fn drag_to(&mut self, edge: Edge, x: f32) {
         match edge {
             Edge::Side => self.side_w = clamp_side(x, self.win_w),
+            Edge::InboxList => self.inbox_list_w = clamp_list(x - self.main_left(), self.main_w()),
             Edge::Drawer => {
                 // The drawer's right edge is the window's, less the page's padding.
                 let want = clamp_drawer(self.win_w - x - 12., self.win_w, self.side_px());
@@ -207,6 +251,7 @@ impl Desk {
         let x = match edge {
             Edge::Side => self.side_px() + by,
             Edge::Drawer => self.win_w - self.drawer_px() - 12. + by,
+            Edge::InboxList => self.main_left() + self.list_px() + by,
         };
         self.drag_to(edge, x);
         cx.stop_propagation();
@@ -223,54 +268,51 @@ impl Desk {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let on = self.drag == Some(edge);
-        ui::control(
-            match edge {
-                Edge::Side => "divider-side",
-                Edge::Drawer => "divider-drawer",
-            },
-            Role::Splitter,
-            label,
-            t,
-        )
-        .aria_orientation(gpui::Orientation::Vertical)
-        .aria_numeric_value(f64::from(match edge {
-            Edge::Side => self.side_px(),
-            Edge::Drawer => self.drawer_px(),
-        }))
-        .aria_min_numeric_value(f64::from(match edge {
-            Edge::Side => SIDE_MIN,
-            Edge::Drawer => DRAWER_MIN,
-        }))
-        .aria_max_numeric_value(f64::from(match edge {
-            Edge::Side => SIDE_MAX.min(self.win_w - MAIN_MIN).max(SIDE_MIN),
-            Edge::Drawer => DRAWER_MAX
-                .min(self.win_w - self.side_px() - TERM_MIN - CHROME)
-                .max(DRAWER_MIN),
-        }))
-        .debug_selector(move || match edge {
-            Edge::Side => "divider-side".to_string(),
-            Edge::Drawer => "divider-drawer".to_string(),
-        })
-        .flex_none()
-        .w(px(7.))
-        .h_full()
-        .flex()
-        .justify_center()
-        .cursor_ew_resize()
-        .child(div().w(px(if on { 2. } else { 1. })).h_full().bg(if on {
-            c(t.focus)
-        } else {
-            ca(t.hair)
-        }))
-        .hover(|s| s.bg(ca(t.fill)))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                this.drag = Some(edge);
-                cx.notify();
-            }),
-        )
-        .on_key_down(cx.listener(move |this, event, _, cx| this.nudge(edge, event, cx)))
+        let id = match edge {
+            Edge::Side => "divider-side",
+            Edge::Drawer => "divider-drawer",
+            Edge::InboxList => "divider-inbox",
+        };
+        ui::control(id, Role::Splitter, label, t)
+            .aria_orientation(gpui::Orientation::Vertical)
+            .aria_numeric_value(f64::from(match edge {
+                Edge::Side => self.side_px(),
+                Edge::Drawer => self.drawer_px(),
+                Edge::InboxList => self.list_px(),
+            }))
+            .aria_min_numeric_value(f64::from(match edge {
+                Edge::Side => SIDE_MIN,
+                Edge::Drawer => DRAWER_MIN,
+                Edge::InboxList => LIST_MIN,
+            }))
+            .aria_max_numeric_value(f64::from(match edge {
+                Edge::Side => SIDE_MAX.min(self.win_w - MAIN_MIN).max(SIDE_MIN),
+                Edge::Drawer => DRAWER_MAX
+                    .min(self.win_w - self.side_px() - TERM_MIN - CHROME)
+                    .max(DRAWER_MIN),
+                Edge::InboxList => clamp_list(f32::MAX, self.main_w()),
+            }))
+            .debug_selector(move || id.to_string())
+            .flex_none()
+            .w(px(7.))
+            .h_full()
+            .flex()
+            .justify_center()
+            .cursor_ew_resize()
+            .child(div().w(px(if on { 2. } else { 1. })).h_full().bg(if on {
+                c(t.focus)
+            } else {
+                ca(t.hair)
+            }))
+            .hover(|s| s.bg(ca(t.fill)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.drag = Some(edge);
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event, _, cx| this.nudge(edge, event, cx)))
     }
 
     /// What is wrong with the connection, above the page and wrapped whole: each machine not

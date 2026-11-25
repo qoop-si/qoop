@@ -131,6 +131,15 @@ pub struct Desk {
     pub(crate) inbox_filter: crate::inbox::Filter,
     pub(crate) inbox_cursor: Option<state::Slot>,
     pub(crate) cursor_at: usize,
+    /// The Inbox list beside the reader: its width as dragged, its focus (Up and Down move
+    /// the pick while it has the keys), the pointer over it, its rows held still meanwhile,
+    /// and the item the reader showed last (when it leaves, the next takes the keys).
+    pub(crate) inbox_list_w: f32,
+    pub(crate) inbox_list_focus: FocusHandle,
+    pub(crate) inbox_hovered: bool,
+    pub(crate) inbox_held: Option<crate::inbox::ListDrawn>,
+    pub(crate) reader_shown: Option<state::Slot>,
+    pub(crate) reader_order: Vec<state::Slot>,
     /// What this client answered itself: agent menus leave no card, so Answered today reads it.
     pub(crate) own_answers: Vec<qoop_tui::inbox::OwnAnswer>,
     /// When the person's day began, for Answered today; looked up again once a day.
@@ -394,6 +403,12 @@ impl Desk {
             inbox_filter: Default::default(),
             inbox_cursor: None,
             cursor_at: 0,
+            inbox_list_w: shell::LIST_DEFAULT,
+            inbox_list_focus: cx.focus_handle().tab_stop(true),
+            inbox_hovered: false,
+            inbox_held: None,
+            reader_shown: None,
+            reader_order: Vec::new(),
             own_answers: Vec::new(),
             day_start: 0,
             folds: BTreeMap::new(),
@@ -1728,6 +1743,8 @@ impl Render for Desk {
         let inbox = self.inbox();
         self.follow_card_focus(&inbox, window, cx);
         self.update_hold(&inbox, window, cx);
+        self.update_inbox_hold(&inbox, window, cx);
+        self.follow_reader(&inbox, window, cx);
         let side = self.side_px();
         let mut root = div()
             .id("desk")

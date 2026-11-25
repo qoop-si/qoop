@@ -1,10 +1,13 @@
-//! The Inbox page: everything that needs the owner as one list, one card per open loop, oldest
-//! first, from the shared rules (`qoop_tui::inbox`). Digits answer the card with the focus ring,
-//! `u` undoes, a pick waits its 3 s in the hold bar at the foot of the page, and the quiet
-//! sections (With qass, Finished, Answered today) sit below the list.
+//! The Inbox page, as mail: on the left, everything that needs the owner as one list, one row
+//! per open loop, oldest first, from the shared rules (`qoop_tui::inbox`), then "Not waiting on
+//! you" and the quiet sections (With qass, Finished, Answered today); on the right, the picked
+//! item's card whole. Digits answer the card in the reader, `u` undoes, a pick waits its 3 s in
+//! the hold bar at the foot of the page. The list holds still under the pointer or the keys.
 //!
 //! The page is a page like any other: the session open before it keeps its terminal alive
 //! behind it, and `ctrl-a i` or Escape goes back to it.
+
+use std::collections::HashMap;
 
 use gpui::{AnyElement, Context, FontWeight, Role, Window, div, prelude::*, px};
 use qoop_runtime::control::{AgentRow, AskInfo, ControlRequest, TerminalStream};
@@ -54,7 +57,237 @@ impl Filter {
     }
 }
 
+/// What the Inbox list draws: its items (the chip's), then "Not waiting on you". Worked out
+/// from the live lists, or kept whole while the list is held (as the column's rows are).
+/// ponytail: what is drawn while held can be up to one hover old; a dimmed row does nothing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ListDrawn {
+    pub items: Vec<Slot>,
+    pub others: Vec<u32>,
+    /// Each row's agent as drawn ("space title"): a row that left keeps it, dimmed.
+    pub names: HashMap<Slot, String>,
+    pub titles: HashMap<u32, String>,
+}
+
+impl ListDrawn {
+    /// Every agent the list draws, an item's or a "Not waiting on you" row's.
+    fn terminals(&self) -> Vec<u32> {
+        self.items
+            .iter()
+            .filter_map(|s| match s {
+                Slot::Agent(t) => Some(*t),
+                Slot::Card(_) => None,
+            })
+            .chain(self.others.iter().copied())
+            .collect()
+    }
+}
+
 impl Desk {
+    /// The agents "Not waiting on you" lists: every agent by the Priority order, less the
+    /// ones an item names and the ones a quiet section lists (With qass, Finished), so no
+    /// agent is on the page twice.
+    pub(crate) fn not_waiting(&self, list: &Inbox) -> Vec<u32> {
+        let named: Vec<u32> = list
+            .items
+            .iter()
+            .filter_map(|i| i.terminal)
+            .chain(list.with_qass.iter().copied())
+            .chain(list.finished.iter().copied())
+            .collect();
+        self.model
+            .priority()
+            .iter()
+            .map(|e| e.terminal())
+            .filter(|t| !named.contains(t))
+            .collect()
+    }
+
+    /// What the list draws now from the live lists.
+    pub(crate) fn live_list(&self, list: &Inbox) -> ListDrawn {
+        let items = self.shown(list);
+        let others = self.not_waiting(list);
+        let named = |t: u32| {
+            self.model
+                .row(t)
+                .map_or_else(|| format!("tab {t}"), |r| self.who_text(r))
+        };
+        let names = items
+            .iter()
+            .map(|i| {
+                let who = i.terminal.map_or_else(|| "qass".to_string(), named);
+                (i.slot.clone(), who)
+            })
+            .collect();
+        let agents = self.model.agents();
+        let titles = others
+            .iter()
+            .map(|t| {
+                let title = agents
+                    .iter()
+                    .find(|e| e.terminal() == *t)
+                    .map_or_else(|| named(*t), |e| self.entry_name(*e));
+                (*t, title)
+            })
+            .collect();
+        ListDrawn {
+            items: items.iter().map(|i| i.slot.clone()).collect(),
+            others,
+            names,
+            titles,
+        }
+    }
+
+    /// An agent as a row of the page names it: its space and its title.
+    fn entry_name(&self, entry: state::Entry<'_>) -> String {
+        match self.model.space(entry.workspace()) {
+            Some(w) => format!("{} {}", state::short_space(w), entry.title()),
+            None => entry.title(),
+        }
+    }
+
+    /// A held item row that left: its agent as the list drew it, and the word it says now (the
+    /// agent's state, "Closed" once it is gone; a card about no agent, "Answered").
+    pub(crate) fn left_item(&self, drawn: &ListDrawn, slot: &Slot) -> (String, String) {
+        let name = drawn
+            .names
+            .get(slot)
+            .cloned()
+            .unwrap_or_else(|| slot_name(slot));
+        let word = match slot {
+            Slot::Agent(t) => {
+                let agents = self.model.agents();
+                self.left_word(agents.iter().find(|e| e.terminal() == *t).copied())
+            }
+            Slot::Card(_) => "Answered".to_string(),
+        };
+        (name, word)
+    }
+
+    /// What the list draws: its held rows while held, else the live ones.
+    pub(crate) fn drawn_list(&self, list: &Inbox) -> ListDrawn {
+        self.inbox_held
+            .clone()
+            .unwrap_or_else(|| self.live_list(list))
+    }
+
+    /// Before each frame on the Inbox: hold the list while the pointer is on it or the keys
+    /// drive inside it (as the column holds), let it go otherwise.
+    pub(crate) fn update_inbox_hold(&mut self, list: &Inbox, window: &Window, cx: &gpui::App) {
+        if self.page != Page::Inbox {
+            // Left with the pointer on the list (a click on a row that opens an agent): its
+            // hover ends with the page, which says nothing when it is drawn again.
+            self.inbox_hovered = false;
+            self.inbox_held = None;
+            return;
+        }
+        let keys =
+            window.last_input_was_keyboard() && self.inbox_list_focus.contains_focused(window, cx);
+        if !self.listed || !(self.inbox_hovered || keys) {
+            self.inbox_held = None;
+            return;
+        }
+        if self.inbox_held.is_none() {
+            self.inbox_held = Some(self.live_list(list));
+        }
+    }
+
+    /// Before each frame: when the item the reader showed has left (answered here after its
+    /// hold, or elsewhere), the next one by the order the list drew (the first later row still
+    /// waiting, else the one before) takes the reader and the keys; none left, the list takes
+    /// the keys. The keys move only when they were on the card that left, in the list (a row
+    /// clicked), or fell to the window.
+    pub(crate) fn follow_reader(
+        &mut self,
+        list: &Inbox,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.page != Page::Inbox {
+            self.reader_shown = None;
+            self.reader_order.clear();
+            return;
+        }
+        let items = self.shown(list);
+        // The pick's place in the live list, kept in step as items above it leave.
+        if let Some(at) = self
+            .inbox_cursor
+            .as_ref()
+            .and_then(|s| items.iter().position(|i| &i.slot == s))
+        {
+            self.cursor_at = at;
+        }
+        if let Some(was) = self.reader_shown.clone()
+            && !items.iter().any(|i| i.slot == was)
+        {
+            let order = &self.reader_order;
+            let next = order.iter().position(|s| *s == was).and_then(|p| {
+                order[p + 1..]
+                    .iter()
+                    .chain(order[..p].iter().rev())
+                    .find_map(|s| {
+                        items
+                            .iter()
+                            .position(|i| &i.slot == s)
+                            .map(|at| (s.clone(), at))
+                    })
+            });
+            match next {
+                Some((slot, at)) => self.set_cursor(slot, at),
+                None => self.inbox_cursor = None,
+            }
+            let on_it = self
+                .card_focus
+                .borrow()
+                .get(&was)
+                .is_some_and(|h| h.contains_focused(window, cx))
+                || self.inbox_list_focus.contains_focused(window, cx);
+            if on_it || self.focus.is_focused(window) {
+                let to = match self.cursor_slot(&items) {
+                    Some(slot) => self.card_handle(&slot, cx),
+                    None => self.inbox_list_focus.clone(),
+                };
+                window.focus(&to, cx);
+            }
+        }
+        self.reader_shown = self.cursor_slot(&items);
+        self.reader_order = self.drawn_list(list).items;
+    }
+
+    /// A card's focus handle, made before it is drawn: the keys can go to a card the reader
+    /// is about to show.
+    fn card_handle(&self, slot: &Slot, cx: &mut Context<Self>) -> gpui::FocusHandle {
+        self.card_focus
+            .borrow_mut()
+            .entry(slot.clone())
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// Up and Down on the list: the pick moves to the drawn row above or below, over the rows
+    /// that left (dimmed while held); the reader follows. The keys stay on the list.
+    fn move_pick(&mut self, down: bool, cx: &mut Context<Self>) {
+        let list = self.inbox();
+        let items = self.shown(&list);
+        let drawn = self.drawn_list(&list).items;
+        let live = |slot: &Slot| items.iter().position(|i| &i.slot == slot);
+        let here = self
+            .cursor_slot(&items)
+            .and_then(|s| drawn.iter().position(|d| *d == s));
+        let order: Vec<usize> = if down {
+            (here.map_or(0, |h| h + 1)..drawn.len()).collect()
+        } else {
+            (0..here.unwrap_or(0)).rev().collect()
+        };
+        if let Some((slot, at)) = order
+            .into_iter()
+            .find_map(|n| live(&drawn[n]).map(|at| (drawn[n].clone(), at)))
+        {
+            self.set_cursor(slot, at);
+            cx.notify();
+        }
+    }
+
     /// Everything the Inbox lists now: one list, one count, from the rows and every card read.
     pub(crate) fn inbox(&self) -> Inbox {
         Inbox::build(
@@ -122,13 +355,20 @@ impl Desk {
     }
 
     /// The position of the card with the focus ring: the one picked, else the same place in the
-    /// list when it left, never past the end.
+    /// list when it left, never past the end. While the list is held, never an item it has not
+    /// drawn: the reader never shows a card whose row is missing.
     fn cursor_in(&self, items: &[&Item]) -> Option<usize> {
         let by_slot = self
             .inbox_cursor
             .as_ref()
             .and_then(|slot| items.iter().position(|i| &i.slot == slot));
-        by_slot.or_else(|| (!items.is_empty()).then(|| self.cursor_at.min(items.len() - 1)))
+        let at =
+            by_slot.or_else(|| (!items.is_empty()).then(|| self.cursor_at.min(items.len() - 1)))?;
+        let undrawn = self
+            .inbox_held
+            .as_ref()
+            .is_some_and(|held| !held.items.contains(&items[at].slot));
+        (!undrawn).then_some(at)
     }
 
     pub(crate) fn set_cursor(&mut self, slot: Slot, at: usize) {
@@ -142,14 +382,27 @@ impl Desk {
         let list = self.inbox();
         if self.page == Page::Inbox {
             let items = self.shown(&list);
-            if let Some(at) = self.cursor_in(&items).map(|at| (at + 1) % items.len()) {
+            let next = match self.cursor_in(&items) {
+                Some(at) => Some((at + 1) % items.len()),
+                None => (!items.is_empty()).then_some(0),
+            };
+            if let Some(at) = next {
                 let slot = items[at].slot.clone();
-                // The card takes the keyboard focus too, so the list scrolls it into view.
-                let handle = self.card_focus.borrow().get(&slot).cloned();
-                self.set_cursor(slot, at);
-                if let Some(handle) = handle {
-                    window.focus(&handle, cx);
+                // He asked for it: an item the held list has not drawn ends the hold, so the
+                // reader never shows a card whose row is missing.
+                if self
+                    .inbox_held
+                    .as_ref()
+                    .is_some_and(|held| !held.items.contains(&slot))
+                {
+                    self.inbox_held = None;
                 }
+                // The card takes the keys too. It is not drawn yet (only the reader's card
+                // is): its handle is made now, so the focus is never left on the card before,
+                // which would take the pick back on the next frame.
+                let handle = self.card_handle(&slot, cx);
+                self.set_cursor(slot, at);
+                window.focus(&handle, cx);
                 cx.notify();
             }
             return;
@@ -350,6 +603,8 @@ impl Desk {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         // The chip that filters is the clear control: pressed again, All.
                         this.inbox_filter = if on { Filter::All } else { f };
+                        // A new list: drawn again from the live one.
+                        this.inbox_held = None;
                         cx.notify();
                     }))
             }))
@@ -366,14 +621,76 @@ impl Desk {
             })
     }
 
-    /// The Inbox page.
+    /// The Inbox page as mail: on the left the list (the items oldest first, then "Not waiting
+    /// on you" and the quiet sections), on the right the picked item's card whole with what
+    /// `⌘J` goes to next. The list widens by its divider; a main column too narrow for both
+    /// puts the reader under the item rows, above the rest. The hold bar stays at the foot.
     pub fn inbox_page(&self, list: &Inbox, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let items = self.shown(list);
+        // Only the reader's card is drawn; every listed item keeps its focus handle, so `⌘J`
+        // and a leaving item can give the keys to one not drawn yet.
+        let cursor = self.cursor_in(&items);
+        let reading = cursor.map(|at| items[at].slot.clone());
         self.card_focus
             .borrow_mut()
             .retain(|slot, _| items.iter().any(|i| &i.slot == slot));
-        let cursor = self.cursor_in(&items);
         let first_run = self.listed && self.model.agents().is_empty();
+        let stacked = self.inbox_stacked();
+        let (rows, rest) = self.inbox_list(list, &items, reading.as_ref(), first_run, t, cx);
+        let reader = (!first_run).then(|| self.reader(&items, cursor, t, cx));
+        let content = if stacked {
+            // One column scrolled as one: the item rows, the reader right under them, then the
+            // rest, so a pick is always in sight.
+            ui::scroll(
+                div()
+                    .id("inbox-body")
+                    .debug_selector(|| "inbox-body".to_string())
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(14.))
+                            .pb(px(20.))
+                            .child(self.list_part("inbox-list", cx).child(rows))
+                            .children(reader)
+                            .child(self.list_part("inbox-list-rest", cx).child(rest)),
+                    ),
+            )
+            .into_any_element()
+        } else {
+            div()
+                .id("inbox-body")
+                .debug_selector(|| "inbox-body".to_string())
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .child(ui::scroll(
+                    div()
+                        .id("inbox-list-scroll")
+                        .debug_selector(|| "inbox-list-scroll".to_string())
+                        .flex_none()
+                        .w(px(self.list_px()))
+                        .h_full()
+                        .overflow_y_scroll()
+                        .child(self.list_part("inbox-list", cx).child(rows).child(rest)),
+                ))
+                .child(self.divider(crate::shell::Edge::InboxList, "Inbox list width", t, cx))
+                .children(reader.map(|reader| {
+                    ui::scroll(
+                        div()
+                            .id("inbox-reader-scroll")
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
+                            .child(reader),
+                    )
+                }))
+                .into_any_element()
+        };
         div()
             .id("inbox-page")
             .debug_selector(|| "inbox-page".to_string())
@@ -384,53 +701,469 @@ impl Desk {
                 d.child(self.inbox_chips(list, t, cx))
             })
             .when_some(self.qass_stopped(t, cx), |d, line| d.child(line))
-            .child(ui::scroll(
-                div()
-                    .id("inbox-body")
-                    .debug_selector(|| "inbox-body".to_string())
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .px(px(26.))
-                            .pb(px(20.))
-                            .max_w(px(940.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.))
-                            .when(!self.listed, |d| d.children((0..3).map(|n| skeleton(n, t))))
-                            .when_some(
-                                state::loading_line(&self.model.spaces, &self.model.rows),
-                                |d, line| {
-                                    d.child(
-                                        div()
-                                            .id("loading-line")
-                                            .role(Role::Status)
-                                            .aria_label(line.clone())
-                                            .text_size(px(12.5))
-                                            .text_color(c(t.t2))
-                                            .child(line),
-                                    )
-                                },
-                            )
-                            .when(self.listed && items.is_empty(), |d| {
-                                d.child(self.inbox_empty(first_run, t, cx))
-                            })
-                            .children(
-                                items.iter().enumerate().map(|(i, item)| {
-                                    self.item_card(item, i, cursor == Some(i), t, cx)
-                                }),
-                            )
-                            // The quiet lists belong to the whole Inbox: a filter hides them.
-                            .when(self.inbox_filter == Filter::All, |d| {
-                                d.child(self.quiet_sections(list, t, cx))
-                            }),
-                    ),
-            ))
+            .child(content)
             .when(!self.holds.held.is_empty(), |d| {
                 d.child(self.hold_bar(t, cx))
             })
+            .into_any_element()
+    }
+
+    /// A part of the list (all of it side by side; stacked, the item rows or the rest): the
+    /// pointer on it holds the list.
+    fn list_part(&self, id: &'static str, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .hover_listener_mode(gpui::HoverListenerMode::InputModalityIndependent)
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if this.inbox_hovered != *hovered {
+                    this.inbox_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
+            .flex()
+            .flex_col()
+            .px(px(14.))
+    }
+
+    /// The list in two parts. First "N waiting, oldest first" and the item rows, one list box
+    /// whose picked row is its active descendant; then "Not waiting on you" with the other
+    /// agents and the quiet sections. Held, the rows stay where they are: a row that left
+    /// stays dimmed with its new state word, not a link, and the quiet sections leave out an
+    /// agent the held rows draw, so none is on the page twice. New ones are counted.
+    fn inbox_list(
+        &self,
+        list: &Inbox,
+        items: &[&Item],
+        reading: Option<&Slot>,
+        first_run: bool,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, AnyElement) {
+        let drawn = self.drawn_list(list);
+        let live = self.live_list(list);
+        let agents = self.model.agents();
+        let entry = |terminal: u32| agents.iter().find(|e| e.terminal() == terminal).copied();
+        // New is what neither held part draws: an item that left moves its agent to the
+        // others, and is not new.
+        let fresh = self.inbox_held.as_ref().map_or(0, |held| {
+            let shown = held.terminals();
+            live.items
+                .iter()
+                .filter(|s| match s {
+                    Slot::Agent(t) => !shown.contains(t),
+                    Slot::Card(_) => !held.items.contains(s),
+                })
+                .count()
+                + live.others.iter().filter(|t| !shown.contains(t)).count()
+        });
+        let quiet = match &self.inbox_held {
+            Some(held) => {
+                let shown = held.terminals();
+                let mut quiet = list.clone();
+                quiet.with_qass.retain(|t| !shown.contains(t));
+                quiet.finished.retain(|t| !shown.contains(t));
+                std::borrow::Cow::Owned(quiet)
+            }
+            None => std::borrow::Cow::Borrowed(list),
+        };
+        // No count before the Inbox is read, nor on the first run.
+        let count =
+            (self.listed && !first_run).then(|| format!("{} waiting, oldest first", items.len()));
+        let listbox = div()
+            .id("inbox-listbox")
+            .debug_selector(|| "inbox-listbox".to_string())
+            .role(Role::ListBox)
+            .aria_label(
+                count
+                    .as_ref()
+                    .map_or_else(|| "Inbox".to_string(), |n| format!("Inbox, {n}")),
+            )
+            .track_focus(&self.inbox_list_focus)
+            // Up and Down move the pick while the list has the keys; the reader follows.
+            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _, cx| {
+                match e.keystroke.key.as_str() {
+                    "up" => this.move_pick(false, cx),
+                    "down" => this.move_pick(true, cx),
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .children(drawn.items.iter().map(|slot| {
+                if let Some(at) = items.iter().position(|i| &i.slot == slot) {
+                    return self.list_row(items[at], at, reading == Some(slot), t, cx);
+                }
+                let (name, word) = self.left_item(&drawn, slot);
+                crate::column::left_row(format!("inbox-row-{}", slot_name(slot)), name, word, t)
+            }));
+        let rows = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .children(count.map(|n| {
+                div()
+                    .id("inbox-count")
+                    .debug_selector(|| "inbox-count".to_string())
+                    .px(px(8.))
+                    .pb(px(6.))
+                    .text_size(px(12.5))
+                    .text_color(c(t.t2))
+                    .child(n)
+            }))
+            .when(!self.listed, |d| d.children((0..3).map(|n| skeleton(n, t))))
+            .when_some(
+                state::loading_line(&self.model.spaces, &self.model.rows),
+                |d, line| {
+                    d.child(
+                        div()
+                            .id("loading-line")
+                            .role(Role::Status)
+                            .aria_label(line.clone())
+                            .px(px(8.))
+                            .text_size(px(12.5))
+                            .text_color(c(t.t2))
+                            .child(line),
+                    )
+                },
+            )
+            .when(self.listed && items.is_empty(), |d| {
+                if first_run || self.inbox_filter != Filter::All {
+                    d.child(self.inbox_empty(first_run, t, cx))
+                } else {
+                    d.child(
+                        div()
+                            .id("inbox-none")
+                            .debug_selector(|| "inbox-none".to_string())
+                            .role(Role::Status)
+                            .px(px(8.))
+                            .py(px(6.))
+                            .text_size(px(13.))
+                            .text_color(c(t.t2))
+                            .child("Nothing waits on you."),
+                    )
+                }
+            })
+            .child(listbox)
+            .when(fresh > 0, |d| {
+                d.child(
+                    div()
+                        .id("inbox-new")
+                        .debug_selector(|| "inbox-new".to_string())
+                        .role(Role::Status)
+                        .px(px(8.))
+                        .py(px(6.))
+                        .text_size(px(12.))
+                        .text_color(c(t.t2))
+                        .child(format!("{fresh} new, shown when you move away")),
+                )
+            });
+        let others = drawn.others.iter().map(|&o| {
+            if live.others.contains(&o) {
+                return self.other_row(o, t, cx);
+            }
+            let title = drawn
+                .titles
+                .get(&o)
+                .cloned()
+                .unwrap_or_else(|| format!("tab {o}"));
+            crate::column::left_row(
+                format!("inbox-other-{o}"),
+                title,
+                self.left_word(entry(o)),
+                t,
+            )
+        });
+        let others: Vec<AnyElement> = others.collect();
+        let rest = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .pb(px(20.))
+            .when(!others.is_empty(), |d| {
+                d.child(
+                    div()
+                        .px(px(8.))
+                        .pt(px(14.))
+                        .pb(px(4.))
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Not waiting on you"),
+                )
+                .child(
+                    div()
+                        .id("inbox-others")
+                        .role(Role::List)
+                        .aria_label("Not waiting on you")
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .children(others),
+                )
+            })
+            // The quiet lists belong to the whole Inbox: a filter hides them.
+            .when(self.inbox_filter == Filter::All && !first_run, |d| {
+                d.child(div().px(px(8.)).child(self.quiet_sections(&quiet, t, cx)))
+            });
+        (rows.into_any_element(), rest.into_any_element())
+    }
+
+    /// One item of the list: its agent's logo and mark, the question, its space and title,
+    /// whose it is ("Needs you", "From qass", "Failed") and how long it has waited. A click
+    /// puts its card in the reader.
+    fn list_row(
+        &self,
+        item: &Item,
+        at: usize,
+        picked: bool,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let row = item.terminal.and_then(|t| self.model.row(t));
+        let question = self.item_question(item);
+        let space = row.and_then(|r| self.model.space(r.workspace));
+        let title = row.map_or_else(|| "qass".to_string(), state::title_of);
+        let (whose, ink, kind) = match item.kind {
+            ItemKind::Failed => (
+                "Failed",
+                t.fail_text,
+                Kind::Status(qoop_domain::status::Status::Failed),
+            ),
+            kind if kind.from_qass() => (
+                "From qass",
+                t.needs_text,
+                Kind::Status(qoop_domain::status::Status::Blocked),
+            ),
+            _ => (
+                "Needs you",
+                t.needs_text,
+                Kind::Status(qoop_domain::status::Status::Blocked),
+            ),
+        };
+        let ago = item.since.map(|at| self.now.saturating_sub(at).max(0));
+        let who = match space {
+            Some(w) => format!("{} {title}", state::short_space(w)),
+            None => title.clone(),
+        };
+        let label = match ago {
+            Some(secs) => format!(
+                "{who} asks: {question}, {}, {}",
+                whose.to_lowercase(),
+                state::spoken_span(secs)
+            ),
+            None => format!("{who} asks: {question}, {}", whose.to_lowercase()),
+        };
+        let slot = item.slot.clone();
+        let key = slot_name(&slot);
+        let selector = format!("inbox-row-{key}");
+        ui::control(
+            gpui::ElementId::from(selector.clone()),
+            Role::ListBoxOption,
+            label,
+            t,
+        )
+        .debug_selector(move || selector)
+        // One stop for the list; Up and Down walk its rows.
+        .tab_stop(false)
+        .aria_selected(picked)
+        // The list box has the keys, its picked row is what a screen reader says.
+        .when(picked, |d| d.aria_active_descendant())
+        .flex()
+        .items_start()
+        .gap(px(10.))
+        .px(px(8.))
+        .py(px(8.))
+        .rounded(px(10.))
+        .when(picked, |d| ui::current(d, t))
+        .hover(|s| ui::paint(s, t.hover()))
+        .child(div().pt(px(2.)).child(ui::avatar(
+            row.and_then(|r| r.program.as_deref()).or(Some("qass")),
+            kind,
+            24.,
+            false,
+            t,
+        )))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(
+                    div()
+                        .whitespace_normal()
+                        .text_size(px(13.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(c(t.ink))
+                        .child(question),
+                )
+                .child({
+                    let text = match space {
+                        Some(w) => {
+                            let tag = state::short_space(w);
+                            gpui::StyledText::new(format!("{tag} {title}")).with_highlights([(
+                                0..tag.len(),
+                                gpui::HighlightStyle {
+                                    color: Some(t.space(state::space_slot(w))),
+                                    font_weight: Some(FontWeight::SEMIBOLD),
+                                    ..Default::default()
+                                },
+                            )])
+                        }
+                        None => gpui::StyledText::new(title),
+                    };
+                    div()
+                        .whitespace_normal()
+                        .text_size(px(12.5))
+                        .text_color(c(t.t1))
+                        .child(text)
+                })
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.))
+                        .text_size(px(12.))
+                        .child(div().text_color(c(ink)).child(whose))
+                        .children(
+                            ago.map(|secs| {
+                                div().text_color(c(t.t2)).child(state::short_span(secs))
+                            }),
+                        ),
+                ),
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.set_cursor(slot.clone(), at);
+            cx.notify();
+        }))
+        .into_any_element()
+    }
+
+    /// An agent under "Not waiting on you": its logo and mark, its space and title, its state;
+    /// it opens the agent's page. One that left while held stays, dimmed.
+    fn other_row(&self, terminal: u32, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let agents = self.model.agents();
+        let Some(entry) = agents.iter().find(|e| e.terminal() == terminal).copied() else {
+            return div()
+                .debug_selector(move || format!("inbox-other-{terminal}"))
+                .px(px(8.))
+                .py(px(6.))
+                .text_size(px(13.))
+                .text_color(c(t.t2))
+                .child("Closed")
+                .into_any_element();
+        };
+        let kind = self.shown_kind(entry);
+        let space = self.model.space(entry.workspace());
+        let words = match entry {
+            state::Entry::Live(r) => self.shown_word(r),
+            state::Entry::Asleep(..) => kind.word().to_string(),
+        };
+        ui::control(
+            ("inbox-other", u64::from(terminal)),
+            Role::Link,
+            self.model.row_label(entry, self.now),
+            t,
+        )
+        .debug_selector(move || format!("inbox-other-{terminal}"))
+        .flex()
+        .items_start()
+        .gap(px(10.))
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(10.))
+        .hover(|s| ui::paint(s, t.hover()))
+        .child(ui::avatar(entry.program(), kind, 24., false, t))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .whitespace_normal()
+                        .text_size(px(13.))
+                        .child(match space {
+                            Some(w) => format!("{} {}", state::short_space(w), entry.title()),
+                            None => entry.title(),
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(c(ui::word_ink(kind, t)))
+                        .child(words),
+                ),
+        )
+        .on_click(
+            cx.listener(move |this, _, window, cx| this.open(Page::Session(terminal), window, cx)),
+        )
+        .into_any_element()
+    }
+
+    /// The reader: the picked item's card whole, and what `⌘J` goes to next; while loading,
+    /// a line saying so; with nothing to answer, that.
+    fn reader(
+        &self,
+        items: &[&Item],
+        cursor: Option<usize>,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let quiet = |id: &'static str, text: &str| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .role(Role::Status)
+                .aria_label(text.to_string())
+                .py(px(10.))
+                .text_size(px(13.5))
+                .text_color(c(t.t2))
+                .child(text.to_string())
+                .into_any_element()
+        };
+        let body = match cursor {
+            _ if !self.listed => quiet("inbox-reader-loading", "Loading"),
+            None => quiet("inbox-reader-empty", "Nothing to answer."),
+            Some(at) => {
+                let next = (items.len() > 1).then(|| items[(at + 1) % items.len()]);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .child(self.item_card(items[at], at, true, t, cx))
+                    .when_some(next, |d, next| {
+                        let who = next
+                            .terminal
+                            .and_then(|t| self.model.row(t))
+                            .map_or_else(|| "qass".to_string(), |r| self.who_text(r));
+                        d.child(
+                            div()
+                                .id("inbox-next")
+                                .debug_selector(|| "inbox-next".to_string())
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_size(px(12.5))
+                                .text_color(c(t.t2))
+                                .child(ui::kbd("\u{2318}J", t))
+                                .child(format!("next: {who}")),
+                        )
+                    })
+                    .into_any_element()
+            }
+        };
+        div()
+            .id("inbox-reader")
+            .debug_selector(|| "inbox-reader".to_string())
+            .px(px(14.))
+            .pb(px(20.))
+            .max_w(px(900.))
+            .child(body)
             .into_any_element()
     }
 
@@ -529,6 +1262,7 @@ impl Desk {
             .child(div().text_size(px(13.)).text_color(c(t.t2)).child(line))
             .child(
                 ui::pill("empty-new", "New agent", t)
+                    .debug_selector(|| "empty-new".to_string())
                     .child(ui::icon(Icon::Plus, 14., c(t.t1)))
                     .child("New agent")
                     .on_click(cx.listener(|this, _, window, cx| this.new_work(None, window, cx))),
