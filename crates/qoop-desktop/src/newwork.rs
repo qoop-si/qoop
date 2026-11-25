@@ -57,11 +57,17 @@ impl Desk {
     fn current_space(&self) -> Option<i64> {
         match self.page {
             Page::Session(t) => self.model.row(t).map(|r| r.workspace),
-            Page::Computer(m) => self
-                .spaces_for_work()
-                .into_iter()
-                .find(|w| state::machine_of(w.id) == m)
-                .map(|w| w.id),
+            Page::Computer(m) => {
+                let of_it = || {
+                    self.spaces_for_work()
+                        .into_iter()
+                        .filter(move |w| state::machine_of(w.id) == m)
+                };
+                of_it()
+                    .find(|w| !state::empty_default(w))
+                    .or_else(|| of_it().next())
+                    .map(|w| w.id)
+            }
             _ => None,
         }
     }
@@ -103,6 +109,7 @@ impl Desk {
         let (space, moved) = state::work_space(
             &self.model.spaces,
             space.or_else(|| self.current_space()),
+            self.worked_in,
             &|m| self.computer_lost(m),
         );
         window.focus(&field_focus, cx);

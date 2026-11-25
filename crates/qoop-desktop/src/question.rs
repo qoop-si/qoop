@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use gpui::{AnyElement, Context, Entity, FontWeight, Role, Window, div, prelude::*, px};
 use qoop_runtime::control::{
-    AgentRow, AskInfo, AskOp, ControlRequest, ControlResponse, Hand, TerminalStream,
+    AgentRow, AskCard, AskInfo, AskOp, ControlRequest, ControlResponse, Hand, TerminalStream,
 };
 
 use crate::app::{Desk, Page};
@@ -1263,15 +1263,13 @@ impl Desk {
                 ),
             })
             // What qass made of this one, and where else it is open.
-            .when_some(self.qass_view(row), |d, line| {
-                d.child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(c(t.t2))
-                        .whitespace_normal()
-                        .child(line),
-                )
-            })
+            .children(self.qass_lines(row).into_iter().map(|line| {
+                div()
+                    .text_size(px(12.))
+                    .text_color(c(t.t2))
+                    .whitespace_normal()
+                    .child(line)
+            }))
             .when(row.clients.iter().any(|c| c == "phone"), |d| {
                 d.child(
                     div()
@@ -1290,27 +1288,32 @@ impl Desk {
             .into_any_element()
     }
 
-    /// qass's own look at this question, when it wrote a card for it: why it asks, and which
-    /// option it would pick.
-    fn qass_view(&self, row: &AgentRow) -> Option<String> {
-        let card = self
-            .asks
+    /// qass's own look at this question, when it wrote a card for it: why it asks, then, on a
+    /// line of its own, which option it would pick. Two lines, never one run-on sentence: the
+    /// why is the agent's or qass's text and is shown as it is.
+    fn qass_lines(&self, row: &AgentRow) -> Vec<String> {
+        self.asks
             .iter()
-            .find(|a| a.terminal == Some(row.terminal) && a.status == "open")?;
-        let pick = card.body.pick.as_ref().map(|p| {
-            let n = card
-                .body
-                .options
-                .iter()
-                .position(|o| o.key == p.key)
-                .map_or_else(|| p.key.clone(), |i| (i + 1).to_string());
-            format!("qass would pick {n}: {}", p.reason)
-        });
-        Some(match pick {
-            Some(pick) => format!("{} {pick}", card.body.why),
-            None => card.body.why.clone(),
-        })
+            .find(|a| a.terminal == Some(row.terminal) && a.status == "open")
+            .map(|card| qass_lines_of(&card.body))
+            .unwrap_or_default()
     }
+}
+
+/// The lines of qass's view of one card: its why, then its pick.
+pub(crate) fn qass_lines_of(body: &AskCard) -> Vec<String> {
+    let pick = body.pick.as_ref().map(|p| {
+        let n = body
+            .options
+            .iter()
+            .position(|o| o.key == p.key)
+            .map_or_else(|| p.key.clone(), |i| (i + 1).to_string());
+        format!("qass would pick {n}: {}", p.reason)
+    });
+    [Some(body.why.clone()), pick]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// A number for a pick's controls: the terminal for an agent, a hash of the card's id (above
@@ -1335,5 +1338,34 @@ fn by_word(kind: &str) -> &str {
         "browser" => "browser",
         "attach" => "terminal",
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// qass's why and its pick are two lines, never one run-on sentence, and the why is the
+    /// text as it came (no full stop added).
+    #[test]
+    fn qass_view_keeps_the_why_and_the_pick_on_their_own_lines() {
+        let body: AskCard = serde_json::from_value(serde_json::json!({
+            "handle": "billing", "urgency": "now", "doing": "wrote migration 0042",
+            "why": "The migration drops a column, which cannot be undone",
+            "asks": "Run it?",
+            "options": [
+                {"key": "a", "label": "Run it", "reason": "r", "words": "run it"},
+                {"key": "b", "label": "Wait", "reason": "r", "words": "wait"},
+            ],
+            "pick": {"key": "b", "reason": "A snapshot first makes the drop reversible"},
+        }))
+        .expect("card");
+        assert_eq!(
+            qass_lines_of(&body),
+            [
+                "The migration drops a column, which cannot be undone",
+                "qass would pick 2: A snapshot first makes the drop reversible",
+            ]
+        );
     }
 }
