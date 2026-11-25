@@ -377,19 +377,36 @@ pub(crate) fn write(row: &Row, value: &str) -> Result<(), String> {
     }
 }
 
+/// Set by a page drawn inside a qoop pane (the board page): it draws for the background the
+/// pane answered before the theme the file names. The desktop draws every terminal on one
+/// dark card in both themes, so `theme = light` there would put light inks on a dark ground.
+static IN_PANE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process is a page that draws in a pane: [`apply_theme`] takes the pane's answered
+/// background first from now on.
+pub(crate) fn draw_in_pane() {
+    IN_PANE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Draw for the background the config asks for; `auto` takes what the terminal answered
-/// (`page::ground_light`), then `COLORFGBG`, else dark, as the interface does.
+/// (`page::ground_light`), then `COLORFGBG`, else dark, as the interface does. A page in a
+/// pane ([`draw_in_pane`]) takes the answer before the file.
 pub(crate) fn apply_theme() {
     let colorfgbg = std::env::var("COLORFGBG").ok();
     theme::set_light(light_for(
         config::read().config.theme,
         crate::page::ground_light(),
         colorfgbg.as_deref(),
+        IN_PANE.load(std::sync::atomic::Ordering::Relaxed),
     ));
 }
 
 /// [`apply_theme`]'s pick: the file, then the terminal's answer, then `COLORFGBG`, then dark.
-fn light_for(theme: Theme, answered: Option<bool>, colorfgbg: Option<&str>) -> bool {
+/// In a pane the answer comes first: the pane's ground is what the page is drawn on.
+fn light_for(theme: Theme, answered: Option<bool>, colorfgbg: Option<&str>, pane: bool) -> bool {
+    if pane && let Some(light) = answered {
+        return light;
+    }
     match theme {
         Theme::Light => true,
         Theme::Dark => false,
@@ -1360,14 +1377,25 @@ mod tests {
     }
 
     /// `auto` takes the terminal's answer over `COLORFGBG`, as the interface does: a page in
-    /// a qoop pane on a light terminal draws light. A theme the file names wins over both.
+    /// a qoop pane on a light terminal draws light. A theme the file names wins over both on
+    /// every page that is not drawn in a pane (`qoop settings`, onboarding, the qass page).
     #[test]
     fn auto_draws_for_the_background_the_terminal_answered() {
-        assert!(light_for(Theme::Auto, Some(true), Some("15;0")));
-        assert!(!light_for(Theme::Auto, Some(false), Some("0;15")));
-        assert!(light_for(Theme::Auto, None, Some("0;15")));
-        assert!(!light_for(Theme::Auto, None, None));
-        assert!(!light_for(Theme::Dark, Some(true), None));
-        assert!(light_for(Theme::Light, Some(false), None));
+        assert!(light_for(Theme::Auto, Some(true), Some("15;0"), false));
+        assert!(!light_for(Theme::Auto, Some(false), Some("0;15"), false));
+        assert!(light_for(Theme::Auto, None, Some("0;15"), false));
+        assert!(!light_for(Theme::Auto, None, None, false));
+        assert!(!light_for(Theme::Dark, Some(true), None, false));
+        assert!(light_for(Theme::Light, Some(false), None, false));
+    }
+
+    /// The board page in a desktop pane: the file says light, the pane answered dark (the
+    /// desktop's terminal card), so it draws dark. No answer yet, the file still decides.
+    #[test]
+    fn a_page_in_a_pane_draws_for_the_panes_ground_before_the_file() {
+        assert!(!light_for(Theme::Light, Some(false), None, true));
+        assert!(light_for(Theme::Dark, Some(true), None, true));
+        assert!(light_for(Theme::Light, None, Some("15;0"), true));
+        assert!(!light_for(Theme::Dark, None, None, true));
     }
 }
