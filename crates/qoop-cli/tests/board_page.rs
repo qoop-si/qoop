@@ -287,3 +287,81 @@ fn a_start_waits_while_qass_waits_on_the_owner_and_then_reaches_it() {
     });
     assert!(board().contains("\"doing\""), "{}", board());
 }
+
+/// qass's agent ends (its pane stays, a shell at its prompt) and `qoop qass` starts qass again
+/// in a new tab: the board that was beside the old qass moves to the new one, and the space
+/// never has two board panes.
+#[test]
+fn qass_started_again_after_its_agent_ended_has_one_board() {
+    let dir = tempfile::tempdir().unwrap();
+    let die = dir.path().join("die");
+    let daemon = Daemon::start_with(
+        dir.path(),
+        &format!(
+            "while [ ! -f '{die}' ]; do sleep 0.2; done\n",
+            die = die.display()
+        ),
+    );
+    let start = || -> u32 {
+        let (ok, out, err) = daemon.run(&["qass"]);
+        assert!(ok, "qoop qass: {out} {err}");
+        assert!(!err.contains("board did not open"), "{err}");
+        out.split_whitespace()
+            .skip_while(|w| *w != "terminal")
+            .nth(1)
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no terminal in {out:?}"))
+    };
+    let boards = || -> Vec<u32> {
+        let (rows, _) = daemon.index();
+        rows.iter()
+            .filter(|r| r.name.as_deref() == Some("board"))
+            .map(|r| r.terminal)
+            .collect()
+    };
+    let first = start();
+    let agent = |t: u32| {
+        daemon
+            .index()
+            .0
+            .into_iter()
+            .find(|r| r.terminal == t)
+            .is_some_and(|r| r.agent)
+    };
+    daemon.until("qass an agent", &|| format!("{:?}", daemon.index()), || {
+        agent(first)
+    });
+    daemon.until("one board", &|| format!("{:?}", daemon.index()), || {
+        boards().len() == 1
+    });
+
+    // qass's agent ends; its pane stays.
+    std::fs::write(&die, "").unwrap();
+    daemon.until(
+        "qass's agent ended",
+        &|| format!("{:?}", daemon.index()),
+        || !agent(first),
+    );
+    std::fs::remove_file(&die).unwrap();
+    // The first start's claim outlives a minute; a restart a minute later finds it stale.
+    let _ = std::fs::remove_file(dir.path().join("d/qoop/qass/starting"));
+
+    let second = start();
+    assert_ne!(first, second, "a new qass tab");
+    daemon.until(
+        "qass an agent again",
+        &|| format!("{:?}", daemon.index()),
+        || agent(second),
+    );
+    let (rows, splits) = daemon.index();
+    assert_eq!(
+        boards().len(),
+        1,
+        "one board in qass's space: {rows:?} {splits:?}"
+    );
+    let tab = splits.iter().find(|t| t.leaves().contains(&second));
+    assert!(
+        tab.is_some_and(|t| t.leaves().contains(&boards()[0])),
+        "the board is beside the new qass: {splits:?}"
+    );
+}

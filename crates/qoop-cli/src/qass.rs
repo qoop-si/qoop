@@ -1003,7 +1003,7 @@ pub(crate) fn send(terminal: u64, text: &str) -> std::io::Result<()> {
 /// page as a new item.
 fn show_board(qass: u64, folder: &Path) -> std::io::Result<()> {
     use qoop_runtime::control::{ControlRequest, ControlResponse, Pane, SplitDir};
-    use qoop_runtime::idle::{BOARD_PANE, has_board, lone_board};
+    use qoop_runtime::idle::{BOARD_PANE, has_board, left_board};
 
     let qass = u32::try_from(qass).map_err(std::io::Error::other)?;
     let patience = std::time::Duration::from_secs(10);
@@ -1018,7 +1018,7 @@ fn show_board(qass: u64, folder: &Path) -> std::io::Result<()> {
             "unexpected answer to the agent listing",
         ));
     };
-    let left = lone_board(&agents, &splits, qass);
+    let left = left_board(&agents, &splits, qass);
     let tree = splits.into_iter().find(|t| t.leaves().contains(&qass));
     let panes = tree.as_ref().map(|t| t.leaves()).unwrap_or_default();
     if has_board(agents.iter().filter(|r| panes.contains(&r.terminal)), qass) {
