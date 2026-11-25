@@ -1,6 +1,6 @@
-//! The rail: qass's folded panes share ONE column at the left of the pane area instead of a thin
-//! strip each. A tab row per folded pane (board, questions, qass, in screen order), a rule, then
-//! what waits for the owner, and a cap rule on the last row.
+//! The rail: qass's folded panes share ONE column at the left of a stacked qass tab instead of a
+//! thin strip each. A tab row per folded pane (board, questions, schedules, qass, in screen
+//! order), a rule, then what waits for the owner, and a cap rule on the last row.
 //!
 //! A tab's text follows a fixed ladder by the width it gets, and never wraps or cuts a word:
 //! word and state, word and count, word, code and count, code, dot and count, dot. A questions
@@ -28,6 +28,8 @@ const PREVIEW_MIN: usize = 12;
 pub enum Pane {
     Board,
     Questions,
+    /// The schedules, drawn over the open pane's tile while they are on show.
+    Schedules,
     Qass,
 }
 
@@ -36,6 +38,7 @@ impl Pane {
         match self {
             Pane::Board => "board",
             Pane::Questions => "questions",
+            Pane::Schedules => "schedules",
             Pane::Qass => "qass",
         }
     }
@@ -45,6 +48,7 @@ impl Pane {
             Pane::Board => "brd",
             // Never shown: the questions keep their word.
             Pane::Questions => "questions",
+            Pane::Schedules => "sch",
             Pane::Qass => "qss",
         }
     }

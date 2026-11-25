@@ -67,21 +67,18 @@ pub const QASS_MIN_COLS: usize = 40;
 /// The board's share of qass's tab when it is shown the other way from how it was saved.
 const BOARD_RATIO_V: f32 = 0.70;
 const BOARD_RATIO_H: f32 = 0.50;
-/// The questions column between the board and qass: the edge column the board's frame keeps,
-/// then the inbox at the width it is built for.
+/// The questions column beside the open pane of a folded stacked tab: the edge column the pane's
+/// frame keeps, then the inbox at the width it is built for.
 pub const QUESTIONS_GAP: usize = 1 + INBOX_WIDTH.0;
-/// The most the questions column grows to when the board has room to spare, so a card reads whole.
+/// The most the questions column grows to when the pane has room to spare, so a card reads whole.
 const QUESTIONS_WIDE: usize = 60;
 
-/// The edge column and the questions at their default, given the `room` over the board's minimum
-/// (at least `QUESTIONS_GAP`): the default width, and half of the room beyond it up to `QUESTIONS_WIDE`.
+/// The edge column and the questions at their default, given the `room` over the open pane's
+/// minimum (at least `QUESTIONS_GAP`): the default width, and half of the room beyond it up to
+/// `QUESTIONS_WIDE`.
 fn default_gap(room: usize) -> usize {
     (QUESTIONS_GAP + (room - QUESTIONS_GAP) / 2).min(QUESTIONS_WIDE + 1)
 }
-/// The narrowest the questions column is dragged to, so a card still reads.
-pub const QUESTIONS_MIN: usize = 24;
-/// The columns the keys widen or narrow it by.
-pub const QUESTIONS_STEP: usize = 4;
 
 /// The most columns the rail's tabs may have in a pane `cols` wide: what is left once the board keeps
 /// its minimum (the rail comes off the board; a pane too narrow for both side by side is stacked).
@@ -104,18 +101,9 @@ pub fn board_default(dir: Dir, board_first: bool) -> f32 {
 /// share, whichever pane that is) when the saved direction is the one shown, else that
 /// direction's own. `rail` is the columns the rail may take off the first pane (the board when
 /// it is first), always charged here, shown or not, so a card arriving never turns the tab over.
-/// The columns cut from the board for the questions: none while they are folded (their tab is on
-/// the rail); with `questions` the open column while the board keeps its minimum after it: the
-/// default width, or the one the owner dragged them to (`width`), which gives way to what the
-/// board needs before the column falls back to the rail.
-pub fn board_shape(
-    cols: usize,
-    saved: (Dir, f32),
-    questions: bool,
-    width: Option<usize>,
-    board_first: bool,
-    rail: usize,
-) -> (Dir, f32, usize) {
+/// A pane wide enough for side by side draws the right column instead ([`column_fits`]), so this
+/// shape is the stacked tab's, the zoomed one's and a pane too short for qass's header.
+pub fn board_shape(cols: usize, saved: (Dir, f32), board_first: bool, rail: usize) -> (Dir, f32) {
     let ratio = |dir: Dir| match saved.0 == dir {
         true => saved.1,
         false => board_default(dir, board_first),
@@ -128,40 +116,9 @@ pub fn board_shape(
     let board = if board_first { first } else { total - first };
     // The rail comes off the board, on whichever side it is.
     if board < BOARD_MIN_COLS + rail || total - board < QASS_MIN_COLS {
-        return (Dir::H, ratio(Dir::H), 0);
+        return (Dir::H, ratio(Dir::H));
     }
-    // Beside the board the questions leave no rail (it shows only while a pane is folded, and
-    // `fold_gap` weighs that case), so the board's room for them is what is over its minimum.
-    let room = board - BOARD_MIN_COLS;
-    let gap = match (questions, width) {
-        (false, _) => 0,
-        (true, None) if room >= QUESTIONS_GAP => default_gap(room),
-        (true, None) => 0,
-        (true, Some(width)) => {
-            let gap = (width + 1).min(room);
-            if gap > QUESTIONS_MIN { gap } else { 0 }
-        }
-    };
-    (Dir::V, ratio(Dir::V), gap)
-}
-
-/// The questions width (without their edge column) a drag or a key asks for, `gap` being the edge
-/// column and the questions, in a board pane `pane_cols` wide before the cut. `None` when the
-/// questions would be under their minimum or the board under its own.
-pub fn questions_width(gap: usize, pane_cols: usize) -> Option<usize> {
-    let width = gap.checked_sub(1)?;
-    (width >= QUESTIONS_MIN && pane_cols.checked_sub(gap)? >= BOARD_MIN_COLS).then_some(width)
-}
-
-/// The handle on the questions' edge, a thin line over the middle half of it.
-pub fn edge_handle(x: usize, y: usize, rows: usize) -> Option<Handle> {
-    let len = rows / 2;
-    (len >= 2).then_some(Handle {
-        x,
-        y: y + (rows - len) / 2,
-        len,
-        vertical: true,
-    })
+    (Dir::V, ratio(Dir::V))
 }
 
 /// The handle on the divider between the board and qass: a thin line over the middle half of
@@ -242,6 +199,222 @@ pub fn fold_gap(open_cols: usize, board_open: bool, questions: bool) -> usize {
     }
 }
 
+/// The tabs of qass's right column, in their order on the column's head.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColumnTab {
+    #[default]
+    Board,
+    Questions,
+    Schedules,
+}
+
+impl ColumnTab {
+    pub const ALL: [ColumnTab; 3] = [ColumnTab::Board, ColumnTab::Questions, ColumnTab::Schedules];
+
+    fn word(self) -> &'static str {
+        match self {
+            ColumnTab::Board => "board",
+            ColumnTab::Questions => "questions",
+            ColumnTab::Schedules => "schedules",
+        }
+    }
+
+    /// The tab after this one, the last going round to the first.
+    pub fn next(self) -> ColumnTab {
+        match self {
+            ColumnTab::Board => ColumnTab::Questions,
+            ColumnTab::Questions => ColumnTab::Schedules,
+            ColumnTab::Schedules => ColumnTab::Board,
+        }
+    }
+}
+
+/// The open column's share of the split's columns while nobody dragged its border (the T3
+/// design gives it 52 of 125).
+const COLUMN_SHARE: f32 = 0.42;
+/// The columns the closed column keeps at the right of qass's tab: a blank after qass's frame
+/// and the strip's two cells; the pane's own margin follows them.
+pub const STRIP: usize = 3;
+
+/// Whether qass's tab in a pane `cols` wide draws the right column: the board at its minimum
+/// beside qass at its own, inside the split's frame and divider. Narrower, the tab stacks as
+/// before.
+pub fn column_fits(cols: usize) -> bool {
+    cols.saturating_sub(3) >= BOARD_MIN_COLS + QASS_MIN_COLS
+}
+
+/// The open column's columns out of `total` (the split's, less its divider): `dragged` when
+/// its border was dragged this session, else its share, kept so the board and qass both keep
+/// their minimum.
+pub fn column_cols(total: usize, dragged: Option<usize>) -> usize {
+    let share = (total as f32 * COLUMN_SHARE).round() as usize;
+    let most = total.saturating_sub(QASS_MIN_COLS).max(BOARD_MIN_COLS);
+    dragged.unwrap_or(share).clamp(BOARD_MIN_COLS, most)
+}
+
+/// qass's right column as it is drawn: open, the board's tile with its frame line around it,
+/// the tab on show and the three counts on its head; closed, the strip at the tab's right edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Column {
+    /// Pane cells: the column with its frame when open, the strip's two cells when closed.
+    pub rect: Rect,
+    pub open: bool,
+    pub tab: ColumnTab,
+    /// The board's items to do (`None` until the board is read), the questions waiting and the
+    /// schedules on, in the tabs' order.
+    pub counts: [Option<usize>; 3],
+}
+
+/// What a press on the column does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnHit {
+    /// Show this tab, opening the column when it is closed.
+    Show(ColumnTab),
+    /// The closed strip anywhere but a count: open the column on the tab it last showed.
+    Open,
+    /// `»` on the open column's head.
+    Close,
+}
+
+/// A count as the column writes it: nothing past 99.
+fn count_text(n: usize) -> String {
+    if n > 99 {
+        "99+".to_string()
+    } else {
+        n.to_string()
+    }
+}
+
+impl Column {
+    /// Where the schedules are drawn: over the open column, frame and all, on their tab.
+    pub fn clock(&self) -> Option<Clock> {
+        (self.open && self.tab == ColumnTab::Schedules).then_some(Clock {
+            rect: self.rect,
+            under: false,
+        })
+    }
+
+    /// A tab's ink on the head and the strip: the questions in the waiting ink while one waits,
+    /// the schedules in the working one while one is on, the rest quiet.
+    fn ink_of(&self, tab: ColumnTab) -> Role {
+        let n = self.counts[tab as usize].unwrap_or(0);
+        match tab {
+            ColumnTab::Questions if n > 0 => Role::Blocked,
+            ColumnTab::Schedules if n > 0 => Role::Working,
+            _ => Role::FaintText,
+        }
+    }
+
+    /// The pieces of the open column's head, written over its top edge between the corners,
+    /// each with what a press on it does: the tabs, the shown one bold in the tab bar's ink,
+    /// then the rule, and `»` that closes the column.
+    fn head_pieces(&self) -> Vec<(String, Option<Role>, Option<ColumnHit>)> {
+        let w = self.rect.cols.saturating_sub(2);
+        let mut out: Vec<(String, Option<Role>, Option<ColumnHit>)> =
+            vec![("\u{2500}".to_string(), Some(Role::Rule), None)];
+        for (i, tab) in ColumnTab::ALL.into_iter().enumerate() {
+            if i > 0 {
+                out.push(("\u{2502}".to_string(), Some(Role::Rule), None));
+            }
+            let text = match self.counts[i] {
+                Some(n) => format!(" {} {} ", tab.word(), count_text(n)),
+                None => format!(" {} ", tab.word()),
+            };
+            // `None` is the shown tab: the tab bar's own focus, bold in monochrome too.
+            let role = (tab != self.tab).then(|| self.ink_of(tab));
+            out.push((text, role, Some(ColumnHit::Show(tab))));
+        }
+        let close = " \u{00bb} ";
+        let used: usize = out.iter().map(|(t, _, _)| width::width(t)).sum();
+        let fill = w.saturating_sub(used + width::width(close) + 1);
+        out.push(("\u{2500}".repeat(fill), Some(Role::Rule), None));
+        out.push((
+            close.to_string(),
+            Some(Role::FaintText),
+            Some(ColumnHit::Close),
+        ));
+        out.push(("\u{2500}".to_string(), Some(Role::Rule), None));
+        out
+    }
+
+    /// The open column's head, exactly `rect.cols - 2` cells, painted from the cell after the
+    /// top left corner.
+    pub fn head(&self, fade: bool) -> String {
+        let w = self.rect.cols.saturating_sub(2);
+        let mut out = String::new();
+        let mut used = 0;
+        for (text, role, _) in self.head_pieces() {
+            let text = width::fit(&text, width::width(&text).min(w - used));
+            used += width::width(&text);
+            out.push_str(&match role {
+                _ if fade => ink(Role::Unobserved, true),
+                Some(role) => ink(role, false),
+                None => theme::tab_on(),
+            });
+            out.push_str(&text);
+            out.push_str(theme::RESET);
+        }
+        out.push_str(&" ".repeat(w - used));
+        out
+    }
+
+    /// The closed strip's rows, each its two cells: `«` on the first, then a blank, then the
+    /// three tabs in their order, each its letter (the first of its word on the head) and its
+    /// count, so a count is never told apart by its colour or its place alone. Two cells hold
+    /// one digit after the letter: more is a plus, the open head says how many; a count not
+    /// read yet is the letter alone.
+    pub fn strip(&self, fade: bool) -> Vec<String> {
+        let quiet = ink(Role::FaintText, fade);
+        let mut out = vec![format!("{quiet} \u{00ab}{}", theme::RESET)];
+        out.push("  ".to_string());
+        for (i, tab) in ColumnTab::ALL.into_iter().enumerate() {
+            let count = match self.counts[i] {
+                Some(n) if n > 9 => "+".to_string(),
+                Some(n) => n.to_string(),
+                None => " ".to_string(),
+            };
+            let role = self.ink_of(tab);
+            let bold = if role == Role::Blocked && !fade {
+                "\x1b[1m"
+            } else {
+                ""
+            };
+            out.push(format!(
+                "{quiet}{}{}{bold}{count}{}",
+                &tab.word()[..1],
+                ink(role, fade),
+                theme::RESET
+            ));
+        }
+        out.truncate(self.rect.rows);
+        out
+    }
+
+    /// What a press at pane cell (`x`, `y`) does, when it is on the column's head or strip.
+    pub fn hit(&self, x: usize, y: usize) -> Option<ColumnHit> {
+        let r = self.rect;
+        if !self.open {
+            let inside = x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows;
+            return inside.then(|| match y - r.y {
+                at @ 2..=4 => ColumnHit::Show(ColumnTab::ALL[at - 2]),
+                _ => ColumnHit::Open,
+            });
+        }
+        if y != r.y || x <= r.x {
+            return None;
+        }
+        let mut at = r.x + 1;
+        for (text, _, hit) in self.head_pieces() {
+            let end = at + width::width(&text);
+            if x < end {
+                return hit;
+            }
+            at = end;
+        }
+        None
+    }
+}
+
 /// The file the watcher touches each time it tells qass an event.
 const LAST_WAKE: &str = "last-wake";
 
@@ -256,6 +429,11 @@ pub struct Ui {
     pub fold: Option<Fold>,
     /// The width the owner dragged the rail's tabs to, for this session; `None` for the default.
     pub rail: Option<usize>,
+    /// The tab the right column shows when it is open.
+    pub tab: ColumnTab,
+    /// The width the owner dragged the right column to, for this session and never saved;
+    /// `None` for its share.
+    pub column: Option<usize>,
     /// The space on screen when qass's page was last settled: entering qass's space from any
     /// other folds the board onto the rail.
     pub seen: Option<i64>,
@@ -1286,6 +1464,74 @@ mod tests {
         out
     }
 
+    /// The open column's head names its three tabs with their counts (none for a board not yet
+    /// read) and `»`, exactly as wide as the edge between the corners, and a press on each says
+    /// what it is; the closed strip is `«`, a blank and the counts, each beside its tab's letter,
+    /// a count a press on its tab, anything else of the strip a press that opens it.
+    #[test]
+    fn the_column_head_and_strip_say_what_a_press_does() {
+        let mut column = Column {
+            rect: Rect {
+                x: 10,
+                y: 2,
+                cols: 62,
+                rows: 30,
+            },
+            open: true,
+            tab: ColumnTab::Questions,
+            counts: [None, Some(1), Some(120)],
+        };
+        let head = strip(&column.head(false));
+        assert_eq!(width::width(&head), 60);
+        assert!(
+            head.starts_with("\u{2500} board \u{2502} questions 1 \u{2502} schedules 99+ \u{2500}"),
+            "{head:?}"
+        );
+        assert!(head.ends_with(" \u{bb} \u{2500}"), "{head:?}");
+        let chars: Vec<char> = head.chars().collect();
+        // The pane column a word starts at: the head starts after the corner at column 10.
+        let at = |word: &str| {
+            let w: Vec<char> = word.chars().collect();
+            11 + chars
+                .windows(w.len())
+                .position(|run| run == w.as_slice())
+                .expect(word)
+        };
+        assert_eq!(
+            column.hit(at("board"), 2),
+            Some(ColumnHit::Show(ColumnTab::Board))
+        );
+        assert_eq!(
+            column.hit(at("schedules"), 2),
+            Some(ColumnHit::Show(ColumnTab::Schedules))
+        );
+        assert_eq!(column.hit(at("\u{bb}"), 2), Some(ColumnHit::Close));
+        assert_eq!(column.hit(at("\u{bb}") - 3, 2), None, "the rule between");
+        assert_eq!(column.hit(at("board"), 3), None, "under the head");
+        column.open = false;
+        column.rect = Rect {
+            x: 120,
+            y: 1,
+            cols: 2,
+            rows: 30,
+        };
+        // Each count beside its tab's letter: the board not read yet, one question, more
+        // schedules than two cells say.
+        let rows: Vec<String> = column.strip(false).iter().map(|r| strip(r)).collect();
+        assert_eq!(rows[..5], [" \u{ab}", "  ", "b ", "q1", "s+"]);
+        column.counts = [Some(3), Some(0), Some(9)];
+        let rows: Vec<String> = column.strip(false).iter().map(|r| strip(r)).collect();
+        assert_eq!(rows[2..5], ["b3", "q0", "s9"]);
+        assert!(rows.iter().all(|r| width::width(r) == 2), "{rows:?}");
+        assert_eq!(column.hit(121, 1), Some(ColumnHit::Open));
+        assert_eq!(
+            column.hit(120, 4),
+            Some(ColumnHit::Show(ColumnTab::Questions))
+        );
+        assert_eq!(column.hit(121, 20), Some(ColumnHit::Open));
+        assert_eq!(column.hit(122, 4), None, "the pane's margin");
+    }
+
     fn facts_of(state: &str) -> Facts {
         Facts {
             terminal: 7,
@@ -1321,35 +1567,20 @@ mod tests {
         }
     }
 
+    /// The questions beside the open pane of a folded tab take their width while the pane keeps
+    /// its minimum, grow with the room up to their widest, and leave it when there is none. Was
+    /// also: the questions beside the board, never drawn now (they are the right column's tab).
     #[test]
     fn the_questions_column_grows_with_the_room_and_never_loses_its_place() {
-        let stacked = (Dir::V, 0.70);
-        assert_eq!(
-            board_shape(161, stacked, true, None, true, 0).2,
-            QUESTIONS_GAP
-        );
-        // 180 columns: the board has 63 over its minimum, the column takes half of the 14 beyond its default.
-        assert_eq!(
-            board_shape(180, stacked, true, None, true, 0).2,
-            QUESTIONS_GAP + 7
-        );
-        assert_eq!(
-            board_shape(200, stacked, true, None, true, 0).2,
-            QUESTIONS_WIDE + 1
-        );
-        assert_eq!(
-            board_shape(400, stacked, true, None, true, 0).2,
-            QUESTIONS_WIDE + 1
-        );
-        for cols in 80..=400 {
-            let (dir, _, gap) = board_shape(cols, stacked, true, None, true, 0);
-            assert!(
-                dir != Dir::V || gap == 0 || (QUESTIONS_GAP..=QUESTIONS_WIDE + 1).contains(&gap)
-            );
-        }
         assert_eq!(fold_gap(60 + QUESTIONS_GAP, true, true), QUESTIONS_GAP);
         assert_eq!(fold_gap(60 + QUESTIONS_GAP - 1, true, true), 0);
         assert_eq!(fold_gap(60 + 100, true, true), QUESTIONS_WIDE + 1);
+        // Beside qass, open with the board folded, against qass's own minimum.
+        assert_eq!(
+            fold_gap(QASS_MIN_COLS + QUESTIONS_GAP, false, true),
+            QUESTIONS_GAP
+        );
+        assert_eq!(fold_gap(200, true, false), 0, "not wanted, no gap");
     }
 
     #[test]
@@ -2093,161 +2324,55 @@ mod tests {
 
     /// qass's tab with the board goes side by side once the board keeps 60 columns and qass
     /// 40, whatever direction was saved; the saved ratio only for the direction it was saved
-    /// with; the questions column only while the board keeps 60 after it.
+    /// with. (Side by side, the tab draws the right column instead unless it is zoomed or too
+    /// short for the header.) Was also: the questions column cut from the board.
     #[test]
     fn the_board_goes_beside_qass_when_both_keep_their_minimum() {
         let stacked = (Dir::H, 0.5);
-        assert_eq!(
-            board_shape(161, stacked, false, None, true, 0),
-            (Dir::V, 0.70, 0)
-        );
-        assert_eq!(
-            board_shape(134, stacked, false, None, true, 0),
-            (Dir::V, 0.70, 0)
-        );
-        assert_eq!(
-            board_shape(133, stacked, false, None, true, 0),
-            (Dir::H, 0.5, 0)
-        );
-        assert_eq!(
-            board_shape(121, (Dir::V, 0.75), false, None, true, 0),
-            (Dir::H, 0.5, 0)
-        );
-        assert_eq!(
-            board_shape(200, (Dir::V, 0.6), false, None, true, 0),
-            (Dir::V, 0.6, 0)
-        );
-        assert_eq!(
-            board_shape(161, stacked, true, None, true, 0),
-            (Dir::V, 0.70, QUESTIONS_GAP)
-        );
-        assert_eq!(
-            board_shape(159, stacked, true, None, true, 0),
-            (Dir::V, 0.70, QUESTIONS_GAP)
-        );
-        assert_eq!(
-            board_shape(158, stacked, true, None, true, 0),
-            (Dir::V, 0.70, 0)
-        );
+        assert_eq!(board_shape(161, stacked, true, 0), (Dir::V, 0.70));
+        assert_eq!(board_shape(134, stacked, true, 0), (Dir::V, 0.70));
+        assert_eq!(board_shape(133, stacked, true, 0), (Dir::H, 0.5));
+        assert_eq!(board_shape(121, (Dir::V, 0.75), true, 0), (Dir::H, 0.5));
+        assert_eq!(board_shape(200, (Dir::V, 0.6), true, 0), (Dir::V, 0.6));
         // Qass first: the same cuts, the first pane's share is the mirror of the board's, and
         // the saved ratio is read as qass's share, never the board's.
         assert_eq!(board_default(Dir::V, true), 0.70);
         assert_eq!(board_default(Dir::V, false), 1.0 - 0.70);
-        assert_eq!(
-            board_shape(161, stacked, true, None, false, 0),
-            // The board has 51 over its minimum here: one column beyond the default is taken.
-            (Dir::V, 1.0 - 0.70, QUESTIONS_GAP + 1)
-        );
-        assert_eq!(
-            board_shape(133, stacked, false, None, false, 0),
-            (Dir::H, 0.5, 0)
-        );
-        // 0.3 of 158 is qass's 47 columns and the board's 111: a column of questions fits; the
-        // same number read as the board's share would not even fit the board.
-        assert_eq!(
-            board_shape(161, (Dir::V, 0.3), true, None, false, 0).2,
-            QUESTIONS_GAP + 1
-        );
-        assert_eq!(
-            board_shape(161, (Dir::V, 0.3), false, None, true, 0),
-            (Dir::H, 0.5, 0)
-        );
-        for cols in 80..=260 {
-            let (dir, ratio, gap) = board_shape(cols, stacked, true, None, false, 0);
-            if dir == Dir::V {
-                let total = cols - 3;
-                let qass = (total as f32 * ratio).floor() as usize;
-                assert!(
-                    total - qass - gap >= BOARD_MIN_COLS && qass >= QASS_MIN_COLS,
-                    "{cols}"
-                );
-            }
-        }
-        for cols in 80..=260 {
-            let (dir, ratio, gap) = board_shape(cols, stacked, true, None, true, 0);
-            if dir == Dir::V {
-                let total = cols - 3;
-                let board = (total as f32 * ratio).floor() as usize;
-                assert!(
-                    board - gap >= BOARD_MIN_COLS && total - board >= QASS_MIN_COLS,
-                    "{cols}"
-                );
+        assert_eq!(board_shape(161, stacked, false, 0), (Dir::V, 1.0 - 0.70));
+        assert_eq!(board_shape(133, stacked, false, 0), (Dir::H, 0.5));
+        // 0.3 of 158 is qass's 47 columns and the board's 111; the same number read as the
+        // board's share would not even fit the board.
+        assert_eq!(board_shape(161, (Dir::V, 0.3), false, 0).0, Dir::V);
+        assert_eq!(board_shape(161, (Dir::V, 0.3), true, 0), (Dir::H, 0.5));
+        for board_first in [false, true] {
+            for cols in 80..=260 {
+                let (dir, ratio) = board_shape(cols, stacked, board_first, 0);
+                if dir == Dir::V {
+                    let total = cols - 3;
+                    let first = (total as f32 * ratio).floor() as usize;
+                    let (board, qass) = match board_first {
+                        true => (first, total - first),
+                        false => (total - first, first),
+                    };
+                    assert!(board >= BOARD_MIN_COLS && qass >= QASS_MIN_COLS, "{cols}");
+                    assert!(column_fits(cols), "{cols}: side by side draws the column");
+                }
             }
         }
         // The rail's columns are charged before the board's minimum, shown or not: a board that
         // keeps its minimum only without them goes stacked, never side by side without room.
+        assert_eq!(board_shape(102, (Dir::V, 0.6), true, 0), (Dir::H, 0.5));
+        assert_eq!(board_shape(103, (Dir::V, 0.6), true, 0), (Dir::V, 0.6));
         assert_eq!(
-            board_shape(102, (Dir::V, 0.6), false, None, true, 0),
-            (Dir::H, 0.5, 0)
-        );
-        assert_eq!(
-            board_shape(103, (Dir::V, 0.6), false, None, true, 0),
-            (Dir::V, 0.6, 0)
-        );
-        assert_eq!(
-            board_shape(103, (Dir::V, 0.6), false, None, true, 16),
-            (Dir::H, 0.5, 0),
+            board_shape(103, (Dir::V, 0.6), true, 16),
+            (Dir::H, 0.5),
             "the board is first: the rail comes off it"
         );
         assert_eq!(
-            board_shape(103, (Dir::V, 0.4), false, None, false, 16),
-            (Dir::H, 0.5, 0),
+            board_shape(103, (Dir::V, 0.4), false, 16),
+            (Dir::H, 0.5),
             "swapped: it comes off the board too"
         );
-        assert_eq!(
-            board_shape(103, (Dir::V, 0.4), false, None, false, 0).0,
-            Dir::V
-        );
-    }
-
-    /// A dragged questions width is kept, gives way to the board's minimum, and is dropped under
-    /// the questions' own; a drag or a key is refused when it would break either minimum.
-    #[test]
-    fn a_dragged_questions_width_gives_way_to_the_board_before_it_is_dropped() {
-        let wide = (Dir::V, 0.70);
-        assert_eq!(board_shape(200, wide, true, Some(30), true, 0).2, 31);
-        assert_eq!(board_shape(200, wide, true, Some(70), true, 0).2, 71);
-        // Only 77 columns are left over the board's 60 at 200 columns, and 49 at 160.
-        assert_eq!(board_shape(200, wide, true, Some(90), true, 0).2, 77);
-        assert_eq!(board_shape(160, wide, true, Some(90), true, 0).2, 49);
-        // Less than the questions' minimum is left: they leave the board's side.
-        assert_eq!(
-            board_shape(200, (Dir::V, 0.45), true, Some(70), true, 0).2,
-            28
-        );
-        assert_eq!(
-            board_shape(200, (Dir::V, 0.4), true, Some(70), true, 0).2,
-            0
-        );
-        // Qass first: the board is the second pane.
-        assert_eq!(
-            board_shape(200, (Dir::V, 0.3), true, Some(70), false, 0).2,
-            71
-        );
-        // Without a width, or without questions, nothing moves.
-        assert_eq!(
-            board_shape(200, wide, true, None, true, 0).2,
-            QUESTIONS_WIDE + 1
-        );
-        assert_eq!(board_shape(200, wide, false, Some(70), true, 0).2, 0);
-    }
-
-    #[test]
-    fn the_questions_keep_their_minimum_and_so_does_the_board() {
-        assert_eq!(questions_width(25, 100), Some(24));
-        assert_eq!(questions_width(24, 100), None);
-        assert_eq!(questions_width(40, 100), Some(39));
-        assert_eq!(questions_width(41, 100), None);
-        assert_eq!(questions_width(0, 100), None);
-        assert_eq!(
-            edge_handle(5, 2, 20),
-            Some(Handle {
-                x: 5,
-                y: 7,
-                len: 10,
-                vertical: true
-            })
-        );
-        assert_eq!(edge_handle(5, 2, 3), None);
+        assert_eq!(board_shape(103, (Dir::V, 0.4), false, 0).0, Dir::V);
     }
 }
