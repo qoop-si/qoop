@@ -96,10 +96,11 @@ pub fn has_board<'a>(
         .any(|r| r.terminal != qass && r.name.as_deref() == Some(BOARD_PANE))
 }
 
-/// A board pane in qass's space left in a tab of its own (qass's tab closed and the board
-/// stayed): the next start puts that one beside the new qass rather than opening a second
-/// board. A board sharing a tab with anything else is left alone.
-pub fn lone_board(
+/// A board pane in qass's space left behind in another tab: qass's tab closed and the board
+/// stayed, or qass's agent ended and its pane stayed beside the board as a shell. The next
+/// start puts that one beside the new qass rather than opening a second board. A board in a
+/// tab with a live agent is left alone.
+pub fn left_board(
     rows: &[crate::control::AgentRow],
     trees: &[crate::control::Pane],
     qass: u32,
@@ -111,9 +112,12 @@ pub fn lone_board(
         })
         .map(|r| r.terminal)
         .find(|t| {
-            trees
+            let tab = trees
                 .iter()
-                .all(|tree| !tree.leaves().contains(t) || tree.leaves() == [*t])
+                .map(|tree| tree.leaves())
+                .find(|leaves| leaves.contains(t))
+                .unwrap_or_else(|| vec![*t]);
+            !tab.contains(&qass) && !rows.iter().any(|r| r.agent && tab.contains(&r.terminal))
         })
 }
 
@@ -586,19 +590,21 @@ mod tests {
         }
     }
 
-    /// qass's tab closed and its board stayed in a tab of its own: the next start takes that
-    /// board back, never a second one; a board in a tab with something else, or in another
-    /// space, is not it.
+    /// qass's tab closed and its board stayed, alone or beside a shell that was qass's agent:
+    /// the next start takes that board back, never a second one; a board in a tab with a live
+    /// agent, or in another space, is not it.
     #[test]
-    fn a_board_left_alone_is_taken_back() {
+    fn a_board_left_behind_is_taken_back() {
         use crate::control::Pane;
-        let row = |terminal: u32, workspace: i64, name: &str| {
+        let agent_row = |terminal: u32, workspace: i64, name: &str, agent: bool| {
             serde_json::from_value::<crate::control::AgentRow>(serde_json::json!({
                 "terminal": terminal, "workspace": workspace, "name": name,
-                "program": "qoop", "behind": null, "state": "idle", "generation": null,
+                "program": "qoop", "agent": agent, "behind": null, "state": "idle", "generation": null,
             }))
             .unwrap()
         };
+        let row =
+            |terminal: u32, workspace: i64, name: &str| agent_row(terminal, workspace, name, false);
         let leaf = |terminal| Pane::Leaf { terminal };
         let pair = |a, b| Pane::Split {
             dir: crate::control::SplitDir::V,
@@ -609,20 +615,27 @@ mod tests {
         };
         let qass = row(20, 3, "qass");
         let left = row(9, 3, BOARD_PANE);
-        assert_eq!(lone_board(&[qass.clone(), left.clone()], &[], 20), Some(9));
+        assert_eq!(left_board(&[qass.clone(), left.clone()], &[], 20), Some(9));
         assert_eq!(
-            lone_board(&[qass.clone(), left.clone()], &[leaf(9)], 20),
+            left_board(&[qass.clone(), left.clone()], &[leaf(9)], 20),
             Some(9),
             "a tab of its own"
         );
+        let shell = row(11, 3, "qass");
         assert_eq!(
-            lone_board(&[qass.clone(), left.clone()], &[pair(9, 11)], 20),
+            left_board(&[qass.clone(), left.clone(), shell], &[pair(9, 11)], 20),
+            Some(9),
+            "it shares a tab with qass's ended agent"
+        );
+        let live = agent_row(11, 3, "work", true);
+        assert_eq!(
+            left_board(&[qass.clone(), left.clone(), live], &[pair(9, 11)], 20),
             None,
-            "it shares a tab"
+            "it shares a tab with a live agent"
         );
         let elsewhere = row(9, 4, BOARD_PANE);
-        assert_eq!(lone_board(&[qass.clone(), elsewhere], &[], 20), None);
-        assert_eq!(lone_board(&[left], &[], 20), None, "no qass listed");
+        assert_eq!(left_board(&[qass.clone(), elsewhere], &[], 20), None);
+        assert_eq!(left_board(&[left], &[], 20), None, "no qass listed");
     }
 
     #[test]
