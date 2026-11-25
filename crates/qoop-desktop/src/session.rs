@@ -1782,7 +1782,7 @@ fn wheel_rows(delta: ScrollDelta, row: Pixels, left: &mut f32) -> i64 {
 }
 
 /// A page of scrollback rows as a screen: no styles, no cursor.
-fn page_of(lines: Vec<String>, cols: u16, rows: u16) -> SnapshotWire {
+pub(crate) fn page_of(lines: Vec<String>, cols: u16, rows: u16) -> SnapshotWire {
     let modes = ModesWire {
         cursor_visible: false,
         ..ModesWire::default()

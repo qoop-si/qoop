@@ -98,7 +98,11 @@ impl Desk {
             cx.notify();
             return;
         }
-        let task = cx.new(|cx| Field::new("What should the agent do?", cx));
+        let task = cx.new(|cx| {
+            let mut field = Field::new("What should the agent do?", cx);
+            field.multiline = true;
+            field
+        });
         let branch = cx.new(|cx| {
             let mut field = Field::new("named from the task", cx);
             field.label = Some("Branch".into());
@@ -341,7 +345,7 @@ impl Desk {
                 };
                 window.focus(&sheet.stops[next], cx);
             }
-            "enter" if matches!(at, Some(0 | 4)) => self.start(cx),
+            "enter" if matches!(at, Some(0 | 4)) && !crate::keys::newline(k) => self.start(cx),
             "left" | "right" if at == Some(3) => {
                 let n = self.offers.len().max(1);
                 sheet.agent = if k.key == "right" {

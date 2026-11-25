@@ -3,6 +3,8 @@
 //! a screen reader says, a visible focus ring for the keyboard, and a 24 px target at least.
 
 use std::borrow::Cow;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use gpui::{
     A11ySubtreeBuilder, AnyElement, AnyView, App, AssetSource, Bounds, BoxShadow, Context, Div,
@@ -134,17 +136,33 @@ pub fn word_ink(kind: Kind, t: &Theme) -> u32 {
     }
 }
 
+/// The frame of the working mark's breath, set by the window's clock (`Desk::step_beat`).
+/// ponytail: one value for every window, which is one window today.
+static BEAT: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_beat(frame: u32) {
+    BEAT.store(frame, Ordering::Relaxed);
+}
+
+/// Whether marks may move: yes, unless `QOOP_MOTION=0` is set, as in the TUI. macOS's own
+/// Reduce Motion is not read yet.
+pub fn motion_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !qoop_runtime::legacy::var("QOOP_MOTION").is_ok_and(|v| v.trim() == "0"))
+}
+
 /// The state mark: real dots on the 3x3 grid, `size` px square. Always drawn beside the
 /// word, so it is hidden from a screen reader, which reads the word.
 pub fn mark(kind: Kind, t: &Theme, size: f32) -> Div {
     let dot = (size / 5.0).max(2.0).round();
     let step = (size - dot) / 2.0;
     let ink = c(mark_ink(kind, t));
+    let frame = motion_on().then(|| BEAT.load(Ordering::Relaxed));
     div()
         .relative()
         .size(px(size))
         .flex_none()
-        .children(mark_dots(kind, None).into_iter().map(|(x, y)| {
+        .children(mark_dots(kind, frame).into_iter().map(|(x, y)| {
             div()
                 .absolute()
                 .left(px(f32::from(x) * step))

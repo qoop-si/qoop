@@ -189,6 +189,7 @@ impl Spike {
             .screen
             .as_ref()
             .is_some_and(|s| s.modes.application_cursor);
+        let kitty = pane.screen.as_ref().map_or(0, |s| s.modes.kitty_keyboard);
         let press = Press {
             key: &k.key,
             key_char: k.key_char.as_deref(),
@@ -197,6 +198,7 @@ impl Spike {
             shift: k.modifiers.shift,
             cmd: k.modifiers.platform,
             option_is_meta: self.option_is_meta,
+            kitty,
         };
         if let Some(bytes) = keys::encode(press, app_cursor) {
             let _ = self.up.send(Up::Input(terminal, bytes));

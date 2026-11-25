@@ -248,6 +248,51 @@ fn the_prefix_twice_sends_it_to_the_terminal(cx: &mut TestAppContext) {
     );
 }
 
+/// Shift+Enter in the terminal on screen reaches the agent as the kitty protocol's `CSI 13;2u`
+/// once the program pushed the flags, and as a plain return while it has not; Option+Enter is
+/// `ESC CR` and Ctrl+J a line feed either way. Nothing in the window takes them first.
+#[gpui::test]
+fn new_line_keys_reach_the_terminal_the_way_a_terminal_sends_them(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    let mut press = |vcx: &mut VisualTestContext, keys: &str| -> Vec<u8> {
+        sent(&mut rx);
+        vcx.simulate_keystrokes(keys);
+        sent(&mut rx)
+            .into_iter()
+            .find_map(|u| match u {
+                Up::Input(1, bytes) => Some(bytes),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+    let flags = |vcx: &mut VisualTestContext, kitty: u8| {
+        vcx.update(|_, cx| {
+            desk.update(cx, |d, _| {
+                let term = d.term.as_mut().expect("the session's terminal");
+                let mut screen = term
+                    .screen
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_else(|| crate::session::page_of(Vec::new(), 80, 24));
+                screen.modes.kitty_keyboard = kitty;
+                term.screen = Some(std::rc::Rc::new(screen));
+            })
+        })
+    };
+    flags(&mut vcx, 0);
+    assert_eq!(press(&mut vcx, "shift-enter"), b"\r");
+    assert_eq!(press(&mut vcx, "alt-enter"), b"\x1b\r");
+    assert_eq!(press(&mut vcx, "ctrl-j"), b"\n");
+    flags(&mut vcx, 1);
+    assert_eq!(press(&mut vcx, "shift-enter"), b"\x1b[13;2u");
+    assert_eq!(press(&mut vcx, "alt-enter"), b"\x1b[13;3u");
+    assert_eq!(press(&mut vcx, "enter"), b"\r");
+    assert_eq!(press(&mut vcx, "shift-tab"), b"\x1b[Z");
+    assert_eq!(press(&mut vcx, "ctrl-right"), b"\x1b[1;5C");
+}
+
 #[gpui::test]
 fn new_work_by_keyboard_empty_enter_sends_nothing_then_starts(cx: &mut TestAppContext) {
     let (desk, mut vcx, mut rx) = open(cx);
@@ -332,6 +377,48 @@ fn the_field_marks_then_commits_what_the_input_method_composes(cx: &mut TestAppC
     field.read_with(&vcx, |f, _| assert_eq!(f.text, "x"));
     vcx.simulate_keystrokes("cmd-a backspace");
     field.read_with(&vcx, |f, _| assert_eq!(f.text, ""));
+}
+
+/// In a box whose words go out on Enter, Shift+Enter, Option+Enter and Ctrl+J type a new line
+/// (the box grows a line, the arrows move between lines) and only a plain Enter sends.
+#[gpui::test]
+fn shift_enter_types_a_new_line_and_enter_sends(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-a c");
+    sent(&mut rx);
+    let field = desk.read_with(&vcx, |d, _| d.sheet.as_ref().expect("open").task.clone());
+    let shown = |vcx: &mut VisualTestContext| {
+        vcx.run_until_parked();
+        field.read_with(vcx, |f, _| {
+            let height = f.drawn().expect("painted").size.height;
+            (f.text.clone(), height / f.line_height().expect("painted"))
+        })
+    };
+    vcx.simulate_input("ab");
+    vcx.simulate_keystrokes("shift-enter");
+    vcx.simulate_input("ab");
+    assert_eq!(shown(&mut vcx), ("ab\nab".to_string(), 2.));
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Request(_))),
+        "Shift+Enter sends nothing"
+    );
+    // The arrows go between lines, keeping the column: up to the first, down to the second.
+    vcx.simulate_keystrokes("up");
+    vcx.simulate_input("X");
+    vcx.simulate_keystrokes("down");
+    vcx.simulate_input("Y");
+    assert_eq!(shown(&mut vcx).0, "abX\nabY");
+    vcx.simulate_keystrokes("alt-enter ctrl-j");
+    assert_eq!(shown(&mut vcx), ("abX\nabY\n\n".to_string(), 4.));
+    assert!(!sent(&mut rx).iter().any(|u| matches!(u, Up::Request(_))));
+    vcx.simulate_keystrokes("backspace backspace enter");
+    assert!(
+        sent(&mut rx).iter().any(|u| matches!(
+            u,
+            Up::Request(r) if matches!(**r, ControlRequest::CreateTerminal { .. })
+        )),
+        "Enter starts it"
+    );
 }
 
 /// A field wraps what is typed in it to its width and grows a line at a time, up to six lines;
@@ -5654,4 +5741,57 @@ fn the_hold_bar_never_covers_the_card_it_holds(cx: &mut TestAppContext) {
             "the bar in its own room at {w}x{h}: {bar:?}"
         );
     }
+}
+
+/// Which states' marks move: a turn going, and work running in the background; nothing else.
+#[test]
+fn only_working_and_background_marks_move() {
+    use crate::state::Kind;
+    use qoop_domain::status::Status;
+    for status in [Status::Working, Status::Background] {
+        assert!(crate::shell::moves(Kind::Status(status)), "{status:?}");
+    }
+    for status in [
+        Status::Starting,
+        Status::Blocked,
+        Status::Failed,
+        Status::Done,
+        Status::Parked,
+        Status::Idle,
+        Status::Unknown,
+    ] {
+        assert!(!crate::shell::moves(Kind::Status(status)), "{status:?}");
+    }
+    assert!(!crate::shell::moves(Kind::Sleeping));
+}
+
+/// The working mark's clock: with an agent working the window steps a frame every 160 ms and
+/// draws again; once nothing works the clock stops by itself, and a window with nothing
+/// working never starts one.
+#[gpui::test]
+fn the_marks_clock_runs_only_while_a_mark_moves(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let frame = |vcx: &VisualTestContext| desk.read_with(vcx, |d, _| (d.beat.frame, d.animating()));
+    assert!(frame(&vcx).1, "the fixture has agents that work");
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.keep_beating(window, cx)));
+    vcx.executor().advance_clock(crate::shell::FRAME * 3);
+    vcx.run_until_parked();
+    assert_eq!(frame(&vcx).0, 3, "a frame each 160 ms");
+    // Nothing works any more: the next frame stops the clock, and it is not started again.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            for r in &mut d.model.rows {
+                r.state = "idle".into();
+                r.status = Some("idle".into());
+            }
+            cx.notify();
+            assert!(!d.animating());
+        });
+        desk.update(cx, |d, cx| d.keep_beating(window, cx));
+    });
+    vcx.executor().advance_clock(crate::shell::FRAME * 3);
+    vcx.run_until_parked();
+    assert_eq!(frame(&vcx).0, 3, "still: no frame after nothing moves");
+    // The clock stopped itself, so a later second starts it only when a mark moves again.
+    desk.update(&mut vcx, |d, _| assert!(!d.beat.is_running()));
 }

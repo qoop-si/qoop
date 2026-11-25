@@ -4,7 +4,9 @@
 //! underlined until it commits); a caret, a selection, word moves, copy, cut, paste, and undo
 //! of the last edit.
 //!
-//! Enter and Escape are left to the field's owner, which listens for them around it.
+//! Enter and Escape are left to the field's owner, which listens for them around it. A field
+//! that is told it is `multiline` takes Shift+Enter, Option+Enter and Ctrl+J as a new line, and
+//! paragraphs stack, each wrapped to the width.
 
 use std::ops::Range;
 
@@ -53,6 +55,9 @@ pub struct Field {
     /// [`MAX_LINES`].
     pub rows: usize,
     pub top: usize,
+    /// Whether a new line can be typed: the box is for words sent on Enter, which a person
+    /// composes over several lines. Off, a line end can neither be typed nor pasted.
+    pub multiline: bool,
 }
 
 /// The field's inks, from the theme the window draws in now (never kept: a field made before
@@ -90,6 +95,7 @@ impl Field {
             shape: None,
             rows: 1,
             top: 0,
+            multiline: false,
         }
     }
 
@@ -105,7 +111,7 @@ impl Field {
     }
 
     /// The text wrapped as it was last painted, for a point or a character's place.
-    fn wrapped(&self, window: &Window) -> Option<(WrappedLine, &Shape)> {
+    fn wrapped(&self, window: &Window) -> Option<(Wrapped, &Shape)> {
         let shape = self.shape.as_ref()?;
         let runs = [plain_run(
             self.text.len(),
@@ -126,10 +132,7 @@ impl Field {
     fn index_at(&self, at: Point<Pixels>, window: &Window) -> Option<usize> {
         let (line, shape) = self.wrapped(window)?;
         let local = at - shape.bounds.origin + point(px(0.), shape.line_height * self.top);
-        let i = line
-            .closest_index_for_position(local, shape.line_height)
-            .unwrap_or_else(|i| i);
-        Some(i.min(self.text.len()))
+        Some(line.index_at(local, shape.line_height).min(self.text.len()))
     }
 
     /// Put `text` in the field with the caret after it, as a field filled for editing reads:
@@ -210,11 +213,41 @@ impl Field {
         }
     }
 
-    fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    /// The caret one shown line down or up, at the same distance from the left: above the first
+    /// line it goes to the start, below the last to the end.
+    fn move_line(&mut self, down: bool, extend: bool, window: &Window) {
+        let Some((wrapped, shape)) = self.wrapped(window) else {
+            return;
+        };
+        let lh = shape.line_height;
+        let here = wrapped
+            .position_for_index(self.head, lh)
+            .unwrap_or_default();
+        let row = (here.y / lh).round() as usize;
+        let to = match (down, row) {
+            (false, 0) => 0,
+            (true, row) if row + 1 >= wrapped.rows() => self.text.len(),
+            (down, _) => {
+                let y = here.y + if down { lh * 1.5 } else { -lh * 0.5 };
+                wrapped.index_at(point(here.x, y), lh)
+            }
+        };
+        self.move_to(to.min(self.text.len()), extend);
+    }
+
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &event.keystroke;
         let m = &k.modifiers;
         let sel = self.selection();
         let handled = match (k.key.as_str(), m.platform, m.shift) {
+            _ if self.multiline && crate::keys::newline(k) => {
+                self.replace(sel, "\n");
+                true
+            }
+            ("up" | "down", false, extend) if self.multiline && !m.alt => {
+                self.move_line(k.key == "down", extend, window);
+                true
+            }
             // Option deletes the word before, Cmd everything before the caret.
             ("backspace", cmd, _) if (cmd || m.alt) && sel.is_empty() => {
                 let from = if cmd { 0 } else { self.word_before(self.head) };
@@ -297,10 +330,16 @@ impl Field {
             }
             ("v", true, false) => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                    // One paragraph: a pasted line end becomes a space, Enter belongs to the owner.
+                    // A pasted line end is a space, Enter belongs to the owner; a multi-line
+                    // field keeps the lines.
+                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
                     let one: String = text
                         .chars()
-                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .map(|c| match c {
+                            '\n' if self.multiline => c,
+                            c if c.is_control() => ' ',
+                            c => c,
+                        })
                         .collect();
                     self.replace(sel, &one);
                 }
@@ -531,20 +570,82 @@ fn plain_run(len: usize, font: Font, color: Hsla) -> TextRun {
     }
 }
 
-/// `text` shaped and wrapped to `width`: one paragraph, so one wrapped line.
+/// The text shaped and wrapped to a width: one wrapped line for each paragraph (a `\n` ends
+/// one), stacked, so a position in the text is a point and a point is a position, across them.
+struct Wrapped {
+    lines: Vec<WrappedLine>,
+}
+
+impl Wrapped {
+    /// Each paragraph with the byte it starts at and the shown line it starts on.
+    fn paragraphs(&self) -> impl Iterator<Item = (usize, usize, &WrappedLine)> {
+        let (mut start, mut row) = (0, 0);
+        self.lines.iter().map(move |line| {
+            let at = (start, row, line);
+            start += line.len() + 1;
+            row += rows_of(line);
+            at
+        })
+    }
+
+    /// How many shown lines the text takes.
+    fn rows(&self) -> usize {
+        self.lines.iter().map(rows_of).sum::<usize>().max(1)
+    }
+
+    /// Where byte `index` is drawn, from the text's top left.
+    fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
+        self.paragraphs()
+            .find(|(start, _, line)| index <= start + line.len())
+            .and_then(|(start, row, line)| {
+                let at = line.position_for_index(index - start, line_height)?;
+                Some(at + point(px(0.), line_height * row))
+            })
+    }
+
+    /// The byte nearest `at`, from the text's top left: the last paragraph's end for a point
+    /// below the text.
+    fn index_at(&self, at: Point<Pixels>, line_height: Pixels) -> usize {
+        let shown = (at.y / line_height).floor().max(0.) as usize;
+        let mut lines = self.paragraphs().peekable();
+        while let Some((start, row, line)) = lines.next() {
+            if shown < row + rows_of(line) || lines.peek().is_none() {
+                let last = line_height * (rows_of(line) - 1) + line_height * 0.5;
+                let local = point(
+                    at.x.max(px(0.)),
+                    (at.y - line_height * row).max(px(0.)).min(last),
+                );
+                let i = line
+                    .closest_index_for_position(local, line_height)
+                    .unwrap_or_else(|i| i);
+                return start + i.min(line.len());
+            }
+        }
+        0
+    }
+
+    fn paint(&self, origin: Point<Pixels>, line_height: Pixels, window: &mut Window, cx: &mut App) {
+        for (_, row, line) in self.paragraphs() {
+            let at = origin + point(px(0.), line_height * row);
+            let _ = line.paint(at, line_height, TextAlign::Left, None, window, cx);
+        }
+    }
+}
+
+/// `text` shaped and wrapped to `width`.
 fn wrap(
     window: &Window,
     text: SharedString,
     font_size: Pixels,
     runs: &[TextRun],
     width: Pixels,
-) -> WrappedLine {
-    window
+) -> Wrapped {
+    let lines = window
         .text_system()
         .shape_text(text, font_size, runs, Some(width), None)
-        .ok()
-        .and_then(|mut lines| lines.pop())
-        .unwrap_or_default()
+        .map(|lines| lines.into_vec())
+        .unwrap_or_default();
+    Wrapped { lines }
 }
 
 /// How many lines `line` wraps to.
@@ -571,7 +672,7 @@ impl IntoElement for FieldText {
 }
 
 struct Laid {
-    line: WrappedLine,
+    line: Wrapped,
     shape: Shape,
     /// Where the first shown line is drawn: above the field's top when it is scrolled.
     origin: Point<Pixels>,
@@ -628,7 +729,7 @@ impl Element for FieldText {
             });
             let rows = width.map_or(1, |width| {
                 let runs = [plain_run(text.len(), font.clone(), Hsla::default())];
-                rows_of(&wrap(window, text.clone(), font_size, &runs, width))
+                wrap(window, text.clone(), font_size, &runs, width).rows()
             });
             size(width.unwrap_or_default(), line_height * rows.min(MAX_LINES))
         });
@@ -669,7 +770,7 @@ impl Element for FieldText {
             None => vec![run(text.len(), false)],
         };
         let line = wrap(window, text, font_size, &runs, bounds.size.width);
-        let rows = rows_of(&line);
+        let rows = line.rows();
         let at = |i: usize| {
             if empty {
                 Point::default()
@@ -736,9 +837,7 @@ impl Element for FieldText {
             for sel in &laid.selection {
                 window.paint_quad(fill(*sel, colors.selection));
             }
-            let _ = laid
-                .line
-                .paint(laid.origin, lh, TextAlign::Left, None, window, cx);
+            laid.line.paint(laid.origin, lh, window, cx);
             if let Some(caret) = laid.caret {
                 window.paint_quad(fill(caret, colors.caret));
             }

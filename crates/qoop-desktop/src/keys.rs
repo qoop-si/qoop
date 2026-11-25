@@ -6,8 +6,11 @@
 //! most European Mac layouts it is how `@ [ ] { } | ~` are typed. Only when a person asks
 //! for it is Option Meta, an ESC prefix. Option and Cmd with the arrows and Backspace are the
 //! macOS word and line keys (`ESC b`, `ESC f`, `ESC DEL`, `^A`, `^E`, `^U`), as Ghostty and
-//! iTerm2 send them. The kitty keyboard protocol needs a flag the
-//! snapshot does not carry yet, so Shift+Enter is a plain carriage return here.
+//! iTerm2 send them. A new line in an agent's prompt is how the three terminals send it: with
+//! the kitty keyboard protocol on (the program pushed `CSI > 1 u`, the snapshot carries the
+//! flags) a modified Enter is `CSI 13;m u`, Shift+Enter being `CSI 13;2u`; Option+Enter is
+//! `ESC CR`; Ctrl+J is a line feed. With the protocol off Shift+Enter is a plain return, as
+//! in any terminal.
 
 /// The key as GPUI reports it, without GPUI's types, so the encoder tests run anywhere.
 #[derive(Clone, Copy, Debug, Default)]
@@ -20,7 +23,12 @@ pub struct Press<'a> {
     pub cmd: bool,
     /// Option is Meta (an ESC prefix) rather than a compose key. Off unless asked for.
     pub option_is_meta: bool,
+    /// The kitty keyboard flags the program pushed (`ModesWire::kitty_keyboard`), 0 when none.
+    pub kitty: u8,
 }
+
+/// The kitty protocol's first flag: keys the legacy bytes cannot tell apart get `CSI u` forms.
+const KITTY_DISAMBIGUATE: u8 = 1;
 
 /// What a keystroke types, for the window's own one-letter keys: the ASCII character the
 /// layout produced (`/` is shift-7 on a Turkish Q keyboard), else the key's name (`c` on a
@@ -30,6 +38,15 @@ pub fn typed(k: &gpui::Keystroke) -> &str {
         .as_deref()
         .filter(|c| c.len() == 1 && c.bytes().all(|b| b.is_ascii_graphic()))
         .unwrap_or(&k.key)
+}
+
+/// Whether the press asks for a new line rather than to send: Shift+Enter, Option+Enter or
+/// Ctrl+J. Text fields that send on Enter and the terminal agree on it.
+pub fn newline(k: &gpui::Keystroke) -> bool {
+    let m = &k.modifiers;
+    let enter = k.key == "enter" && (m.shift || m.alt);
+    let line_feed = k.key == "j" && m.control;
+    !m.platform && (enter || line_feed)
 }
 
 /// The bytes for one press, or `None` for a press the terminal does not get (Cmd chords
@@ -59,6 +76,11 @@ pub fn encode(p: Press<'_>, app_cursor: bool) -> Option<Vec<u8>> {
         }
     }
     let modifier = 1 + u8::from(p.shift) + 2 * u8::from(p.alt) + 4 * u8::from(p.ctrl);
+    // Legacy bytes cannot tell Shift+Enter from Enter: a program that asked for the kitty
+    // protocol reads the `CSI u` form (Claude Code and Codex insert a new line on it).
+    if p.key == "enter" && modifier > 1 && p.kitty & KITTY_DISAMBIGUATE != 0 {
+        return Some(format!("\x1b[13;{modifier}u").into_bytes());
+    }
     let cursor = |end: char| -> Vec<u8> {
         if modifier > 1 {
             format!("\x1b[1;{modifier}{end}").into_bytes()
@@ -108,7 +130,10 @@ pub fn encode(p: Press<'_>, app_cursor: bool) -> Option<Vec<u8>> {
         "f10" => tilde(21),
         "f11" => tilde(23),
         "f12" => tilde(24),
-        "enter" => alt(b"\r".to_vec()),
+        // Enter composes nothing, so Option+Enter is `ESC CR` whether or not Option is Meta:
+        // what Claude Code reads as a new line when the kitty protocol is off.
+        "enter" if p.alt => b"\x1b\r".to_vec(),
+        "enter" => b"\r".to_vec(),
         "escape" => alt(b"\x1b".to_vec()),
         "backspace" if p.ctrl => alt(vec![0x08]),
         "backspace" => alt(vec![0x7f]),
@@ -238,11 +263,128 @@ mod tests {
                 "{key}"
             );
         }
-        let enter = Press {
-            alt: true,
+    }
+
+    /// A new line in an agent's prompt, as Ghostty, iTerm2 and kitty send it.
+    #[test]
+    fn new_line_keys_reach_the_agent() {
+        let with = |key_name, shift, alt, ctrl, kitty| Press {
+            shift,
+            alt,
+            ctrl,
+            kitty,
+            ..key(key_name)
+        };
+        // The kitty protocol on (flag 1 pushed, other flags beside it): the `CSI u` forms.
+        for kitty in [1, 3, 5, 0b11111] {
+            let enc = |s, a, c| encode(with("enter", s, a, c, kitty), false);
+            assert_eq!(enc(true, false, false), Some(b"\x1b[13;2u".to_vec()));
+            assert_eq!(enc(false, true, false), Some(b"\x1b[13;3u".to_vec()));
+            assert_eq!(enc(false, false, true), Some(b"\x1b[13;5u".to_vec()));
+            assert_eq!(
+                enc(false, false, false),
+                Some(b"\r".to_vec()),
+                "plain Enter"
+            );
+        }
+        // Off, or only flags that leave Enter alone: Shift+Enter is a return, as in any terminal.
+        for kitty in [0, 2, 4] {
+            let shift = with("enter", true, false, false, kitty);
+            assert_eq!(encode(shift, false), Some(b"\r".to_vec()));
+        }
+        // Option+Enter is ESC CR with Option composing text or as Meta, and in either protocol state.
+        let alt = with("enter", false, true, false, 0);
+        assert_eq!(encode(alt, false), Some(b"\x1b\r".to_vec()));
+        let meta = Press {
+            option_is_meta: true,
+            ..alt
+        };
+        assert_eq!(encode(meta, false), Some(b"\x1b\r".to_vec()));
+        // Ctrl+J is a line feed.
+        let ctrl_j = with("j", false, false, true, 0);
+        assert_eq!(encode(ctrl_j, false), Some(b"\n".to_vec()));
+        // Cmd+Enter stays with the app.
+        let cmd = Press {
+            cmd: true,
+            kitty: 1,
             ..key("enter")
         };
-        assert_eq!(encode(enter, false), Some(b"\r".to_vec()));
+        assert_eq!(encode(cmd, false), None);
+    }
+
+    /// The other modified keys, as xterm sends them: what agents' key readers expect.
+    #[test]
+    fn modified_navigation_keys() {
+        let with = |key_name, shift, alt, ctrl| Press {
+            shift,
+            alt,
+            ctrl,
+            ..key(key_name)
+        };
+        let enc = |p| encode(p, false);
+        assert_eq!(
+            enc(with("tab", true, false, false)),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(enc(with("tab", false, false, false)), Some(b"\t".to_vec()));
+        assert_eq!(
+            enc(with("up", false, true, false)),
+            Some(b"\x1b[1;3A".to_vec())
+        );
+        assert_eq!(
+            enc(with("right", false, false, true)),
+            Some(b"\x1b[1;5C".to_vec())
+        );
+        assert_eq!(
+            enc(with("left", true, false, true)),
+            Some(b"\x1b[1;6D".to_vec())
+        );
+        assert_eq!(
+            enc(with("home", false, false, false)),
+            Some(b"\x1b[H".to_vec())
+        );
+        assert_eq!(
+            enc(with("end", false, false, false)),
+            Some(b"\x1b[F".to_vec())
+        );
+        assert_eq!(encode(key("home"), true), Some(b"\x1bOH".to_vec()));
+        assert_eq!(
+            enc(with("pageup", false, false, false)),
+            Some(b"\x1b[5~".to_vec())
+        );
+        assert_eq!(
+            enc(with("pagedown", false, false, false)),
+            Some(b"\x1b[6~".to_vec())
+        );
+        assert_eq!(
+            enc(with("pageup", true, false, false)),
+            Some(b"\x1b[5;2~".to_vec())
+        );
+        assert_eq!(
+            enc(with("delete", false, false, true)),
+            Some(b"\x1b[3;5~".to_vec())
+        );
+        // Option as Meta: an ESC prefix on a letter.
+        let meta = Press {
+            alt: true,
+            option_is_meta: true,
+            key: "f",
+            key_char: Some("\u{192}"),
+            ..Press::default()
+        };
+        assert_eq!(enc(meta), Some(b"\x1bf".to_vec()));
+    }
+
+    /// The window's own Enter and Ctrl+J: a new line only when a field takes it.
+    #[test]
+    fn newline_names_the_three_keys() {
+        let stroke = |text: &'static str| gpui::Keystroke::parse(text).expect("a keystroke");
+        for yes in ["shift-enter", "alt-enter", "ctrl-j"] {
+            assert!(newline(&stroke(yes)), "{yes}");
+        }
+        for no in ["enter", "cmd-enter", "j", "ctrl-k", "shift-j", "tab"] {
+            assert!(!newline(&stroke(no)), "{no}");
+        }
     }
 
     /// The window's keys by what the layout typed when it is ASCII, else by the key: `/` on a

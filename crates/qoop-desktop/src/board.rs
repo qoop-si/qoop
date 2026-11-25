@@ -116,6 +116,7 @@ impl BoardPage {
         });
         let tell = cx.new(|cx| {
             let mut f = Field::new("Tell qass what to work on next", cx);
+            f.multiline = true;
             f.label = Some("Tell qass".into());
             f
         });

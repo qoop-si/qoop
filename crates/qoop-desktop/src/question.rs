@@ -764,6 +764,7 @@ impl Desk {
         let kept = self.drafts.remove(&slot);
         let field = cx.new(|cx| {
             let mut field = Field::new("Type your own answer", cx);
+            field.multiline = true;
             if let Some(words) = &kept {
                 field.set_text(words);
             }
