@@ -424,13 +424,7 @@ pub(crate) fn the_pet() -> Avatar {
 /// The first of the picker's own pets. What a test draws with, so no test reads the pet the
 /// person running it picked.
 pub(crate) fn first_pet() -> Avatar {
-    Avatar {
-        body: avatar::BODY.to_string(),
-        hair: "block".to_string(),
-        eyes: "big".to_string(),
-        hair_ink: 212,
-        body_ink: avatar::BODY_INK,
-    }
+    Avatar::first()
 }
 
 /// One part of the pet stepped by `by` (plus or minus one), wrapping.

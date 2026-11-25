@@ -2,7 +2,7 @@
 //! what the link brings in.
 //!
 //! Pages are the Inbox (where the window opens), a Session (one terminal; qass's place is its
-//! own terminal's), qass while it does not run, Schedules, Settings and a Computer. The prefix from `config.toml` (default
+//! own terminal's), qass while it does not run, the Board, Schedules, Settings and a Computer. The prefix from `config.toml` (default
 //! `ctrl-a`) belongs to the app: `ctrl-a c` New agent, `ctrl-a i` the Inbox (and back),
 //! `ctrl-a tab` the agent that has waited longest, the prefix twice sends it to the terminal on
 //! screen. Cmd-J (next waiting) and Cmd-N (New agent) are the app's and never reach a terminal.
@@ -47,6 +47,8 @@ pub enum Page {
     Inbox,
     Session(TerminalStream),
     Qass,
+    /// The board of This Mac or another computer, run by qass.
+    Board,
     Schedules,
     Settings,
     /// A computer by its machine number: how it is reached, and its agents.
@@ -115,8 +117,13 @@ impl Term {
 pub struct Desk {
     pub model: Model,
     pub page: Page,
-    /// The page `ctrl-a i` and Escape go back to from the Inbox.
+    /// The page `ctrl-a i` and Escape go back to from the Inbox or the Board: the last page
+    /// that was neither, so Escape never bounces between the two.
     pub(crate) back: Page,
+    /// The column shows; folded, it and its divider are not drawn and the band keeps the
+    /// toggle. The toggle's one focus handle, wherever it is drawn.
+    pub(crate) side_open: bool,
+    pub(crate) side_toggle: FocusHandle,
     /// The space of the last agent page on screen: where New agent opens when the page on
     /// screen has no space of its own.
     pub(crate) worked_in: Option<i64>,
@@ -328,6 +335,8 @@ impl Desk {
             },
             page: Page::Inbox,
             back: Page::Inbox,
+            side_open: true,
+            side_toggle: cx.focus_handle().tab_stop(true),
             worked_in: None,
             inbox_filter: Default::default(),
             inbox_cursor: None,
@@ -660,9 +669,9 @@ impl Desk {
         }
     }
 
-    /// Go to a page, showing its terminal's screens and dropping the last one's. The Inbox opened
-    /// from a session keeps that session's terminal shown behind it, so coming back is the same
-    /// screen, scrollback and size, and the keys never reach it meanwhile.
+    /// Go to a page, showing its terminal's screens and dropping the last one's. The Inbox or
+    /// the Board opened from a session keeps that session's terminal shown behind it, so coming
+    /// back is the same screen, scrollback and size, and the keys never reach it meanwhile.
     pub fn open(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         // qass's place is its agent page while it runs; the qass page says it does not.
         let page = if page == Page::Qass {
@@ -670,10 +679,11 @@ impl Desk {
         } else {
             page
         };
-        let keep = page == Page::Inbox
-            && matches!(self.page, Page::Session(_) | Page::Inbox)
+        let over = |p: Page| matches!(p, Page::Inbox | Page::Board);
+        let keep = over(page)
+            && matches!(self.page, Page::Session(_) | Page::Inbox | Page::Board)
             && self.term.is_some();
-        if page == Page::Inbox && self.page != Page::Inbox {
+        if over(page) && !over(self.page) {
             self.back = self.page;
         }
         let terminal = match page {
@@ -697,6 +707,9 @@ impl Desk {
         if page == Page::Schedules && self.schedule_page.via.is_none() {
             let ids: Vec<i64> = self.model.schedules.iter().map(|s| s.id).collect();
             self.ask_runs(&ids);
+        }
+        if page == Page::Board {
+            self.ask_board(true);
         }
         if !keep {
             self.set_panes(terminal);
@@ -874,11 +887,11 @@ impl Desk {
             cx.stop_propagation();
             return;
         }
-        // Escape leaves the Inbox for the page before it, and the terminal never hears it: an
-        // Escape typed into an agent interrupts its turn. Not from a field, which keeps its
-        // keys.
-        if self.page == Page::Inbox
-            && self.back != Page::Inbox
+        // Escape leaves the Inbox or the Board for the page before them, and the terminal never
+        // hears it: an Escape typed into an agent interrupts its turn. Not from a field, which
+        // keeps its keys.
+        if matches!(self.page, Page::Inbox | Page::Board)
+            && !matches!(self.back, Page::Inbox | Page::Board)
             && keys::typed(k) == "escape"
             && !self.typing_in_field(window, cx)
         {
@@ -981,7 +994,7 @@ impl Desk {
             return;
         }
         // The Board has no cards to answer: its digits are the person's own.
-        let on_inbox = self.page == Page::Inbox && !self.board.open;
+        let on_inbox = self.page == Page::Inbox;
         // `u` is Undo on the Inbox while anything is on hold (the focused card's pick, else the
         // newest), and on an agent's page, the terminal focused or not, only while a pick for that
         // agent is held and the menu it was made on is still up (a card's: while the card is
@@ -1434,6 +1447,7 @@ impl Desk {
                 )
             }
             Page::Qass => ("qass".into(), None),
+            Page::Board => ("Board".into(), Some("your tasks, run by qass".into())),
             Page::Computer(m) => (
                 state::machines(&self.model.spaces)
                     .into_iter()
@@ -1456,7 +1470,7 @@ impl Desk {
         }
     }
 
-    /// The page: its header where it has none of its own, and its body, in the main column.
+    /// The page's body in the main column, under the band that carries its title.
     fn centre(
         &self,
         inbox: &qoop_tui::inbox::Inbox,
@@ -1475,20 +1489,15 @@ impl Desk {
         let padded = |page: AnyElement| div().flex_1().min_h_0().p(px(12.)).child(page);
         match self.page {
             Page::Inbox => body.child(self.inbox_page(inbox, t, cx)).into_any_element(),
+            Page::Board => body.child(self.board_page(inbox, t, cx)).into_any_element(),
             Page::Session(_) => body
-                .pt(px(12.))
                 .child(padded(self.session(inbox, t, focused, cx)))
                 .into_any_element(),
-            Page::Qass => body
-                .child(self.page_header(t))
-                .child(padded(self.qass_page(cx)))
-                .into_any_element(),
+            Page::Qass => body.child(padded(self.qass_page(cx))).into_any_element(),
             Page::Schedules => body
-                .child(self.page_header(t))
                 .child(padded(self.schedules_page(t, cx)))
                 .into_any_element(),
             Page::Settings => body
-                .child(self.page_header(t))
                 .child(padded(self.settings_page(t, cx)))
                 .into_any_element(),
             Page::Computer(m) => {
@@ -1685,8 +1694,10 @@ impl Render for Desk {
                     ),
                 ))
             })
-            .child(self.sidebar(side, &inbox, &t, cx))
-            .child(self.divider(Edge::Side, "Resize the sidebar", &t, cx))
+            .when(self.side_open, |d| {
+                d.child(self.sidebar(side, &inbox, &t, cx))
+                    .child(self.divider(Edge::Side, "Resize the sidebar", &t, cx))
+            })
             .child(
                 div()
                     .id("main")
@@ -1695,6 +1706,7 @@ impl Render for Desk {
                     .h_full()
                     .flex()
                     .flex_col()
+                    .child(self.top_band(&inbox, &t, cx))
                     .when_some(self.banner_strip(&t, cx), |d, banner| d.child(banner))
                     .child(self.centre(&inbox, &t, focused, cx)),
             );
@@ -1813,10 +1825,15 @@ fn wire(
             cx.background_executor().timer(Duration::from_millis(200))
         })
         .detach();
-        // Back to the window: the settings page reads the file again (it may have been edited).
+        // Back to the window: the settings page reads the file again (it may have been edited),
+        // and macOS's Reduce Motion is read again (it may have been turned).
+        ui::read_reduce_motion();
         cx.observe_window_activation(window, |this: &mut Desk, window, cx| {
             if window.is_window_active() {
                 this.retry_away();
+                ui::read_reduce_motion();
+                this.keep_beating(window, cx);
+                cx.notify();
             }
             if window.is_window_active() && this.page == Page::Settings {
                 this.read_settings();

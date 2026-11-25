@@ -233,6 +233,18 @@ pub struct Avatar {
 }
 
 impl Avatar {
+    /// The first of the picker's own pets: what is drawn while none was picked yet, by the
+    /// CLI's pages and the desktop's header alike.
+    pub fn first() -> Avatar {
+        Avatar {
+            body: BODY.to_string(),
+            hair: "block".to_string(),
+            eyes: "big".to_string(),
+            hair_ink: 212,
+            body_ink: BODY_INK,
+        }
+    }
+
     /// The name the picker prints, from the parts: "Mohawk Pink".
     pub fn name(&self) -> String {
         let hair = HAIR_STYLES

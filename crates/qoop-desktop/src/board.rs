@@ -1,4 +1,4 @@
-//! The Board, the Inbox's second view: what is on the board of This Mac or of another computer,
+//! The Board, a page of its own: what is on the board of This Mac or of another computer,
 //! in four columns (two when the page, the window less the sidebar, is under [`WIDE`] wide): Waiting on you (the same records as Needs you),
 //! Doing, Todo and Done. A search over the items, Add item, and a line to tell qass what to work
 //! on next.
@@ -17,7 +17,7 @@ use qoop_runtime::control::{ControlRequest, ControlResponse, ItemInfo, TaskOp};
 use qoop_tui::board::{Band, Board, Read, bands_of, too_old, why};
 use qoop_tui::inbox::Inbox;
 
-use crate::app::Desk;
+use crate::app::{Desk, Page};
 use crate::field::Field;
 use crate::link;
 use crate::state;
@@ -85,8 +85,6 @@ pub struct AddItem {
 
 /// The Board page's own state.
 pub struct BoardPage {
-    /// The Inbox shows the Board instead of Needs you.
-    pub open: bool,
     /// Each computer's board, as last read.
     pub boards: BTreeMap<usize, Board>,
     /// The computer shown.
@@ -103,8 +101,9 @@ pub struct BoardPage {
     /// Writes out: the id, and the computer it went to.
     writes: HashMap<String, Write>,
     serial: u64,
-    /// When a read was last sent, for the clock's re-read.
-    pub read_at: i64,
+    /// When each computer's board was last asked for, for the clock's re-read: one clock per
+    /// computer, so This Mac's reads on every board change never hold another's back.
+    pub read_at: BTreeMap<usize, i64>,
 }
 
 impl BoardPage {
@@ -123,7 +122,6 @@ impl BoardPage {
         cx.observe(&find, |_, _, cx| cx.notify()).detach();
         cx.observe(&tell, |_, _, cx| cx.notify()).detach();
         BoardPage {
-            open: false,
             boards: BTreeMap::new(),
             machine: 0,
             find,
@@ -134,7 +132,7 @@ impl BoardPage {
             kept: BTreeMap::new(),
             writes: HashMap::new(),
             serial: 0,
-            read_at: 0,
+            read_at: BTreeMap::new(),
         }
     }
 
@@ -258,13 +256,21 @@ pub enum Landed {
 }
 
 impl Desk {
-    /// Show the Board, or Needs you again.
-    pub(crate) fn show_board(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.board.open = on;
-        if on {
-            self.ask_board(true);
+    /// The Board entry's note: what This Mac's board has to do, "3 to do". Nothing until a
+    /// read answered, so never "0 to do" before it, and none while qoop is not running on This
+    /// Mac (the count kept from before would be stale).
+    pub(crate) fn board_note(&self, list: &Inbox) -> Option<String> {
+        if self.lost_at.is_some() {
+            return None;
         }
-        cx.notify();
+        let Read::Items(items) = self.board.read_of(0) else {
+            return None;
+        };
+        let handed: BTreeSet<u32> = list.with_qass.iter().copied().collect();
+        Some(format!(
+            "{} to do",
+            bands_of(&items, &handed).of(Band::Todo).len()
+        ))
     }
 
     /// Read the board of the computer shown: at once (`now`), or when one is owed.
@@ -290,19 +296,22 @@ impl Desk {
             }
         }
         if let Some(request) = board.request_via(&read_id(m), via) {
-            self.board.read_at = crate::app::unix_now();
+            self.board.read_at.insert(m, crate::app::unix_now());
             self.ask(request);
         }
     }
 
-    /// The window is connected again: reads that were out went with the old link.
+    /// The window is connected again: reads that were out went with the old link. This Mac's
+    /// board is read whatever the page, for the column's count; another computer's while the
+    /// Board shows it.
     pub(crate) fn board_reconnected(&mut self) {
         for board in self.board.boards.values_mut() {
             if board.read == Read::Reading {
                 board.read = Read::Unread;
             }
         }
-        if self.board.open {
+        self.ask_board_of(0, true);
+        if self.page == Page::Board && self.board.machine != 0 {
             self.ask_board(true);
         }
     }
@@ -310,20 +319,23 @@ impl Desk {
     /// Every 30 s while the Board shows: another computer's board has no event, and a read that
     /// was lost is asked for again.
     pub(crate) fn board_tick(&mut self, now: i64) -> bool {
-        if self.board.open && now - self.board.read_at >= REREAD {
+        let read_at = self
+            .board
+            .read_at
+            .get(&self.board.machine)
+            .copied()
+            .unwrap_or(0);
+        if self.page == Page::Board && now - read_at >= REREAD {
             self.ask_board(true);
         }
         self.board.expire(now)
     }
 
-    /// The board changed on This Mac: read again when it shows.
+    /// The board changed on This Mac: read again whatever the page, so the column's count is
+    /// never stale.
     pub(crate) fn board_changed(&mut self) {
-        if let Some(board) = self.board.boards.get_mut(&0) {
-            board.stale = true;
-        }
-        if self.board.open && self.board.machine == 0 {
-            self.ask_board(false);
-        }
+        self.board.boards.entry(0).or_default().stale = true;
+        self.ask_board_of(0, false);
     }
 
     /// Whether an answer was the Board's: a read, or a write's (an item added, or refused).
@@ -463,7 +475,7 @@ impl Desk {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.board.open || self.page != crate::app::Page::Inbox {
+        if self.page != Page::Board {
             return false;
         }
         let on = |f: &Entity<Field>, window: &Window, cx: &Context<Self>| {
@@ -498,12 +510,11 @@ impl Desk {
     /// An item of the board opened: its agent's page, or the Inbox on the card about it.
     pub(crate) fn open_item(&mut self, open: &Open, window: &mut Window, cx: &mut Context<Self>) {
         match open {
-            Open::Agent(t) => self.open(crate::app::Page::Session(*t), window, cx),
+            Open::Agent(t) => self.open(Page::Session(*t), window, cx),
             Open::Card(id) => {
-                self.board.open = false;
                 self.inbox_filter = crate::inbox::Filter::All;
                 self.set_cursor(state::Slot::Card(id.clone()), 0);
-                self.open(crate::app::Page::Inbox, window, cx);
+                self.open(Page::Inbox, window, cx);
             }
         }
     }
