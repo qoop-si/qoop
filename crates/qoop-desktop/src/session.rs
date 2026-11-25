@@ -426,7 +426,6 @@ impl Desk {
             .flex()
             .flex_col()
             .gap(px(10.))
-            .child(self.agent_header(term.terminal, inbox, t, cx))
             .child(self.tab_row(term.terminal, t, cx))
             .child(
                 div()
@@ -519,124 +518,6 @@ impl Desk {
             .into_any_element()
     }
 
-    /// The agent's header: its mark, space and title, where it runs, the prefix hint that
-    /// keeps the keys off the terminal, and Next waiting with how many other things wait.
-    fn agent_header(
-        &self,
-        terminal: TerminalStream,
-        inbox: &qoop_tui::inbox::Inbox,
-        t: &Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let row = self.model.row(terminal);
-        let space = row.and_then(|r| self.model.space(r.workspace));
-        let others = inbox
-            .items
-            .iter()
-            .filter(|i| i.terminal != Some(terminal))
-            .count();
-        let (title, program, machine) = match row {
-            Some(r) => (
-                state::title_of(r),
-                r.program.clone(),
-                space.map_or_else(|| "This Mac".to_string(), state::machine_name),
-            ),
-            None => (format!("tab {terminal}"), None, "This Mac".to_string()),
-        };
-        let about = match program {
-            Some(program) => format!("{program} on {machine}"),
-            None => format!("on {machine}"),
-        };
-        let prefix = self.prefix_name();
-        let keys = |text: String| ui::kbd(&text, t);
-        let next = if others > 0 {
-            ui::pill("next-waiting", &format!("Next waiting, {others}"), t)
-                .child("Next waiting")
-                .child(
-                    div()
-                        .debug_selector(|| "next-waiting-count".to_string())
-                        .min_w(px(18.))
-                        .h(px(18.))
-                        .px(px(5.))
-                        .rounded_full()
-                        .bg(c(t.needs))
-                        .text_color(c(t.badge_fg))
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .flex()
-                        .justify_center()
-                        .child(others.to_string()),
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.next_waiting(window, cx)))
-                .into_any_element()
-        } else {
-            ui::pill_off(
-                "next-waiting",
-                "Next waiting, unavailable: nothing else waits",
-                t,
-            )
-            .child("Next waiting")
-            .into_any_element()
-        };
-        let next = div().debug_selector(|| "next-waiting".to_string()).child(
-            // The pill is a Control: wrapped in a div only so a test can find it.
-            next,
-        );
-        div()
-            .id("agent-header")
-            .role(Role::Heading)
-            .aria_level(1)
-            .aria_label(format!("{title}, {about}"))
-            .flex_none()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_x(px(12.))
-            .gap_y(px(6.))
-            .child(match row {
-                Some(r) => ui::mark(self.shown_kind(state::Entry::Live(r)), t, 14.),
-                None => ui::mark(Kind::Status(qoop_domain::status::Status::Unknown), t, 14.),
-            })
-            .when_some(space, |d, w| {
-                d.child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(t.space(state::space_slot(w)))
-                        .child(state::short_space(w)),
-                )
-            })
-            .child(
-                div()
-                    .min_w_0()
-                    .whitespace_normal()
-                    .text_size(px(16.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
-            )
-            .child(div().text_color(c(t.t2)).child(about))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .id("agent-hints")
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .text_size(px(12.))
-                    .text_color(c(t.t2))
-                    .child(keys(format!("{prefix} a")))
-                    .child("keys to the page"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(next)
-                    .child(keys("\u{2318}J".to_string()))
-                    .child(keys(format!("{prefix} tab"))),
-            )
-    }
-
     /// The space's tabs, then Changes and Open in editor for a tab on this machine.
     fn tab_row(
         &self,
@@ -719,6 +600,21 @@ impl Desk {
                                 this.open(Page::Session(terminal), window, cx)
                             }))
                     })),
+            )
+            // The one visible clue for how the keyboard leaves the terminal (and reaches the
+            // controls of the page).
+            .child(
+                div()
+                    .id("agent-hints")
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(6.))
+                    .text_size(px(12.5))
+                    .text_color(c(t.t2))
+                    .child(ui::kbd(&format!("{} a", self.prefix_name()), t))
+                    .child("page keys"),
             )
             .child(div().flex_1())
             .when_some(space.filter(|w| state::machine_of(w.id) != 0), |d, w| {

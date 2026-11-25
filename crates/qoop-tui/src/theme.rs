@@ -636,7 +636,9 @@ pub fn pet(ink: u8) -> u8 {
     if light() { light_pet(ink) } else { ink }
 }
 
-const fn light_pet(ink: u8) -> u8 {
+/// A pet ink as drawn on a light ground, whatever the palette in effect: the desktop's
+/// header pet in its light theme reads it too.
+pub const fn light_pet(ink: u8) -> u8 {
     match ink {
         212 => 162,
         214 => 136,

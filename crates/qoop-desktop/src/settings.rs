@@ -11,7 +11,7 @@ use qoop_runtime::avatar::{self, Avatar};
 use qoop_runtime::control::{ControlRequest, ControlResponse};
 use qoop_tui::config::Read;
 
-use crate::app::{Desk, Page};
+use crate::app::Desk;
 use crate::field::Field;
 use crate::link;
 use crate::state::{self, SETTINGS, Setting, SettingKind};
@@ -254,13 +254,6 @@ impl Desk {
                             .child("a change is written as you make it"),
                     )
                     .child(div().flex_1())
-                    .child(
-                        ui::link_button("nav-schedules", "Schedules", t)
-                            .debug_selector(|| "nav-schedules".to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open(Page::Schedules, window, cx)
-                            })),
-                    )
                     .child(ui::kbd("/", t))
                     .child(
                         ui::pill("open-config", "Open in your editor", t)

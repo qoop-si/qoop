@@ -1490,6 +1490,17 @@ pub fn age_of(row: &AgentRow, now: i64) -> Option<String> {
     Some(short_span(now.saturating_sub(since).max(0)))
 }
 
+/// [`short_span`] as a screen reader says it: "32 seconds", "23 minutes", "1 hour", "3 days"
+/// (a short "23m" reads as metres).
+pub fn spoken_span(secs: i64) -> String {
+    match secs {
+        s if s < 60 => count(s as usize, "second"),
+        s if s < 3600 => count((s / 60) as usize, "minute"),
+        s if s < 86_400 => count((s / 3600) as usize, "hour"),
+        s => count((s / 86_400) as usize, "day"),
+    }
+}
+
 pub fn short_span(secs: i64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),

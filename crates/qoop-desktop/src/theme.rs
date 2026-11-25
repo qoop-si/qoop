@@ -283,6 +283,12 @@ impl Theme {
         ]
     }
 
+    /// An avatar's disc: the popover ground in dark, a light step under the page in light
+    /// (where it also wears a hairline, since `pop` there is the page's white).
+    pub fn disc(&self) -> u32 {
+        if self.dark { self.pop } else { self.card2 }
+    }
+
     pub fn space(&self, slot: usize) -> Hsla {
         c(self.spaces[slot % 6]).into()
     }
@@ -327,7 +333,9 @@ mod tests {
     /// The page grounds a theme draws on. In dark, also the top glow over `bg` (at its
     /// strongest) and the terminal's ground, which only ever carries `DARK`'s tokens.
     fn page_grounds(t: &Theme) -> Vec<u32> {
-        let mut pages = vec![t.bg, t.sidebar, t.card, t.card2, t.panel, t.pop];
+        // The top band sits on `bg` (on the glow in dark); an avatar's logo or letter is
+        // drawn in `ink` on its disc.
+        let mut pages = vec![t.bg, t.sidebar, t.card, t.card2, t.panel, t.pop, t.disc()];
         if t.dark {
             pages.extend([over(TOP_GLOW, t.bg), TERMINAL_BG]);
         }

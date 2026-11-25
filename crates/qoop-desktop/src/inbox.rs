@@ -302,75 +302,17 @@ impl Desk {
             .into_any_element()
     }
 
-    /// The Inbox's own header: its title and count, and the keys that answer.
-    fn inbox_header(&self, count: usize, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("title")
-            .role(Role::Heading)
-            .aria_level(1)
-            .aria_label("Inbox")
-            .flex_none()
-            .flex()
-            .flex_wrap()
-            .items_baseline()
-            .gap_x(px(14.))
-            .gap_y(px(4.))
-            .px(px(26.))
-            .pt(px(18.))
-            .pb(px(10.))
-            .child(
-                div()
-                    .text_size(px(20.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Inbox"),
-            )
-            // Needs you and the Board: the Inbox's two views.
-            .child(
-                div()
-                    .id("inbox-views")
-                    .role(Role::RadioGroup)
-                    .aria_label("Inbox view")
-                    .flex()
-                    .gap(px(4.))
-                    .child(
-                        ui::chip(
-                            "view-needs",
-                            "Needs you",
-                            Some(count),
-                            None,
-                            !self.board.open,
-                            t,
-                        )
-                        .debug_selector(|| "view-needs".to_string())
-                        .on_click(cx.listener(|this, _, _, cx| this.show_board(false, cx))),
-                    )
-                    .child(
-                        ui::chip("view-board", "Board", None, None, self.board.open, t)
-                            .debug_selector(|| "view-board".to_string())
-                            .on_click(cx.listener(|this, _, _, cx| this.show_board(true, cx))),
-                    ),
-            )
-            .child(div().flex_1())
-            .when(count > 0 && !self.board.open, |d| {
-                d.child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(c(t.t2))
-                        .id("inbox-keys")
-                        .aria_label("Command J next, 1 to 9 answer, u undo")
-                        .child("\u{2318}J next, 1-9 answer, u undo"),
-                )
-            })
-    }
-
-    /// The chips: All, From qass, Failed, with a clear control on the one that filters.
+    /// The chips: All, From qass, Failed, with a clear control on the one that filters, and the
+    /// keys that answer. The title is the band's.
     fn inbox_chips(&self, list: &Inbox, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let count = |f: Filter| list.items.iter().filter(|i| f.holds(i)).count();
         div()
             .flex()
             .flex_wrap()
+            .items_center()
             .gap(px(6.))
             .px(px(26.))
+            .pt(px(4.))
             .pb(px(8.))
             .children([Filter::All, Filter::FromQass, Filter::Failed].map(|f| {
                 let on = self.inbox_filter == f;
@@ -389,6 +331,17 @@ impl Desk {
                         cx.notify();
                     }))
             }))
+            .child(div().flex_1())
+            .when(list.count > 0, |d| {
+                d.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(c(t.t2))
+                        .id("inbox-keys")
+                        .aria_label("Command J next, 1 to 9 answer, u undo")
+                        .child("\u{2318}J next, 1-9 answer, u undo"),
+                )
+            })
     }
 
     /// The Inbox page.
@@ -399,24 +352,12 @@ impl Desk {
             .retain(|slot, _| items.iter().any(|i| &i.slot == slot));
         let cursor = self.cursor_in(&items);
         let first_run = self.listed && self.model.agents().is_empty();
-        if self.board.open {
-            return div()
-                .id("inbox-page")
-                .debug_selector(|| "inbox-page".to_string())
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(self.inbox_header(list.count, t, cx))
-                .child(self.board_page(list, t, cx))
-                .into_any_element();
-        }
         div()
             .id("inbox-page")
             .debug_selector(|| "inbox-page".to_string())
             .size_full()
             .flex()
             .flex_col()
-            .child(self.inbox_header(list.count, t, cx))
             .when(list.count > 0 || self.inbox_filter != Filter::All, |d| {
                 d.child(self.inbox_chips(list, t, cx))
             })
