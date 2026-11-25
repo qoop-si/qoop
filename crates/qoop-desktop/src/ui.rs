@@ -499,6 +499,23 @@ pub fn kbd_in(keys: &str, pair: Pair) -> Div {
         .child(keys.to_string())
 }
 
+/// A count of what waits on the person, as the column's badges draw it.
+pub fn badge(count: String, t: &Theme) -> Div {
+    div()
+        .flex_none()
+        .min_w(px(18.))
+        .h(px(18.))
+        .px(px(5.))
+        .rounded_full()
+        .bg(c(t.needs))
+        .text_color(c(t.badge_fg))
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .flex()
+        .justify_center()
+        .child(count)
+}
+
 /// A focusable control: its role, its label, a tab stop, and a ring when the keyboard is on
 /// it. The caller adds the look and `on_click`.
 pub fn control(

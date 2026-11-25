@@ -361,6 +361,8 @@ mod tests {
             let mut grounds = pages.clone();
             grounds.extend(pages.iter().map(|&g| over(t.fill, g)));
             grounds.push(over(t.needs_bg, t.card));
+            // The head of the agent page's "Other agents waiting".
+            grounds.push(over(t.needs_bg, t.panel));
             let mut texts = vec![
                 ("ink", t.ink),
                 ("t1", t.t1),

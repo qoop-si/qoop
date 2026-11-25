@@ -1,32 +1,37 @@
-//! The session page: the agent's header (Next waiting and the prefix hints), the space's tabs,
-//! the tab's panes as the daemon keeps them (read only) with the question card under them, and
-//! the task strip and d-review as drawers beside them, closed until asked for (their width is
-//! dragged, see `shell.rs`).
+//! The session page: the space's tabs, the tab's panes as the daemon keeps them (read only)
+//! with this agent's question under them, and the panel ("Other agents waiting" over "This
+//! agent") or d-review as drawers beside them, closed until asked for (their width is dragged,
+//! see `shell.rs`).
 //!
-//! The terminal keeps the keys: the strip and the review are driven by clicks and by the
+//! The terminal keeps the keys: the panel and the review are driven by clicks and by the
 //! prefix; inside the review, which takes the focus while open, `x` marks the finish read and
-//! `n` opens the next file.
+//! `n` opens the next file. Escape inside the panel closes it.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, FontFeatures, FontWeight, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Role, ScrollDelta, ScrollEvent,
-    Window, div, prelude::*, px, relative,
+    AnyElement, ClipboardItem, Context, FocusHandle, FontFeatures, FontWeight, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Role, ScrollDelta,
+    ScrollEvent, Window, div, prelude::*, px, relative,
 };
 use qoop_runtime::control::{ControlRequest, Pane, SplitDir, TerminalStream};
 use qoop_runtime::daemon::{MAX_SCROLLBACK_ROWS, ModesWire, SnapshotWire};
+use qoop_tui::inbox::{Inbox, Item};
 
 use crate::app::{Desk, Page, Term};
 use crate::element::TerminalElement;
 use crate::link::{self, Up};
 use crate::review::{self, Mark, Review};
 use crate::shell::Edge;
-use crate::state::{self, Kind};
+use crate::state::{self, Kind, Slot};
 use crate::theme::{DARK, MONO_FONT, TERMINAL_BG, Theme, c, ca};
 use crate::ui::{self, Icon};
+
+/// The Panel toggle's least width: its icon, "Panel" and a "99+" count (118 px in the tests'
+/// font), with room to spare for the system font.
+const PANEL_TOGGLE_W: f32 = 128.;
 
 /// The most diff rows the open file draws; the rest are in the editor.
 const DIFF_ROWS: usize = 600;
@@ -294,6 +299,8 @@ impl Desk {
         let Some(cwd) = self.here(terminal) else {
             return;
         };
+        // The review takes the panel's room: a field open in a block goes with it.
+        self.park_block_field(cx);
         let id = link::fresh_id("changes");
         self.review = Some(Review {
             terminal,
@@ -307,16 +314,177 @@ impl Desk {
         cx.notify();
     }
 
-    /// The task strip's drawer: open or closed. The review takes the same room, so opening
-    /// the strip closes it.
-    pub(crate) fn toggle_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The panel: open or closed, only ever by the person. The review takes the same room, so
+    /// opening the panel closes it. The terminal has the keys after.
+    pub(crate) fn toggle_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.review.take().is_some() {
-            self.task_open = true;
+            self.panel_open = true;
+        } else if self.panel_open {
+            self.close_panel(cx);
         } else {
-            self.task_open = !self.task_open;
+            self.panel_open = true;
         }
         window.focus(&self.term_focus, cx);
         cx.notify();
+    }
+
+    /// The panel closes. A block's own-answer field closes with it, its words kept as that
+    /// question's draft (as when a question goes): left open behind the terminal it would turn
+    /// off the card's digits, and a digit would reach the agent raw.
+    pub(crate) fn close_panel(&mut self, cx: &mut Context<Self>) {
+        self.panel_open = false;
+        self.park_block_field(cx);
+    }
+
+    /// A block's own-answer field leaves the screen: closed, its words kept as the draft.
+    fn park_block_field(&mut self, cx: &mut Context<Self>) {
+        let in_block = self.own.as_ref().is_some_and(|own| {
+            let slot = match &own.card {
+                Some(card) => Slot::Card(card.clone()),
+                None => Slot::Agent(own.terminal),
+            };
+            self.others_shown.contains(&slot)
+        });
+        if in_block && let Some(own) = self.own.take() {
+            let words = own.field.read(cx).text.trim().to_string();
+            if !words.is_empty() {
+                let slot = match own.card {
+                    Some(card) => Slot::Card(card),
+                    None => Slot::Agent(own.terminal),
+                };
+                self.drafts.insert(slot, words);
+            }
+        }
+    }
+
+    /// Whether the panel is drawn: open, on an agent page, the review not in its room.
+    pub(crate) fn panel_drawn(&self) -> bool {
+        self.panel_open && self.review.is_none() && self.term_drawn()
+    }
+
+    /// Escape with the keys in the panel: out of a block's own-answer field first (its words
+    /// kept, the keys on that block's head), else the panel closes and the terminal has the
+    /// keys.
+    pub(crate) fn panel_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let field = self
+            .own
+            .as_ref()
+            .filter(|o| o.field.read(cx).focus.is_focused(window))
+            .map(|o| match &o.card {
+                Some(card) => Slot::Card(card.clone()),
+                None => Slot::Agent(o.terminal),
+            });
+        if let Some(head) = field.and_then(|slot| self.block_head(&slot)) {
+            window.focus(&head, cx);
+        } else {
+            self.close_panel(cx);
+            window.focus(&self.term_focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// The head of the panel's block for `slot`, while it is drawn.
+    pub(crate) fn block_head(&self, slot: &Slot) -> Option<FocusHandle> {
+        if !self.panel_drawn() || !self.others_shown.contains(slot) {
+            return None;
+        }
+        self.blocks.borrow().get(slot).map(|(_, head)| head.clone())
+    }
+
+    /// The Inbox items the panel lists: every one but this agent's own (its menu and its
+    /// cards stay under the terminal), so none is drawn twice.
+    pub(crate) fn others_of<'a>(&self, list: &'a Inbox) -> Vec<&'a Item> {
+        let here = self.term.as_ref().map(|t| t.terminal);
+        list.items
+            .iter()
+            .filter(|i| i.terminal.is_none() || i.terminal != here)
+            .collect()
+    }
+
+    /// Before each frame: hold "Other agents waiting" while the pointer is on it or the keys
+    /// drive inside the panel (as the Inbox list holds), and when a block whose item left had
+    /// the keys, give them to the next block's head, or the pane's head when none is left.
+    pub(crate) fn update_others(
+        &mut self,
+        list: &Inbox,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.panel_drawn() {
+            self.others_hovered = false;
+            self.others_held = None;
+            self.others_shown.clear();
+            self.blocks.borrow_mut().clear();
+            return;
+        }
+        // Another agent's page (`⌘J`, a click in the column): what the pane held was drawn
+        // for the page before, and a hover there says nothing until the pointer moves.
+        let on = self.term.as_ref().map(|t| t.terminal);
+        if on != self.others_on {
+            self.others_on = on;
+            self.others_hovered = false;
+            self.others_held = None;
+        }
+        let live: Vec<Slot> = self
+            .others_of(list)
+            .iter()
+            .map(|i| i.slot.clone())
+            .collect();
+        let keys =
+            window.last_input_was_keyboard() && self.others_focus.contains_focused(window, cx);
+        if self.others_hovered || keys {
+            if self.others_held.is_none() {
+                self.others_held = Some(
+                    self.others_of(list)
+                        .iter()
+                        .map(|i| (i.slot.clone(), self.item_who(i)))
+                        .collect(),
+                );
+            }
+        } else {
+            self.others_held = None;
+        }
+        let gone: Vec<Slot> = self
+            .others_shown
+            .iter()
+            .filter(|s| !live.contains(s))
+            .cloned()
+            .collect();
+        for slot in gone {
+            let had_keys = self
+                .blocks
+                .borrow()
+                .get(&slot)
+                .is_some_and(|(block, _)| block.contains_focused(window, cx));
+            if !had_keys {
+                continue;
+            }
+            let shown = &self.others_shown;
+            let at = shown.iter().position(|s| *s == slot).unwrap_or(0);
+            let next = shown[at + 1..]
+                .iter()
+                .chain(shown[..at].iter().rev())
+                .find(|s| live.contains(s))
+                .cloned();
+            let to = match next {
+                Some(next) => self.block_handles(&next, cx).1,
+                None => self.others_head.clone(),
+            };
+            window.focus(&to, cx);
+        }
+        self.blocks
+            .borrow_mut()
+            .retain(|slot, _| live.contains(slot));
+        self.others_shown = live;
+    }
+
+    /// A block's two handles (the block, its head), made before it is drawn.
+    fn block_handles(&self, slot: &Slot, cx: &mut Context<Self>) -> (FocusHandle, FocusHandle) {
+        self.blocks
+            .borrow_mut()
+            .entry(slot.clone())
+            .or_insert_with(|| (cx.focus_handle(), cx.focus_handle()))
+            .clone()
     }
 
     /// Mark read: the finish on screen counts as seen, for that stop only.
@@ -398,15 +566,14 @@ impl Desk {
             .model
             .row(term.terminal)
             .filter(|r| r.menu.is_some() && Kind::of(r).needs_you());
-        let drawer = match (&self.review, self.task_open) {
+        let drawer = match (&self.review, self.panel_open) {
             (Some(review), _) => Some(self.review_panel(review, t, cx).into_any_element()),
-            (None, true) => Some(self.task_column(t, cx).into_any_element()),
+            (None, true) => Some(self.panel(inbox, t, cx)),
             (None, false) => None,
         };
-        let cards = match asking {
-            Some(_) => None,
-            None => self.questions(term.terminal, inbox, t, cx),
-        };
+        // qass's cards about this agent stay under its terminal, under its own question when
+        // it asks one too: the panel lists only the other agents'.
+        let cards = self.questions(term.terminal, asking.is_some(), inbox, t, cx);
         // A pick's line in the card takes its own room: the room under the terminal grows by it.
         let slot = state::Slot::Agent(term.terminal);
         let said_room = match asking {
@@ -426,7 +593,7 @@ impl Desk {
             .flex()
             .flex_col()
             .gap(px(10.))
-            .child(self.tab_row(term.terminal, t, cx))
+            .child(self.tab_row(term.terminal, inbox, t, cx))
             .child(
                 div()
                     .flex_1()
@@ -501,7 +668,7 @@ impl Desk {
                             }),
                     )
                     .when_some(drawer, |d, drawer| {
-                        d.child(self.divider(Edge::Drawer, "Resize the side panel", t, cx))
+                        d.child(self.divider(Edge::Drawer, "Panel width", t, cx))
                             .child(
                                 div()
                                     .flex_none()
@@ -522,6 +689,7 @@ impl Desk {
     fn tab_row(
         &self,
         shown: TerminalStream,
+        inbox: &Inbox,
         t: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -530,18 +698,11 @@ impl Desk {
         let tabs = row.map_or_else(Vec::new, |r| self.model.tabs_of(r.workspace));
         let tree = self.model.tree_of(shown).leaves();
         let here = self.here(shown);
-        // How far the task is, as the strip reads it, else as the agent's row does.
-        let task_said = self
-            .strip
-            .as_ref()
-            .and_then(|strip| strip.heading())
-            .map(|(_, progress)| progress)
-            .or_else(|| {
-                row.and_then(|r| r.task.as_ref())
-                    .filter(|k| k.steps_total > 0)
-                    .map(|k| format!("{} of {} done", k.steps_done, k.steps_total))
-            })
-            .filter(|said| !said.is_empty());
+        let open = self.panel_open && self.review.is_none();
+        // Closed, the panel's toggle carries how many other items wait.
+        let waiting = (!open)
+            .then(|| self.others_of(inbox).len())
+            .filter(|n| *n > 0);
         let totals = self.review.as_ref().and_then(|r| match &r.read {
             Some(Ok(changes)) => Some(changes.totals()),
             _ => None,
@@ -625,33 +786,39 @@ impl Desk {
             })
             .child(
                 ui::control(
-                    "task-toggle",
+                    "panel-toggle",
                     Role::Button,
-                    match &task_said {
-                        Some(said) => format!("Task, {said}"),
-                        None => "Task".to_string(),
+                    match (open, waiting) {
+                        (true, _) => "Hide the panel".to_string(),
+                        (false, Some(1)) => "Show the panel, 1 other waiting".to_string(),
+                        (false, Some(n)) => format!("Show the panel, {n} others waiting"),
+                        (false, None) => "Show the panel".to_string(),
                     },
                     t,
                 )
-                .debug_selector(|| "task-toggle".to_string())
-                .aria_expanded(self.task_open && self.review.is_none())
+                .debug_selector(|| "panel-toggle".to_string())
+                .aria_expanded(open)
                 .flex()
                 .items_center()
                 .gap(px(6.))
                 .h(px(30.))
+                // Room for "99+": a count coming or going never moves the row.
+                .min_w(px(PANEL_TOGGLE_W))
                 .px(px(10.))
                 .rounded(px(9.))
                 .text_size(px(12.5))
                 .text_color(c(t.t1))
-                .when(self.task_open && self.review.is_none(), |d| {
-                    ui::current(d, t)
-                })
+                .when(open, |d| ui::current(d, t))
                 .hover(|s| ui::paint(s, t.hover()))
-                .child("Task")
-                .when_some(task_said.clone(), |d, said| {
-                    d.child(div().text_color(c(t.t2)).child(said))
+                .child(ui::icon(Icon::Panel, 16., c(t.t1)))
+                .child("Panel")
+                .when_some(waiting, |d, n| {
+                    d.child(
+                        ui::badge(if n > 99 { "99+".into() } else { n.to_string() }, t)
+                            .debug_selector(|| "panel-toggle-count".to_string()),
+                    )
                 })
-                .on_click(cx.listener(|this, _, window, cx| this.toggle_task(window, cx))),
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_panel(window, cx))),
             )
             .when(here.is_some(), |d| {
                 d.child(
@@ -879,11 +1046,12 @@ impl Desk {
     }
 
     /// The agent's open question cards over its task: each folded to a row, one opened in place
-    /// (the oldest until another is clicked). A waiting agent with no card says so. `None` when
-    /// there is nothing to say.
+    /// (the oldest until another is clicked). A waiting agent with no card and no question of
+    /// its own (`asking`) says so. `None` when there is nothing to say.
     fn questions(
         &self,
         terminal: TerminalStream,
+        asking: bool,
         inbox: &qoop_tui::inbox::Inbox,
         t: &Theme,
         cx: &mut Context<Self>,
@@ -902,10 +1070,11 @@ impl Desk {
                 .gap(px(6.))
         };
         if cards.is_empty() {
-            let waits = row
-                .task
-                .as_ref()
-                .is_some_and(|k| k.stage == "waiting-human");
+            let waits = !asking
+                && row
+                    .task
+                    .as_ref()
+                    .is_some_and(|k| k.stage == "waiting-human");
             return waits.then(|| {
                 frame()
                     .p(px(14.))
@@ -1108,22 +1277,414 @@ impl Desk {
                 }
             },
         };
-        ui::scroll(
+        div()
+            .id("task-strip")
+            .debug_selector(|| "task-strip".to_string())
+            .role(Role::Group)
+            .aria_label("Task")
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(section("Task", None, t))
+            .child(body)
+    }
+
+    /// The panel: "Other agents waiting" over "This agent", each its own pane. Opened and
+    /// closed only by the person; what is in it never changes its width.
+    fn panel(&self, inbox: &Inbox, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("panel")
+            .debug_selector(|| "panel".to_string())
+            .role(Role::Complementary)
+            .aria_label("Panel")
+            .track_focus(&self.panel_focus)
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(self.others_pane(inbox, t, cx))
+            .child(self.this_agent_pane(t, cx))
+            .into_any_element()
+    }
+
+    /// "Other agents waiting": its head folds the pane; each other Inbox item a block that
+    /// opens and closes, one open at a time. Held, its blocks stay put: one whose item left
+    /// stays dimmed, not a link, and new ones are counted at its foot.
+    fn others_pane(&self, inbox: &Inbox, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let items = self.others_of(inbox);
+        let drawn: Vec<(Slot, String)> = self.others_held.clone().unwrap_or_else(|| {
+            items
+                .iter()
+                .map(|i| (i.slot.clone(), self.item_who(i)))
+                .collect()
+        });
+        let fresh = items
+            .iter()
+            .filter(|i| !drawn.iter().any(|(s, _)| *s == i.slot))
+            .count();
+        // The block he opened, none if he closed it, else (and once his has left) the first.
+        // Held, the first is the first drawn and his stays his even once it left: no block
+        // opens or closes under the pointer.
+        let held = self.others_held.is_some();
+        let open = match &self.block_open {
+            Some(None) => None,
+            Some(Some(slot)) if held || items.iter().any(|i| &i.slot == slot) => Some(slot.clone()),
+            _ if held => drawn.first().map(|(slot, _)| slot.clone()),
+            _ => items.first().map(|i| i.slot.clone()),
+        };
+        let folded = self.others_folded;
+        let head = ui::control(
+            "others-head",
+            Role::Button,
+            format!("Other agents waiting, {}", items.len()),
+            t,
+        )
+        .track_focus(&self.others_head)
+        .debug_selector(|| "others-head".to_string())
+        .aria_expanded(!folded)
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .min_h(px(36.))
+        .px(px(12.))
+        .text_size(px(13.))
+        // The mock's tint: the other agents' questions apart from this agent's.
+        .bg(ca(t.needs_bg))
+        .hover(|s| ui::paint(s, t.hover()))
+        .child(ui::mark(WAITS, t, 10.))
+        .child(
             div()
-                .id("task-strip")
-                .debug_selector(|| "task-strip".to_string())
-                .role(Role::Complementary)
-                .aria_label("Task")
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(c(t.ink))
+                .child("Other agents waiting"),
+        )
+        .when(!items.is_empty(), |d| {
+            d.child(ui::badge(items.len().to_string(), t))
+        })
+        .child(div().flex_1())
+        .child(chevron(!folded, t))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.others_folded = !this.others_folded;
+            cx.notify();
+        }));
+        let body = ui::scroll(
+            div()
+                .id("others-body")
+                .role(Role::List)
+                .aria_label("Other agents waiting")
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .p(px(14.))
-                .rounded(px(14.))
-                .bg(c(t.card))
-                .border_1()
-                .border_color(ca(t.hair))
-                .child(body),
-        )
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .px(px(10.))
+                .pb(px(10.))
+                .when(items.is_empty() && drawn.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .id("others-none")
+                            .debug_selector(|| "others-none".to_string())
+                            .role(Role::Status)
+                            .px(px(4.))
+                            .text_size(px(13.))
+                            .text_color(c(t.t2))
+                            .child("Nothing else waits."),
+                    )
+                })
+                .children(drawn.iter().map(|(slot, who)| {
+                    match items.iter().find(|i| &i.slot == slot) {
+                        Some(item) => self.other_block(item, open.as_ref() == Some(slot), t, cx),
+                        None => {
+                            let word = match slot {
+                                Slot::Agent(t) => {
+                                    let agents = self.model.agents();
+                                    self.left_word(
+                                        agents.iter().find(|e| e.terminal() == *t).copied(),
+                                    )
+                                }
+                                Slot::Card(_) => "Answered".to_string(),
+                            };
+                            crate::column::left_row(
+                                format!("block-{}", slot_key(slot)),
+                                who.clone(),
+                                word,
+                                t,
+                            )
+                        }
+                    }
+                }))
+                .when(fresh > 0, |d| {
+                    d.child(
+                        div()
+                            .id("others-new")
+                            .debug_selector(|| "others-new".to_string())
+                            .role(Role::Status)
+                            .px(px(4.))
+                            .text_size(px(12.))
+                            .text_color(c(t.t2))
+                            .child(format!("{fresh} new, shown when you move away")),
+                    )
+                }),
+        );
+        div()
+            .id("others-pane")
+            .debug_selector(|| "others-pane".to_string())
+            .role(Role::Region)
+            .aria_label("Other agents waiting")
+            .track_focus(&self.others_focus)
+            .hover_listener_mode(gpui::HoverListenerMode::InputModalityIndependent)
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if this.others_hovered != *hovered {
+                    this.others_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
+            .when(!folded, |d| d.flex_1())
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .rounded(px(12.))
+            .overflow_hidden()
+            .bg(c(t.panel))
+            .border_1()
+            .border_color(ca(t.needs_line))
+            .child(head)
+            .when(!folded, |d| d.child(body))
+            .into_any_element()
+    }
+
+    /// One other agent's item: a head that opens and closes it (its agent, what it asks folded,
+    /// how long it waited), and open, its whole card with an Undo line while a pick holds.
+    fn other_block(
+        &self,
+        item: &Item,
+        open: bool,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (block, head) = self.block_handles(&item.slot, cx);
+        let row = item.terminal.and_then(|t| self.model.row(t));
+        let card = match &item.slot {
+            Slot::Card(id) => self.asks.iter().find(|a| &a.card == id),
+            Slot::Agent(_) => None,
+        };
+        let who = self.item_who(item);
+        let question = self.item_question(item);
+        let ago = item.since.map(|at| self.now.saturating_sub(at).max(0));
+        let key = slot_key(&item.slot);
+        let slot = item.slot.clone();
+        let from_qass = item.kind.from_qass();
+        div()
+            .id(gpui::SharedString::from(format!("block-{key}")))
+            .debug_selector({
+                let key = key.clone();
+                move || format!("block-{key}")
+            })
+            .role(Role::ListItem)
+            .aria_label(who.clone())
+            .track_focus(&block)
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(8.))
+            .rounded(px(10.))
+            .bg(c(t.card))
+            .border_1()
+            .border_color(ca(if open { t.needs_line } else { t.hair }))
+            .child(
+                ui::control(
+                    gpui::SharedString::from(format!("block-head-{key}")),
+                    Role::Button,
+                    match ago {
+                        Some(secs) => {
+                            format!("{who} asks: {question}, {}", state::spoken_span(secs))
+                        }
+                        None => format!("{who} asks: {question}"),
+                    },
+                    t,
+                )
+                .track_focus(&head)
+                .debug_selector({
+                    let key = key.clone();
+                    move || format!("block-head-{key}")
+                })
+                .aria_expanded(open)
+                .flex()
+                .items_start()
+                .gap(px(8.))
+                .min_h(px(28.))
+                .px(px(4.))
+                .rounded(px(8.))
+                .text_size(px(13.))
+                .hover(|s| ui::paint(s, t.hover()))
+                .child(div().pt(px(3.)).child(chevron(open, t)))
+                .child(div().pt(px(1.)).child(ui::avatar(
+                    row.and_then(|r| r.program.as_deref()).or(Some("qass")),
+                    WAITS,
+                    16.,
+                    false,
+                    t,
+                )))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().whitespace_normal().child(who))
+                        .when(!open, |d| {
+                            d.child(
+                                div()
+                                    .whitespace_normal()
+                                    .text_size(px(12.5))
+                                    .text_color(c(t.t2))
+                                    .child(question.clone()),
+                            )
+                        }),
+                )
+                .children(ago.map(|secs| {
+                    div()
+                        .flex_none()
+                        .text_size(px(12.))
+                        .text_color(c(t.t2))
+                        .child(state::short_span(secs))
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.block_open = Some((!open).then(|| slot.clone()));
+                    cx.notify();
+                })),
+            )
+            .when(open && from_qass, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .px(px(4.))
+                        .text_size(px(12.))
+                        .text_color(c(t.needs_text))
+                        .child(ui::icon(Icon::Eye, 12., c(t.needs_text)))
+                        .child("From qass"),
+                )
+            })
+            .when(open, |d| {
+                d.child(
+                    div()
+                        .px(px(4.))
+                        .child(self.card_answers(item, row, card, 0, t, cx)),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// "This agent": its head with `esc` and the close button, then its Task (not on qass's
+    /// page, where there is none) and Agent.
+    fn this_agent_pane(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let row = self
+            .term
+            .as_ref()
+            .and_then(|term| self.model.row(term.terminal));
+        let qass = row.is_some_and(|r| Some(r.terminal) == self.qass_terminal());
+        div()
+            .id("this-agent")
+            .debug_selector(|| "this-agent".to_string())
+            .role(Role::Region)
+            .aria_label("This agent")
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .rounded(px(12.))
+            .bg(c(t.panel))
+            .border_1()
+            .border_color(ca(t.hair))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .min_h(px(36.))
+                    .pl(px(12.))
+                    .pr(px(6.))
+                    .text_size(px(13.))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(c(t.ink))
+                            .child("This agent"),
+                    )
+                    .child(div().flex_1())
+                    .child(ui::kbd("esc", t))
+                    .child(
+                        ui::control("panel-close", Role::Button, "Close the panel", t)
+                            .debug_selector(|| "panel-close".to_string())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(26.))
+                            .rounded(px(7.))
+                            .hover(|s| ui::paint(s, t.hover()))
+                            .child(ui::icon(Icon::Close, 12., c(t.t1)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_panel(cx);
+                                window.focus(&this.term_focus, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(ui::scroll(
+                div()
+                    .id("this-agent-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    .px(px(12.))
+                    .pb(px(12.))
+                    .when(!qass, |d| d.child(self.task_column(t, cx)))
+                    .children(row.map(|r| self.agent_section(r, t))),
+            ))
+            .into_any_element()
+    }
+
+    /// The agent's own facts: its state, its program, its computer and its tab.
+    fn agent_section(&self, row: &qoop_runtime::control::AgentRow, t: &Theme) -> AnyElement {
+        let computer = self
+            .model
+            .space(row.workspace)
+            .map_or_else(|| "This Mac".to_string(), state::machine_name);
+        let line = |name: &str, value: String| {
+            div()
+                .flex()
+                .gap(px(10.))
+                .text_size(px(12.5))
+                .child(
+                    div()
+                        .w(px(72.))
+                        .flex_none()
+                        .text_color(c(t.t2))
+                        .child(name.to_string()),
+                )
+                .child(div().flex_1().min_w_0().whitespace_normal().child(value))
+        };
+        div()
+            .id("agent-facts")
+            .debug_selector(|| "agent-facts".to_string())
+            .role(Role::Group)
+            .aria_label("Agent")
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(section("Agent", None, t))
+            .child(line("state", self.shown_word(row)))
+            .when_some(row.program.clone(), |d, p| d.child(line("program", p)))
+            .child(line("computer", computer))
+            .child(line("tab", row.terminal.to_string()))
+            .into_any_element()
     }
 
     /// d-review: the files the tab's checkout changed against its base, one open.
@@ -1433,6 +1994,27 @@ fn quiet(text: &str, t: &Theme) -> impl IntoElement {
         .text_size(px(12.5))
         .text_color(c(t.t2))
         .child(text.to_string())
+}
+
+/// What an item in the panel waits for: the person.
+const WAITS: Kind = Kind::Status(qoop_domain::status::Status::Blocked);
+
+/// A block's name for its element id and debug selector: `t3` for an agent, a card's id.
+fn slot_key(slot: &Slot) -> String {
+    match slot {
+        Slot::Agent(terminal) => format!("t{terminal}"),
+        Slot::Card(card) => card.clone(),
+    }
+}
+
+/// A fold's chevron: pointing right folded, down open.
+fn chevron(open: bool, t: &Theme) -> impl IntoElement {
+    let chevron = ui::icon(Icon::Chevron, 12., c(t.t3));
+    if open {
+        chevron.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.25)))
+    } else {
+        chevron
+    }
 }
 
 /// A section heading with its count on the right: "Plan  2 of 4".

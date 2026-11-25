@@ -139,8 +139,9 @@ impl Desk {
         };
         self.hold(hold, window, cx);
         // Picked on the session's card: the keys go back to its terminal, as after a typed
-        // answer, so the next question's digit works and `u` still undoes.
-        if self.term_drawn() {
+        // answer, so the next question's digit works and `u` still undoes. Picked in the
+        // panel for another agent: they stay in the panel, never in this agent's terminal.
+        if self.term_drawn() && self.page == Page::Session(terminal) {
             window.focus(&self.term_focus, cx);
         }
     }
@@ -785,7 +786,7 @@ impl Desk {
                     window,
                     cx,
                 );
-                self.focus_after_own(window, cx);
+                self.focus_after_own(&Slot::Card(card), window, cx);
             }
             return true;
         }
@@ -807,6 +808,7 @@ impl Desk {
                 };
                 self.own = None;
                 self.hold(hold, window, cx);
+                self.focus_after_own(&Slot::Agent(terminal), window, cx);
             }
             return true;
         }
@@ -833,14 +835,17 @@ impl Desk {
         };
         self.own = None;
         self.pick(terminal, &offer, window, cx);
-        self.focus_after_own(window, cx);
+        self.focus_after_own(&Slot::Agent(terminal), window, cx);
         true
     }
 
-    /// The keys go back where they were once words are held: the terminal when one is on
-    /// screen, else the window (never a terminal that is not drawn).
-    fn focus_after_own(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.term_drawn() {
+    /// The keys go back where they were once words are held: the head of the panel's block
+    /// they were typed in, else the terminal when one is on screen, else the window (never a
+    /// terminal that is not drawn).
+    fn focus_after_own(&self, slot: &Slot, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(head) = self.block_head(slot) {
+            window.focus(&head, cx);
+        } else if self.term_drawn() {
             window.focus(&self.term_focus, cx);
         } else {
             window.focus(&self.focus, cx);
@@ -933,6 +938,20 @@ impl Desk {
         self.said_line_in(slot, true, t, cx)
     }
 
+    /// Whether `u` undoes a pick on `slot` here: anywhere on the Inbox; on an agent's page,
+    /// only that agent's own picks (its menu, its cards).
+    fn u_undoes(&self, slot: &Slot) -> bool {
+        match (self.page, slot) {
+            (Page::Inbox, _) => true,
+            (Page::Session(on), Slot::Agent(t)) => on == *t,
+            (Page::Session(on), Slot::Card(id)) => self
+                .asks
+                .iter()
+                .any(|a| a.card == *id && a.terminal == Some(on)),
+            _ => false,
+        }
+    }
+
     /// [`Self::said_line`], with the hold drawn here (`held`) or left to the Inbox's hold bar,
     /// which names the pick and its target once for the whole page.
     pub(crate) fn said_line_in(
@@ -943,8 +962,12 @@ impl Desk {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let number = slot_number(slot);
-        // The newest pick is the hold bar's; another pick on hold keeps its line on its card.
-        if !held && self.holds.held.last().is_some_and(|h| &h.slot == slot) {
+        // The newest pick is the hold bar's (drawn on the Inbox only); another pick on hold
+        // keeps its line on its card.
+        if !held
+            && self.page == Page::Inbox
+            && self.holds.held.last().is_some_and(|h| &h.slot == slot)
+        {
             return None;
         }
         if let Some(hold) = self.holds.of(slot) {
@@ -979,9 +1002,16 @@ impl Desk {
                     .child({
                         let undo = slot.clone();
                         ui::pill(("undo", number), "Undo", t)
+                            .debug_selector(|| "held-undo".to_string())
                             .h(px(26.))
                             .child("Undo")
-                            .child(ui::kbd("u", t))
+                            // The key only where it undoes this pick: on an agent's page `u`
+                            // is that agent's (a block's pick is undone by this pill).
+                            .when(self.u_undoes(slot), |d| {
+                                d.child(
+                                    ui::kbd("u", t).debug_selector(|| "held-undo-key".to_string()),
+                                )
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.undo(Some(&undo), cx);
                             }))
@@ -1136,15 +1166,15 @@ impl Desk {
             .debug_selector(|| "question-card".to_string())
             .role(Role::Group)
             .aria_label(match &as_of {
-                Some(when) => format!("Question, {when}: {}", menu.question),
-                None => format!("Question: {}", menu.question),
+                Some(when) => format!("This agent's question, {when}: {}", menu.question),
+                None => format!("This agent's question: {}", menu.question),
             })
             .flex_none()
-            .p(px(12.))
+            .p(px(14.))
             .flex()
             .flex_col()
             .gap(px(6.))
-            .rounded(px(12.))
+            .rounded(px(14.))
             .bg(c(t.card))
             .border_1()
             .border_color(ca(if stale { t.line } else { t.needs_line }))
@@ -1167,7 +1197,11 @@ impl Desk {
                                 .text_color(c(t.t2))
                                 .child(age),
                         )
-                    }),
+                    })
+                    // The other agents' questions are in the panel: this one is the agent's
+                    // on screen.
+                    .child(div().flex_1())
+                    .child(div().text_color(c(t.t2)).child("this agent")),
             )
             .when(!menu.question.is_empty(), |d| {
                 d.child(

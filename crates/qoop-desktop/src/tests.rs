@@ -1618,7 +1618,7 @@ fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
         vcx.debug_bounds("task-strip").is_none(),
         "the task strip is a drawer, closed until asked for"
     );
-    let at = vcx.debug_bounds("task-toggle").expect("Task").center();
+    let at = vcx.debug_bounds("panel-toggle").expect("Panel").center();
     vcx.simulate_click(at, gpui::Modifiers::none());
     assert!(
         vcx.debug_bounds("task-strip").is_some() && vcx.debug_bounds("card-2-1").is_some(),
@@ -3162,7 +3162,7 @@ fn the_session_page_lists_its_agents_cards(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("tab-questions").is_some(), "says it waits");
-    let at = vcx.debug_bounds("task-toggle").expect("Task").center();
+    let at = vcx.debug_bounds("panel-toggle").expect("Panel").center();
     vcx.simulate_click(at, gpui::Modifiers::none());
     assert!(
         vcx.debug_bounds("task-progress").is_some(),
@@ -4520,10 +4520,10 @@ fn the_agent_page_has_the_card_under_the_terminal_and_drawers_closed(cx: &mut Te
     );
     assert!(vcx.debug_bounds("question-side").is_none(), "no side panel");
     assert!(vcx.debug_bounds("task-strip").is_none(), "closed at first");
-    let at = vcx.debug_bounds("task-toggle").expect("Task").center();
+    let at = vcx.debug_bounds("panel-toggle").expect("Panel").center();
     vcx.simulate_click(at, gpui::Modifiers::none());
     assert!(vcx.debug_bounds("task-strip").is_some(), "opened");
-    let at = vcx.debug_bounds("task-toggle").expect("Task").center();
+    let at = vcx.debug_bounds("panel-toggle").expect("Panel").center();
     vcx.simulate_click(at, gpui::Modifiers::none());
     assert!(vcx.debug_bounds("task-strip").is_none(), "closed again");
 }
@@ -8028,4 +8028,482 @@ fn after_a_row_click_the_keys_follow_to_the_next_card(cx: &mut TestAppContext) {
     assert_eq!(cursor(&desk, &vcx), Some(Slot::Agent(2)));
     let two = card_of(&desk, &vcx, 2).expect("2's card");
     assert!(has_keys(&mut vcx, &two), "the keys on it");
+}
+
+// The desktop redesign, P4: the agent page.
+
+/// Agent `terminal`'s page, its panel opened by the Panel toggle.
+fn with_panel(desk: &Entity<Desk>, vcx: &mut VisualTestContext, terminal: u32) {
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(terminal), window, cx)));
+    vcx.run_until_parked();
+    click_on(vcx, "panel-toggle");
+    assert!(vcx.debug_bounds("panel").is_some(), "the panel is open");
+}
+
+fn resizes(rx: &mut UnboundedReceiver<Up>) -> usize {
+    sent(rx)
+        .iter()
+        .filter(|u| matches!(u, Up::Resize(..)))
+        .count()
+}
+
+fn panel_open(desk: &Entity<Desk>, vcx: &VisualTestContext) -> bool {
+    desk.read_with(vcx, |d, _| d.panel_open)
+}
+
+fn term_has_keys(desk: &Entity<Desk>, vcx: &mut VisualTestContext) -> bool {
+    let term = desk.read_with(vcx, |d, _| d.term_focus.clone());
+    has_keys(vcx, &term)
+}
+
+fn inside(vcx: &mut VisualTestContext, what: &'static str, of: &'static str) -> bool {
+    let what = vcx.debug_bounds(what).unwrap_or_else(|| panic!("{what}"));
+    let of = vcx.debug_bounds(of).unwrap_or_else(|| panic!("{of}"));
+    of.contains(&what.center())
+}
+
+/// The Panel toggle sends one resize per click and none while the panel stays open; other
+/// agents starting or stopping to wait change nothing. Closed, the toggle counts them.
+#[gpui::test]
+fn opening_the_panel_resizes_once_and_waiting_elsewhere_never(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("panel-toggle-count").is_some(),
+        "closed, it counts the others waiting"
+    );
+    // Closed, the count growing to two figures and past 99 never changes the toggle's width.
+    let width = |vcx: &mut VisualTestContext| {
+        vcx.debug_bounds("panel-toggle")
+            .expect("the toggle")
+            .size
+            .width
+    };
+    let one = width(&mut vcx);
+    sent(&mut rx);
+    desk.update(&mut vcx, |d, cx| {
+        d.asks = (0..12)
+            .map(|n| tab_card(&format!("Q{n}"), 5, "open"))
+            .collect();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert_eq!(width(&mut vcx), one, "13 takes the room 1 did");
+    desk.update(&mut vcx, |d, cx| {
+        d.asks = (0..100)
+            .map(|n| tab_card(&format!("Q{n}"), 5, "open"))
+            .collect();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert_eq!(width(&mut vcx), one, "and 99+");
+    assert_eq!(resizes(&mut rx), 0, "the count never resizes");
+    desk.update(&mut vcx, |d, cx| {
+        d.asks.clear();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    sent(&mut rx);
+    click_on(&mut vcx, "panel-toggle");
+    vcx.run_until_parked();
+    assert_eq!(resizes(&mut rx), 1, "one resize for the click");
+    assert!(vcx.debug_bounds("panel-toggle-count").is_none(), "open");
+    answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100), (4, 44, 1, 300)]));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("block-t3").is_some(), "3 waits now");
+    answer(&desk, &mut vcx, asking(&[]));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("block-t3").is_none(), "and stopped");
+    assert_eq!(resizes(&mut rx), 0, "waiting elsewhere never resizes");
+    assert!(panel_open(&desk, &vcx), "it never closes by itself");
+    click_on(&mut vcx, "panel-toggle");
+    vcx.run_until_parked();
+    assert_eq!(resizes(&mut rx), 1, "one resize for the close");
+}
+
+/// This agent's question sits under its terminal, whole, and not in the panel; on another
+/// agent's page the two swap places, nothing left behind.
+#[gpui::test]
+fn this_agents_question_is_under_the_terminal_and_not_in_the_panel(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    answer(&desk, &mut vcx, asking(&[(1, 11, 1, 100), (3, 33, 1, 300)]));
+    with_panel(&desk, &mut vcx, 1);
+    assert!(inside(&mut vcx, "question-card", "agent-below"), "under it");
+    assert!(vcx.debug_bounds("block-t1").is_none(), "not in the panel");
+    assert!(vcx.debug_bounds("block-t3").is_some(), "3's is");
+    // The pointer resting on the pane (held), `⌘J` opens 3's page.
+    let pane = vcx.debug_bounds("others-head").expect("the pane").center();
+    vcx.simulate_mouse_move(pane, None, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert!(desk.read_with(&vcx, |d, _| d.others_held.is_some()), "held");
+    vcx.simulate_keystrokes("cmd-j");
+    vcx.run_until_parked();
+    assert_eq!(desk.read_with(&vcx, |d, _| d.page), Page::Session(3));
+    assert!(vcx.debug_bounds("others-new").is_none(), "nothing stale");
+    assert!(inside(&mut vcx, "question-card", "agent-below"));
+    assert!(vcx.debug_bounds("block-t3").is_none(), "3's left the panel");
+    assert!(vcx.debug_bounds("block-t1").is_some(), "1's came in");
+    let stale = desk.read_with(&vcx, |d, _| {
+        d.blocks
+            .borrow()
+            .contains_key(&crate::state::Slot::Agent(3))
+    });
+    assert!(!stale, "3's block handles are gone");
+}
+
+/// The panel lists every other agent's item and qass's cards about other agents, never this
+/// agent's menu or cards; with none, it says so and its head stays.
+#[gpui::test]
+fn the_panel_lists_only_other_agents_items(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    answer(&desk, &mut vcx, asking(&[(3, 33, 1, 300)]));
+    desk.update(&mut vcx, |d, cx| {
+        d.asks = vec![tab_card("Q1", 1, "open"), tab_card("Q5", 5, "open")];
+        cx.notify();
+    });
+    with_panel(&desk, &mut vcx, 1);
+    for (what, there) in [
+        ("block-t3", true),
+        ("block-t2", true),
+        ("block-Q5", true),
+        ("block-t1", false),
+        ("block-Q1", false),
+    ] {
+        assert_eq!(vcx.debug_bounds(what).is_some(), there, "{what}");
+    }
+    assert!(
+        inside(&mut vcx, "tab-questions", "agent-below"),
+        "Q1 under it"
+    );
+    assert!(vcx.debug_bounds("others-none").is_none());
+    // Only 2 waits, and the page is 2's.
+    desk.update(&mut vcx, |d, cx| {
+        d.asks.clear();
+        cx.notify();
+    });
+    answer(&desk, &mut vcx, asking(&[]));
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(2), window, cx)));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("others-none").is_some(),
+        "Nothing else waits."
+    );
+    assert!(vcx.debug_bounds("others-head").is_some(), "the head stays");
+}
+
+/// Escape with the keys in the panel closes it and gives the terminal the keys; with the
+/// terminal focused, Escape is the agent's and the panel stays.
+#[gpui::test]
+fn escape_closes_the_panel_from_inside_and_reaches_the_agent_from_the_terminal(
+    cx: &mut TestAppContext,
+) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    with_panel(&desk, &mut vcx, 1);
+    let head = desk.read_with(&vcx, |d, _| d.others_head.clone());
+    vcx.update(|window, cx| window.focus(&head, cx));
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!panel_open(&desk, &vcx), "closed");
+    assert!(term_has_keys(&desk, &mut vcx), "the terminal has the keys");
+    click_on(&mut vcx, "panel-toggle");
+    assert!(term_has_keys(&desk, &mut vcx));
+    sent(&mut rx);
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        sent(&mut rx)
+            .iter()
+            .any(|u| matches!(u, Up::Input(1, b) if b == b"\x1b")),
+        "the agent heard it"
+    );
+    assert!(panel_open(&desk, &vcx), "the panel stays");
+}
+
+/// Escape in a block's own-answer field leaves the field, its words kept and the keys on the
+/// block's head; a second Escape closes the panel, the words still kept.
+#[gpui::test]
+fn escape_in_a_block_field_keeps_the_text_and_the_panel(cx: &mut TestAppContext) {
+    use crate::state::Slot;
+    let (desk, mut vcx, mut rx) = open(cx);
+    // This agent asks too: after the panel closes, its digits are its card's again.
+    answer(&desk, &mut vcx, asking(&[(1, 11, 1, 300), (3, 33, 1, 100)]));
+    with_panel(&desk, &mut vcx, 1);
+    std::thread::sleep(qoop_tui::answers::ARMING);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open_own(3, None, window, cx)));
+    vcx.run_until_parked();
+    assert!(inside(&mut vcx, "own-field", "block-t3"), "in 3's block");
+    vcx.simulate_input("half an");
+    let text = |desk: &Entity<Desk>, vcx: &mut VisualTestContext| {
+        vcx.update(|_, cx| {
+            desk.read(cx)
+                .own
+                .as_ref()
+                .map(|o| o.field.read(cx).text.clone())
+        })
+    };
+    assert_eq!(text(&desk, &mut vcx).as_deref(), Some("half an"));
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(panel_open(&desk, &vcx), "the panel stays");
+    assert_eq!(text(&desk, &mut vcx).as_deref(), Some("half an"), "kept");
+    let head = desk.read_with(&vcx, |d, _| {
+        d.blocks
+            .borrow()
+            .get(&Slot::Agent(3))
+            .map(|(_, h)| h.clone())
+    });
+    assert!(has_keys(&mut vcx, &head.expect("3's head")), "on its head");
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!panel_open(&desk, &vcx), "then it closes");
+    assert!(term_has_keys(&desk, &mut vcx));
+    // The field closed with the panel, its words kept as 3's draft.
+    assert_eq!(text(&desk, &mut vcx), None, "the field is closed");
+    let draft = desk.read_with(&vcx, |d, _| d.drafts.get(&Slot::Agent(3)).cloned());
+    assert_eq!(draft.as_deref(), Some("half an"), "still kept");
+    // A digit in the terminal answers this agent's card, held: never a raw byte.
+    sent(&mut rx);
+    vcx.simulate_keystrokes("2");
+    vcx.run_until_parked();
+    assert_eq!(held_slot(&desk, &vcx), Some(Slot::Agent(1)), "held");
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Input(..))),
+        "nothing raw to the agent"
+    );
+}
+
+/// Digits and `u` typed into a block's own-answer field are its words: they answer neither
+/// this agent's question nor the block's.
+#[gpui::test]
+fn typing_in_a_block_field_answers_nothing(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    answer(&desk, &mut vcx, asking(&[(1, 11, 1, 100), (3, 33, 1, 300)]));
+    with_panel(&desk, &mut vcx, 1);
+    std::thread::sleep(qoop_tui::answers::ARMING);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open_own(3, None, window, cx)));
+    vcx.run_until_parked();
+    sent(&mut rx);
+    vcx.simulate_keystrokes("2 u");
+    vcx.run_until_parked();
+    let text = vcx.update(|_, cx| {
+        desk.read(cx)
+            .own
+            .as_ref()
+            .map(|o| o.field.read(cx).text.clone())
+    });
+    assert_eq!(text.as_deref(), Some("2u"), "the field's words");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.holds.held.is_empty()),
+        "no pick"
+    );
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Input(..))),
+        "nothing to the terminal"
+    );
+}
+
+/// An answer from a block holds 3 s with an Undo control in the block, which takes it back.
+/// Its Undo shows no `u`, which on this page is this agent's; a pick on this agent's own card
+/// shows it.
+#[gpui::test]
+fn a_block_answer_holds_and_undoes(cx: &mut TestAppContext) {
+    use crate::state::Slot;
+    let (desk, mut vcx, _rx) = open(cx);
+    answer(&desk, &mut vcx, asking(&[(1, 11, 1, 300), (3, 33, 1, 100)]));
+    with_panel(&desk, &mut vcx, 1);
+    std::thread::sleep(qoop_tui::answers::ARMING);
+    click_on(&mut vcx, "inbox-3-1");
+    assert_eq!(held_slot(&desk, &vcx), Some(Slot::Agent(3)), "held");
+    assert!(
+        inside(&mut vcx, "held-undo", "block-t3"),
+        "Undo in the block"
+    );
+    assert!(vcx.debug_bounds("held-undo-key").is_none(), "no `u` there");
+    click_on(&mut vcx, "held-undo");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.holds.held.is_empty()),
+        "undone"
+    );
+    click_on(&mut vcx, "card-1-1");
+    assert_eq!(held_slot(&desk, &vcx), Some(Slot::Agent(1)));
+    assert!(
+        inside(&mut vcx, "held-undo-key", "question-card"),
+        "`u` on this agent's own"
+    );
+}
+
+/// The keys in a block: Enter on an option holds that agent's answer and the keys stay in
+/// the panel, so the next Enter never reaches this agent's terminal; once the answer is sent
+/// and its item leaves, the keys are on the next block's head.
+#[gpui::test]
+fn a_pick_in_a_block_keeps_the_keys_in_the_panel(cx: &mut TestAppContext) {
+    use crate::state::Slot;
+    let (desk, mut vcx, mut rx) = open(cx);
+    let menus = [(1, 11, 1, 300), (3, 33, 1, 100), (4, 44, 1, 200)];
+    answer(&desk, &mut vcx, asking(&menus));
+    with_panel(&desk, &mut vcx, 1);
+    std::thread::sleep(qoop_tui::answers::ARMING);
+    let head = desk.read_with(&vcx, |d, _| {
+        d.blocks
+            .borrow()
+            .get(&Slot::Agent(3))
+            .map(|(_, h)| h.clone())
+    });
+    vcx.update(|window, cx| window.focus(&head.expect("3's head"), cx));
+    press_key(&mut vcx, "tab");
+    sent(&mut rx);
+    press_key(&mut vcx, "enter");
+    assert_eq!(held_slot(&desk, &vcx), Some(Slot::Agent(3)), "3 held");
+    assert!(!term_has_keys(&desk, &mut vcx), "not this agent's terminal");
+    press_key(&mut vcx, "enter");
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Input(..))),
+        "nothing reached the terminal"
+    );
+    desk.update(&mut vcx, |d, cx| d.send_now(Some(&Slot::Agent(3)), cx));
+    answer(&desk, &mut vcx, asking(&[(1, 11, 1, 300), (4, 44, 1, 200)]));
+    let four = desk.read_with(&vcx, |d, _| {
+        d.blocks
+            .borrow()
+            .get(&Slot::Agent(4))
+            .map(|(_, h)| h.clone())
+    });
+    assert!(
+        has_keys(&mut vcx, &four.expect("4's head")),
+        "the next block's head"
+    );
+}
+
+/// While this agent asks, qass's cards about it stay on its page, under its question; the
+/// panel still leaves them out.
+#[gpui::test]
+fn this_agents_qass_cards_show_under_its_question(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    answer(&desk, &mut vcx, asking(&[(1, 11, 1, 100)]));
+    desk.update(&mut vcx, |d, cx| {
+        d.asks = vec![tab_card("Q1", 1, "open")];
+        cx.notify();
+    });
+    with_panel(&desk, &mut vcx, 1);
+    assert!(inside(&mut vcx, "question-card", "agent-below"));
+    assert!(inside(&mut vcx, "tab-questions", "agent-below"), "Q1 too");
+    let below =
+        |vcx: &mut VisualTestContext, what: &'static str| vcx.debug_bounds(what).expect(what).top();
+    assert!(
+        below(&mut vcx, "tab-questions") > below(&mut vcx, "question-card"),
+        "under its question"
+    );
+    assert!(vcx.debug_bounds("block-Q1").is_none(), "not in the panel");
+}
+
+/// The keys elsewhere in the panel ("This agent") leave "Other agents waiting" unheld.
+#[gpui::test]
+fn keys_elsewhere_in_the_panel_leave_the_pane_unheld(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100)]));
+    with_panel(&desk, &mut vcx, 1);
+    let panel = desk.read_with(&vcx, |d, _| d.panel_focus.clone());
+    vcx.update(|window, cx| window.focus(&panel, cx));
+    press_key(&mut vcx, "left");
+    answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100), (4, 44, 1, 200)]));
+    assert!(vcx.debug_bounds("block-t4").is_some(), "drawn at once");
+    assert!(vcx.debug_bounds("others-new").is_none());
+}
+
+/// After a block's item leaves, the keys that were in it go to the next block's head, then to
+/// the pane's head when none is left.
+#[gpui::test]
+fn the_keys_go_to_the_next_block_when_one_leaves(cx: &mut TestAppContext) {
+    use crate::state::Slot;
+    let (desk, mut vcx, _rx) = open(cx);
+    answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100), (4, 44, 1, 300)]));
+    with_panel(&desk, &mut vcx, 1);
+    let head_of = |desk: &Entity<Desk>, vcx: &VisualTestContext, t: u32| {
+        desk.read_with(vcx, |d, _| {
+            d.blocks
+                .borrow()
+                .get(&Slot::Agent(t))
+                .map(|(_, h)| h.clone())
+        })
+    };
+    let three = head_of(&desk, &vcx, 3).expect("3's head");
+    vcx.update(|window, cx| window.focus(&three, cx));
+    // 3 is answered: 4 is next, then 2 (the dialog), then none.
+    answer(&desk, &mut vcx, asking(&[(4, 44, 1, 300)]));
+    let four = head_of(&desk, &vcx, 4).expect("4's head");
+    assert!(has_keys(&mut vcx, &four), "the next block's head");
+    answer(&desk, &mut vcx, listed_changed(|_| {}));
+    let two = head_of(&desk, &vcx, 2).expect("2's head");
+    assert!(has_keys(&mut vcx, &two));
+    answer(&desk, &mut vcx, listed_changed(now_is(2, "working")));
+    let pane = desk.read_with(&vcx, |d, _| d.others_head.clone());
+    assert!(has_keys(&mut vcx, &pane), "the pane's head");
+}
+
+/// qass's page: the panel's "This agent" has Agent only, no Task section; another agent's has
+/// both.
+#[gpui::test]
+fn qass_page_panel_has_no_task_section(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    with_panel(&desk, &mut vcx, 9);
+    assert!(vcx.debug_bounds("agent-facts").is_some(), "Agent");
+    assert!(vcx.debug_bounds("task-strip").is_none(), "no Task");
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("task-strip").is_some(), "Task");
+    assert!(vcx.debug_bounds("agent-facts").is_some(), "and Agent");
+}
+
+/// One block open at a time, by the mouse and by the keys; a second press closes it.
+#[gpui::test]
+fn the_blocks_open_one_at_a_time_by_mouse_and_keys(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100), (4, 44, 1, 300)]));
+    with_panel(&desk, &mut vcx, 1);
+    assert!(vcx.debug_bounds("inbox-3-1").is_some(), "the first open");
+    assert!(vcx.debug_bounds("inbox-4-1").is_none());
+    click_on(&mut vcx, "block-head-t3");
+    assert!(vcx.debug_bounds("inbox-3-1").is_none(), "closed by a click");
+    click_on(&mut vcx, "block-head-t4");
+    assert!(vcx.debug_bounds("inbox-4-1").is_some(), "4 open");
+    assert!(vcx.debug_bounds("inbox-3-1").is_none(), "3 folded");
+    let three = desk.read_with(&vcx, |d, _| {
+        d.blocks
+            .borrow()
+            .get(&crate::state::Slot::Agent(3))
+            .map(|(_, h)| h.clone())
+    });
+    vcx.update(|window, cx| window.focus(&three.expect("3's head"), cx));
+    press_key(&mut vcx, "enter");
+    assert!(vcx.debug_bounds("inbox-3-1").is_some(), "3 open by Enter");
+    assert!(vcx.debug_bounds("inbox-4-1").is_none(), "4 folded");
+    press_key(&mut vcx, "space");
+    assert!(vcx.debug_bounds("inbox-3-1").is_none(), "closed by Space");
+}
+
+/// Under the pointer the pane holds: a block whose item left stays in place, dimmed and not
+/// a control, and a new item is counted, not drawn; away, it redraws.
+#[gpui::test]
+fn the_panel_holds_its_blocks_under_the_pointer(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100), (4, 44, 1, 300)]));
+    with_panel(&desk, &mut vcx, 1);
+    let pane = vcx.debug_bounds("others-head").expect("the pane").center();
+    vcx.simulate_mouse_move(pane, None, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("inbox-3-1").is_some(), "3 open");
+    answer(&desk, &mut vcx, asking(&[(4, 44, 1, 300), (5, 55, 1, 400)]));
+    assert!(vcx.debug_bounds("block-t3").is_some(), "3 stays, dimmed");
+    assert!(vcx.debug_bounds("block-head-t3").is_none(), "not a control");
+    assert!(
+        vcx.debug_bounds("inbox-4-1").is_none(),
+        "4 does not open under the pointer"
+    );
+    assert!(vcx.debug_bounds("block-t5").is_none(), "5 not drawn yet");
+    assert!(vcx.debug_bounds("others-new").is_some(), "counted");
+    pointer_on_column(&mut vcx);
+    assert!(vcx.debug_bounds("block-t3").is_none());
+    assert!(vcx.debug_bounds("block-t5").is_some());
+    assert!(vcx.debug_bounds("others-new").is_none());
 }
