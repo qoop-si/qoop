@@ -114,10 +114,7 @@ impl Desk {
         };
         let names = items
             .iter()
-            .map(|i| {
-                let who = i.terminal.map_or_else(|| "qass".to_string(), named);
-                (i.slot.clone(), who)
-            })
+            .map(|i| (i.slot.clone(), self.item_who(i)))
             .collect();
         let agents = self.model.agents();
         let titles = others
@@ -136,6 +133,18 @@ impl Desk {
             names,
             titles,
         }
+    }
+
+    /// Whose an item is, as a row names it: its agent's space and title, or qass.
+    pub(crate) fn item_who(&self, item: &Item) -> String {
+        item.terminal.map_or_else(
+            || "qass".to_string(),
+            |t| {
+                self.model
+                    .row(t)
+                    .map_or_else(|| format!("tab {t}"), |r| self.who_text(r))
+            },
+        )
     }
 
     /// An agent as a row of the page names it: its space and its title.
@@ -1530,7 +1539,7 @@ impl Desk {
     }
 
     /// What the card asks and the answers it offers, by its kind.
-    fn card_answers(
+    pub(crate) fn card_answers(
         &self,
         item: &Item,
         row: Option<&AgentRow>,
@@ -1720,7 +1729,12 @@ impl Desk {
                     .map(|(n, o)| self.offer_button(terminal, o, ("inbox", n), t, cx)),
             )
             .when(words && !offers.is_empty(), |d| match own_open {
-                Some(own) => d.child(div().id("own-answer").child(own.field.clone())),
+                Some(own) => d.child(
+                    div()
+                        .id("own-answer")
+                        .debug_selector(|| "own-field".to_string())
+                        .child(own.field.clone()),
+                ),
                 None => d.child(
                     ui::link_button("own-open", "Something else? Type your own answer", t)
                         .on_click(cx.listener(move |this, _, window, cx| {

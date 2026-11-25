@@ -206,8 +206,25 @@ pub struct Desk {
     pub(crate) strip_ask: Option<String>,
     /// The strip drawn as a vertical timeline.
     pub timeline: bool,
-    /// The task strip's drawer beside the terminal is open (closed until asked for).
-    pub(crate) task_open: bool,
+    /// The agent page's panel beside the terminal is open (closed until asked for): "Other
+    /// agents waiting" over "This agent".
+    pub(crate) panel_open: bool,
+    /// The panel, so Escape closes it only with the keys inside it.
+    pub(crate) panel_focus: FocusHandle,
+    /// "Other agents waiting": folded by its head, its head's handle, the block opened (`None`
+    /// the first, `Some(None)` none), each block's own handle and its head's.
+    pub(crate) others_folded: bool,
+    pub(crate) others_head: FocusHandle,
+    pub(crate) block_open: Option<Option<state::Slot>>,
+    pub(crate) blocks: std::cell::RefCell<HashMap<state::Slot, (FocusHandle, FocusHandle)>>,
+    /// The pane held under the pointer or the keys in it (its slots and names as drawn), the
+    /// pane's own handle for the keys, the blocks drawn last frame (for the focus when one
+    /// leaves) and the agent page they were drawn on (a new page starts unheld).
+    pub(crate) others_hovered: bool,
+    pub(crate) others_held: Option<Vec<(state::Slot, String)>>,
+    pub(crate) others_focus: FocusHandle,
+    pub(crate) others_shown: Vec<state::Slot>,
+    pub(crate) others_on: Option<TerminalStream>,
     /// What the agent page measures of its column (`element::Gauge`).
     pub(crate) gauge: Rc<crate::element::Gauge>,
     pub review: Option<Review>,
@@ -448,7 +465,17 @@ impl Desk {
             strip: None,
             strip_ask: None,
             timeline: false,
-            task_open: false,
+            panel_open: false,
+            panel_focus: cx.focus_handle(),
+            others_folded: false,
+            others_head: cx.focus_handle(),
+            block_open: None,
+            blocks: Default::default(),
+            others_hovered: false,
+            others_held: None,
+            others_focus: cx.focus_handle(),
+            others_shown: Vec::new(),
+            others_on: None,
             gauge: Default::default(),
             review: None,
             review_focus: cx.focus_handle(),
@@ -1202,6 +1229,11 @@ impl Desk {
             "/" if self.page == Page::Settings && self.settings.find.is_none() => {
                 self.open_find(window, cx)
             }
+            // Inside the panel: a block's own-answer field is left first, then the panel
+            // closes. With the terminal focused, Escape stays the agent's.
+            "escape" if self.panel_drawn() && self.panel_focus.contains_focused(window, cx) => {
+                self.panel_escape(window, cx)
+            }
             // Off the terminal with nothing open: Escape gives it the keys back. Not from the
             // own-answer field, which stays open: a digit then would go raw to the agent.
             "escape"
@@ -1745,6 +1777,7 @@ impl Render for Desk {
         self.update_hold(&inbox, window, cx);
         self.update_inbox_hold(&inbox, window, cx);
         self.follow_reader(&inbox, window, cx);
+        self.update_others(&inbox, window, cx);
         let side = self.side_px();
         let mut root = div()
             .id("desk")
