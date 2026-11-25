@@ -295,10 +295,14 @@ fn a_start_waits_while_qass_waits_on_the_owner_and_then_reaches_it() {
 fn qass_started_again_after_its_agent_ended_has_one_board() {
     let dir = tempfile::tempdir().unwrap();
     let die = dir.path().join("die");
+    let q = env!("CARGO_BIN_EXE_qoop");
+    // The stand-in says it is an agent through the hook, as claude does: on Linux a shell
+    // script's process is `dash`, which the screen alone never takes for an agent.
     let daemon = Daemon::start_with(
         dir.path(),
         &format!(
-            "while [ ! -f '{die}' ]; do sleep 0.2; done\n",
+            "'{q}' hook-report --state idle --session-id \"s$$\"\n\
+             while [ ! -f '{die}' ]; do sleep 0.2; done\n",
             die = die.display()
         ),
     );
