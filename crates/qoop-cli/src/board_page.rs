@@ -3678,6 +3678,10 @@ pub(crate) fn run() -> std::io::Result<()> {
             .ok()
     };
     let mut stamp = config_stamp();
+    // The page runs in a pane (qass's tab, the desktop's board tab): it draws for the ground
+    // the pane answers, which the file's theme may not be (the desktop's terminal card is dark
+    // in both themes).
+    crate::settings::draw_in_pane();
     crate::settings::apply_theme();
     let mut page = Page::new();
     let config = qoop_tui::config::read().config;
