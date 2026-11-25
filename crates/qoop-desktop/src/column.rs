@@ -1137,7 +1137,12 @@ impl Desk {
                     Some(entry) => {
                         self.agent_row(*entry, title, block.space.is_none(), inbox, t, cx)
                     }
-                    None => self.left_row(*terminal, title, by_terminal.get(terminal).copied(), t),
+                    None => left_row(
+                        format!("tree-row-{terminal}"),
+                        title.unwrap_or_else(|| format!("tab {terminal}")),
+                        self.left_word(by_terminal.get(terminal).copied()),
+                        t,
+                    ),
                 }
             }))
         });
@@ -1533,37 +1538,37 @@ impl Desk {
             .into_any_element()
     }
 
-    /// A held row that left (answered or slept elsewhere, closed, off the filter): in place,
-    /// dimmed, with its new state word, not a link.
-    fn left_row(
-        &self,
-        terminal: u32,
-        title: Option<String>,
-        now: Option<Entry<'_>>,
-        t: &Theme,
-    ) -> AnyElement {
-        let word = now.map_or("closed", |e| self.shown_kind(e).word());
-        div()
-            .debug_selector(move || format!("tree-row-{terminal}"))
-            .flex()
-            .items_start()
-            .gap(px(8.))
-            .min_h(px(28.))
-            .px(px(8.))
-            .py(px(4.))
-            .text_size(px(13.))
-            .text_color(c(t.t2))
-            .child(div().w(px(20.)).flex_none())
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .whitespace_normal()
-                    .child(title.unwrap_or_else(|| format!("tab {terminal}"))),
-            )
-            .child(div().flex_none().text_size(px(11.5)).child(word))
-            .into_any_element()
+    /// The word a held row that left says now: the agent's own state, or "Closed" once it is
+    /// gone.
+    pub(crate) fn left_word(&self, now: Option<Entry<'_>>) -> String {
+        now.map_or_else(
+            || "Closed".to_string(),
+            |e| self.shown_kind(e).word().to_string(),
+        )
     }
+}
+
+/// A held row that left (answered or slept elsewhere, closed, off the filter), the column's
+/// and the Inbox list's alike: in place, dimmed, its title with its new state word, not a
+/// link. `selector` names it (as its live row was) for the tests and as its element id.
+pub(crate) fn left_row(selector: String, title: String, word: String, t: &Theme) -> AnyElement {
+    div()
+        .id(ElementId::from(selector.clone()))
+        .debug_selector(move || selector)
+        .role(Role::ListItem)
+        .aria_label(format!("{title}, {word}"))
+        .flex()
+        .items_start()
+        .gap(px(8.))
+        .min_h(px(28.))
+        .px(px(8.))
+        .py(px(4.))
+        .text_size(px(13.))
+        .text_color(c(t.t2))
+        .child(div().w(px(20.)).flex_none())
+        .child(div().flex_1().min_w_0().whitespace_normal().child(title))
+        .child(div().flex_none().text_size(px(11.5)).child(word))
+        .into_any_element()
 }
 
 /// The line under a filtered list: what it shows (or that nothing is), then the words after
