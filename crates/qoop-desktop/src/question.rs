@@ -212,30 +212,6 @@ impl Desk {
         qoop_tui::tabq::open_cards(&self.asks, terminal)
     }
 
-    /// How many question cards `entry`'s agent waits on, beside its name; nothing at zero.
-    pub(crate) fn card_count(
-        &self,
-        entry: state::Entry<'_>,
-        place: &'static str,
-        t: &Theme,
-    ) -> Option<AnyElement> {
-        let terminal = entry.terminal();
-        let n = self.cards_of(terminal, entry.workspace()).len();
-        (n > 0).then(|| {
-            div()
-                .debug_selector(move || format!("{place}-cards-{terminal}"))
-                .flex_none()
-                .px(px(6.))
-                .rounded(px(8.))
-                .bg(ca(t.needs_bg))
-                .text_size(px(11.5))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(c(t.needs_text))
-                .child(n.to_string())
-                .into_any_element()
-        })
-    }
-
     fn hold(&mut self, hold: Hold, _: &mut Window, cx: &mut Context<Self>) {
         self.said.remove(&hold.slot);
         *self.reveal.borrow_mut() = Some(hold.slot.clone());

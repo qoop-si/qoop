@@ -9,7 +9,7 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -135,8 +135,40 @@ pub struct Desk {
     pub(crate) own_answers: Vec<qoop_tui::inbox::OwnAnswer>,
     /// When the person's day began, for Answered today; looked up again once a day.
     pub(crate) day_start: i64,
-    /// The spaces the sidebar lists in full instead of folded.
-    pub(crate) expanded: BTreeSet<i64>,
+    /// The column: the person's own folds of spaces (over each one's default), the small
+    /// Inbox open, the order, the state filter.
+    pub(crate) folds: BTreeMap<i64, bool>,
+    pub(crate) inbox_open: bool,
+    pub(crate) side_view: state::SideView,
+    pub(crate) side_filter: state::StateTab,
+    /// The hold: the pointer over the column, the column's focus (keys driving inside it), and
+    /// the rows held still meanwhile.
+    pub(crate) side_hovered: bool,
+    pub(crate) side_focus: FocusHandle,
+    pub(crate) held: Option<crate::column::Drawn>,
+    /// The person's own changes, put into the held rows when the lists come back: spaces they
+    /// renamed and made, and the agent they started last.
+    pub(crate) renamed: BTreeSet<i64>,
+    pub(crate) made: Vec<i64>,
+    pub(crate) own_new: Option<u32>,
+    /// The rename or new-space field, the space menu, their focus handles, and the space
+    /// writes out (by id: what for, and when).
+    pub(crate) space_edit: Option<crate::column::SpaceEdit>,
+    pub(crate) space_menu: Option<crate::column::SpaceMenu>,
+    /// The menu's items (the keys move between them), each space's `...` and name, and the
+    /// strip's `+`: where the keys go back to when the menu or a field closes.
+    pub(crate) menu_items: [FocusHandle; 4],
+    pub(crate) more_focus: std::cell::RefCell<HashMap<i64, FocusHandle>>,
+    pub(crate) name_focus: std::cell::RefCell<HashMap<i64, FocusHandle>>,
+    pub(crate) new_space_focus: FocusHandle,
+    /// The pointer is on the open menu, which covers the column (and blocks its hover).
+    pub(crate) menu_hovered: bool,
+    /// The menu a press outside it just closed: that press on its own `...` only closes it.
+    pub(crate) menu_closed_by_press: Option<i64>,
+    pub(crate) space_writes: HashMap<String, (crate::column::EditFor, i64)>,
+    /// Back to the window: machines not answering are tried, the settings file and Reduce
+    /// Motion are read again, and the spaces (one made or renamed elsewhere has no event).
+    _activated: Subscription,
     /// The sidebar's and the drawers' widths as dragged, the window's width as last drawn, and
     /// the divider being dragged.
     pub(crate) side_w: f32,
@@ -293,6 +325,27 @@ impl Desk {
         let focus_lost = cx.on_focus_lost(window, |this: &mut Desk, window, cx| {
             this.focus_home(window, cx)
         });
+        // Back to the window: every machine not answering is tried at once; macOS's Reduce
+        // Motion is read again (a run only: a test never reads the person's setting); the
+        // settings page reads the file again (it may have been edited); and the spaces, since
+        // no event names one made or renamed in the TUI or on the phone (no timer, ADR-009).
+        let activated = cx.observe_window_activation(window, |this: &mut Desk, window, cx| {
+            if !window.is_window_active() {
+                return;
+            }
+            this.retry_away();
+            if !cfg!(test) {
+                ui::read_reduce_motion();
+                this.keep_beating(window, cx);
+            }
+            if this.page == Page::Settings {
+                this.read_settings();
+            }
+            this.ask(ControlRequest::ListWorkspaces {
+                id: link::fresh_id("spaces"),
+            });
+            cx.notify();
+        });
         let mut offered: Vec<(String, String)> = ["claude", "codex", "opencode"]
             .map(|a| (a.to_string(), a.to_string()))
             .to_vec();
@@ -343,7 +396,26 @@ impl Desk {
             cursor_at: 0,
             own_answers: Vec::new(),
             day_start: 0,
-            expanded: BTreeSet::new(),
+            folds: BTreeMap::new(),
+            inbox_open: true,
+            side_view: Default::default(),
+            side_filter: Default::default(),
+            side_hovered: false,
+            side_focus: cx.focus_handle(),
+            held: None,
+            renamed: BTreeSet::new(),
+            made: Vec::new(),
+            own_new: None,
+            space_edit: None,
+            space_menu: None,
+            menu_items: std::array::from_fn(|_| cx.focus_handle()),
+            name_focus: Default::default(),
+            new_space_focus: cx.focus_handle().tab_stop(true),
+            menu_hovered: false,
+            menu_closed_by_press: None,
+            more_focus: Default::default(),
+            space_writes: HashMap::new(),
+            _activated: activated,
             side_w: shell::SIDE_DEFAULT,
             drawer_w: shell::DRAWER_DEFAULT,
             review_w: shell::REVIEW_DEFAULT,
@@ -476,6 +548,8 @@ impl Desk {
                 self.connected = false;
                 self.fresh = false;
                 self.sending_dropped();
+                // A rename or a new space out went with the link: the field says so.
+                self.space_writes_lost(None, cx);
             }
             Down::Screens => {
                 let mut screens =
@@ -514,7 +588,8 @@ impl Desk {
     }
 
     fn answer(&mut self, answer: ControlResponse, window: &mut Window, cx: &mut Context<Self>) {
-        if self.answer_reply(&answer, cx)
+        if self.space_answered(&answer, cx)
+            || self.answer_reply(&answer, cx)
             || self.report_came(&answer, window, cx)
             || self.remote_setting_came(&answer)
             || self.board_answered(&answer, cx)
@@ -625,6 +700,7 @@ impl Desk {
                 self.note_hand();
                 self.ping_machines();
                 self.machines_back(&back);
+                self.spaces_came(window, cx);
             }
             ControlResponse::Pet { id, rects } => {
                 if let Some(m) = self.pet_asks.remove(&id) {
@@ -887,6 +963,16 @@ impl Desk {
             cx.stop_propagation();
             return;
         }
+        // Enter, Escape and the arrows in a space field and the space menu, which are theirs.
+        if !k.modifiers.control
+            && !k.modifiers.platform
+            && !k.modifiers.alt
+            && !keys::newline(k)
+            && self.column_key(&k.key, window, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         // Escape leaves the Inbox or the Board for the page before them, and the terminal never
         // hears it: an Escape typed into an agent interrupts its turn. Not from a field, which
         // keeps its keys.
@@ -939,6 +1025,11 @@ impl Desk {
                     .any(|f| on(f, window, cx))
             });
         schedule
+            || self.menu_has_keys(window)
+            || self
+                .space_edit
+                .as_ref()
+                .is_some_and(|e| on(&e.field, window, cx))
             || on(&self.board.find, window, cx)
             || on(&self.board.tell, window, cx)
             || self
@@ -1399,7 +1490,8 @@ impl Desk {
             .into_iter()
             .map(|(m, _, _)| self.machine_state(m))
             .collect();
-        let redraw = redraw || board_moved || states != self.drawn_states;
+        let spaces_moved = self.space_writes_lost(Some(now), cx);
+        let redraw = redraw || board_moved || spaces_moved || states != self.drawn_states;
         self.drawn_states = states;
         qoop_tui::inbox_pane::day_start(&mut self.day_start, now);
         let redraw = self.follow_config() || redraw;
@@ -1635,6 +1727,7 @@ impl Render for Desk {
         self.win_h = f32::from(window.viewport_size().height);
         let inbox = self.inbox();
         self.follow_card_focus(&inbox, window, cx);
+        self.update_hold(&inbox, window, cx);
         let side = self.side_px();
         let mut root = div()
             .id("desk")
@@ -1644,9 +1737,11 @@ impl Render for Desk {
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(Self::capture_key))
             .on_key_down(cx.listener(Self::key))
-            .capture_any_mouse_down(
-                cx.listener(|this, _, _, _| this.last_input = Some(Instant::now())),
-            )
+            .capture_any_mouse_down(cx.listener(|this, _, _, _| {
+                this.last_input = Some(Instant::now());
+                // Before the open menu hears the press (`Desk::menu`).
+                this.menu_closed_by_press = None;
+            }))
             // A divider follows the mouse while the button is down, wherever it goes.
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                 match (this.drag, event.pressed_button) {
@@ -1825,22 +1920,9 @@ fn wire(
             cx.background_executor().timer(Duration::from_millis(200))
         })
         .detach();
-        // Back to the window: the settings page reads the file again (it may have been edited),
-        // and macOS's Reduce Motion is read again (it may have been turned).
+        // macOS's Reduce Motion at launch; the window reads it again on each activation
+        // (`Desk::new`'s observer).
         ui::read_reduce_motion();
-        cx.observe_window_activation(window, |this: &mut Desk, window, cx| {
-            if window.is_window_active() {
-                this.retry_away();
-                ui::read_reduce_motion();
-                this.keep_beating(window, cx);
-                cx.notify();
-            }
-            if window.is_window_active() && this.page == Page::Settings {
-                this.read_settings();
-                cx.notify();
-            }
-        })
-        .detach();
         cx.observe_window_appearance(window, |this: &mut Desk, window, cx| {
             this.appearance = window.appearance();
             this.dark = dark_for(this.theme_pref, this.appearance);

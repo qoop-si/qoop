@@ -59,6 +59,10 @@ pub struct Theme {
     pub sleep: u32,
     pub sleep_text: u32,
     pub idle: u32,
+    /// Saved for later (a person parked the agent): the TUI's Saved, its word a step darker
+    /// in light.
+    pub saved: u32,
+    pub saved_text: u32,
     pub badge_fg: u32,
     /// The six space inks, as names wear them.
     pub spaces: [u32; 6],
@@ -98,6 +102,8 @@ pub const DARK: Theme = Theme {
     sleep: 0xaf87d7,
     sleep_text: 0xb794db,
     idle: 0x6c6c6c,
+    saved: 0xffd700,
+    saved_text: 0xffd700,
     badge_fg: 0x14110f,
     spaces: [0xd787ff, 0xd7ff5f, 0x5fffff, 0xffafd7, 0x87d7ff, 0xffff87],
 };
@@ -134,6 +140,8 @@ pub const LIGHT: Theme = Theme {
     sleep: 0x875faf,
     sleep_text: 0x7a52a3,
     idle: 0x767676,
+    saved: 0xaf8700,
+    saved_text: 0x875f00,
     badge_fg: 0xffffff,
     spaces: [0x8700d7, 0x5f5f00, 0x005f5f, 0xaf005f, 0x005f87, 0x875f00],
 };
@@ -363,6 +371,7 @@ mod tests {
                 ("done", t.done_text),
                 ("fail", t.fail_text),
                 ("sleep", t.sleep_text),
+                ("saved", t.saved_text),
             ];
             texts.extend(t.spaces.iter().map(|s| ("space", *s)));
             for (name, text) in texts {

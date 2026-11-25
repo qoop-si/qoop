@@ -36,6 +36,12 @@ fn open_with(
             cx.notify();
         })
     });
+    // The pointer on the page, not over the column (where it would hold the list still).
+    vcx.simulate_mouse_move(
+        gpui::point(gpui::px(900.), gpui::px(600.)),
+        None,
+        gpui::Modifiers::none(),
+    );
     vcx.run_until_parked();
     (desk, vcx, rx)
 }
@@ -48,9 +54,9 @@ fn sent(rx: &mut UnboundedReceiver<Up>) -> Vec<Up> {
     out
 }
 
-/// The sidebar lists, under each space, the agents that wait for the owner and the one on
-/// screen; the rest are folded behind "N more", and a space where nothing waits is one line.
-/// Qass's own row is never listed. "N more" lists the whole space, sleepers included.
+/// The column lists every space; one where something waits is open with all its agents, a
+/// quiet one is its heading alone, and the space of the agent on screen opens. Qass's own row
+/// is never listed. Opened, a space lists every agent, sleepers included.
 #[gpui::test]
 fn the_sidebar_lists_what_waits_the_open_agent_and_folds_the_rest(cx: &mut TestAppContext) {
     let (desk, mut vcx, _rx) = open(cx);
@@ -62,57 +68,38 @@ fn the_sidebar_lists_what_waits_the_open_agent_and_folds_the_rest(cx: &mut TestA
     };
     let remote = 1i64 << 40 | 1;
     let remote_space: &'static str = format!("side-space-{remote}").leak();
-    // acme-web: the agent that waits (2) and "2 more"; api and staging: nothing waits, one line.
+    // acme-web: 2 waits, so it is open with all three; api and staging are their headings.
     let order = [
         "side-space-1",
+        "tree-row-1",
         "tree-row-2",
-        "side-more-1",
+        "tree-row-3",
         "side-space-2",
         remote_space,
     ];
     let ys: Vec<_> = order.iter().map(|s| y(&mut vcx, s)).collect();
     assert!(ys.windows(2).all(|w| w[0] < w[1]), "{order:?} at {ys:?}");
-    for folded in [
-        "tree-row-1",
-        "tree-row-3",
-        "tree-row-4",
-        "tree-row-5",
-        "tree-row-9",
-    ] {
+    for folded in ["tree-row-4", "tree-row-5", "tree-row-9"] {
         assert!(
             vcx.debug_bounds(folded).is_none(),
             "{folded} is folded or qass's"
         );
     }
-    assert!(
-        vcx.debug_bounds("side-more-2").is_none(),
-        "a quiet space is one line"
-    );
-    // The agent on screen is always listed, and its space is no longer a quiet line.
+    // The agent on screen opens its space.
     vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(5), window, cx)));
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("tree-row-5").is_some(), "the open agent");
-    assert!(
-        vcx.debug_bounds("side-more-2").is_some(),
-        "its space folds the other one"
-    );
-    assert!(vcx.debug_bounds("tree-row-4").is_none());
-    // "N more" opens the whole space.
+    assert!(vcx.debug_bounds("tree-row-4").is_some(), "its space whole");
+    // Opened, the remote space lists its sleeper too.
     vcx.update(|_, cx| {
         desk.update(cx, |d, cx| {
-            d.expanded.insert(1);
-            d.expanded.insert(remote);
+            d.folds.insert(remote, true);
             cx.notify();
         })
     });
     vcx.run_until_parked();
-    for listed in [
-        "tree-row-1",
-        "tree-row-3",
-        "tree-row-2164260865",
-        "tree-row-2164260866",
-    ] {
-        assert!(vcx.debug_bounds(listed).is_some(), "{listed} once expanded");
+    for listed in ["tree-row-2164260865", "tree-row-2164260866"] {
+        assert!(vcx.debug_bounds(listed).is_some(), "{listed} once opened");
     }
     assert!(
         vcx.debug_bounds("tree-row-2164260867").is_none(),
@@ -1444,7 +1431,8 @@ fn the_local_daemon_down_offers_start_and_no_remote_retry(cx: &mut TestAppContex
 
 /// Every control at the column's top takes the ring: from the window's own focus, Tab once
 /// reaches the fold toggle, twice qass (its agent page), three times New agent, four times
-/// the Inbox, five the Board and six Schedules, each focused with a key as the last input (what
+/// the Inbox, then its fold and its first rows, then the Board and Schedules, each focused
+/// with a key as the last input (what
 /// `focus_visible` draws the ring on), and Space presses the one that has it.
 #[gpui::test]
 fn every_sidebar_link_takes_tab_and_its_ring(cx: &mut TestAppContext) {
@@ -1474,8 +1462,9 @@ fn every_sidebar_link_takes_tab_and_its_ring(cx: &mut TestAppContext) {
     for (tabs, link, from) in [
         (2, Page::Session(9), Page::Inbox),
         (4, Page::Inbox, Page::Settings),
-        (5, Page::Board, Page::Inbox),
-        (6, Page::Schedules, Page::Inbox),
+        // The Inbox's fold (5) and its one waiting row (6) come before the Board.
+        (7, Page::Board, Page::Inbox),
+        (8, Page::Schedules, Page::Inbox),
     ] {
         vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(from, window, cx)));
         vcx.run_until_parked();
@@ -1512,6 +1501,86 @@ fn every_sidebar_link_takes_tab_and_its_ring(cx: &mut TestAppContext) {
     assert!(
         desk.read_with(&vcx, |d, _| d.sheet.is_some()),
         "New agent opens"
+    );
+    vcx.simulate_keystrokes("escape");
+    // The Inbox's fold: Space folds its first rows.
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Inbox, window, cx)));
+    vcx.run_until_parked();
+    press(&mut vcx, 5, "the Inbox's fold");
+    assert!(desk.read_with(&vcx, |d, _| !d.inbox_open), "folded");
+    // Further down, the order switch, the filter and each heading's controls are Tab stops:
+    // Tab reaches acme-web's `...`, and Space opens its menu.
+    let more = desk
+        .read_with(&vcx, |d, _| d.more_focus.borrow().get(&1).cloned())
+        .expect("acme-web's ...");
+    let mut reached = false;
+    for _ in 0..40 {
+        vcx.simulate_keystrokes("tab");
+        if vcx.update(|window, _| more.is_focused(window)) {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "Tab reaches a space's ...");
+    press(&mut vcx, 0, "acme-web's ...");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.space_menu.is_some()),
+        "Space opens the menu"
+    );
+    vcx.simulate_keystrokes("escape");
+    // In order after Schedules (8): Spaces (9), Priority (10), the strip's + (11), the seven
+    // state tabs (12 to 18), then acme-web's chevron (19), name (20) and + (21). Each by Tab
+    // from the window, each pressed with Space.
+    let reset = |vcx: &mut VisualTestContext| {
+        vcx.update(|window, cx| {
+            desk.update(cx, |d, cx| {
+                d.sheet = None;
+                d.space_edit = None;
+                d.space_menu = None;
+                d.side_view = crate::state::SideView::Spaces;
+                d.side_filter = crate::state::StateTab::All;
+                d.folds.clear();
+                d.inbox_open = true;
+                d.open(Page::Inbox, window, cx);
+            })
+        });
+        vcx.run_until_parked();
+    };
+    reset(&mut vcx);
+    press(&mut vcx, 10, "Priority");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.side_view),
+        crate::state::SideView::Priority
+    );
+    reset(&mut vcx);
+    press(&mut vcx, 11, "the strip's +");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.space_edit.as_ref().map(|e| e.target)),
+        Some(crate::column::EditFor::New)
+    );
+    reset(&mut vcx);
+    press(&mut vcx, 17, "the working tab");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.side_filter),
+        crate::state::StateTab::Working
+    );
+    reset(&mut vcx);
+    press(&mut vcx, 19, "acme-web's chevron");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.folds.get(&1).copied()),
+        Some(false)
+    );
+    reset(&mut vcx);
+    press(&mut vcx, 20, "acme-web's name");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.space_edit.as_ref().map(|e| e.target)),
+        Some(crate::column::EditFor::Rename(1))
+    );
+    reset(&mut vcx);
+    press(&mut vcx, 21, "acme-web's +");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.sheet.as_ref().map(|s| s.space)),
+        Some(Some(1))
     );
 }
 
@@ -2392,7 +2461,7 @@ fn the_sidebar_lists_sleeping_tabs_from_the_space_list(cx: &mut TestAppContext) 
                 cx,
             );
             // The spaces opened up: every agent, sleepers included.
-            d.expanded.extend([7, 1i64 << 40 | 1]);
+            d.folds.extend([(7, true), (1i64 << 40 | 1, true)]);
             // As the link's pump does after each batch.
             cx.notify();
         })
@@ -4230,7 +4299,8 @@ fn the_ring_follows_tab_into_a_card(cx: &mut TestAppContext) {
     answer(&desk, &mut vcx, asking(&[(3, 33, 1, 100), (1, 11, 1, 300)]));
     std::thread::sleep(qoop_tui::answers::ARMING);
     let second = crate::state::Slot::Agent(1);
-    for _ in 0..40 {
+    // Through the column's controls first: its rows, strip, filter and headings.
+    for _ in 0..120 {
         vcx.simulate_keystrokes("tab");
         let on = vcx.update(|window, cx| {
             desk.read(cx)
@@ -6305,18 +6375,1007 @@ fn the_qass_row_says_its_age_in_words(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_avatar_ring_is_only_on_the_columns_ground(cx: &mut TestAppContext) {
     let (desk, mut vcx, _rx) = open(cx);
-    assert!(vcx.debug_bounds("avatar-ring").is_some(), "on the Inbox");
+    assert!(vcx.debug_bounds("qass-ring").is_some(), "on the Inbox");
     vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Qass, window, cx)));
     vcx.run_until_parked();
     assert!(
         desk.read_with(&vcx, |d, _| d.nav_on(Page::Qass)),
         "qass's row is the current one"
     );
-    assert!(vcx.debug_bounds("avatar-ring").is_none(), "no patch on it");
+    assert!(vcx.debug_bounds("qass-ring").is_none(), "no patch on it");
     desk.update(&mut vcx, |d, _| d.model.rows.retain(|r| r.terminal != 9));
     assert_eq!(
         desk.read_with(&vcx, |d, _| d.qass_program().map(str::to_string)),
         Some("claude".to_string()),
         "not running: the agent it runs as"
     );
+}
+
+// The desktop redesign, P2: the agent list.
+
+/// The pointer onto the page, off the column.
+fn pointer_away(vcx: &mut VisualTestContext) {
+    vcx.simulate_mouse_move(
+        gpui::point(gpui::px(900.), gpui::px(600.)),
+        None,
+        gpui::Modifiers::none(),
+    );
+    vcx.run_until_parked();
+}
+
+/// The pointer over the column's list.
+fn pointer_on_column(vcx: &mut VisualTestContext) {
+    vcx.simulate_mouse_move(
+        gpui::point(gpui::px(120.), gpui::px(700.)),
+        None,
+        gpui::Modifiers::none(),
+    );
+    vcx.run_until_parked();
+}
+
+/// A key pressed and let go, as a control takes Enter or Space.
+fn press_key(vcx: &mut VisualTestContext, key: &'static str) {
+    vcx.simulate_keystrokes(key);
+    vcx.update(|window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(key).expect("a key"),
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+}
+
+/// The agents as the fixture has them, changed by `change`.
+fn listed_changed(change: impl Fn(&mut qoop_runtime::control::AgentRow)) -> ControlResponse {
+    let mut rows = fixture().rows;
+    rows.iter_mut().for_each(change);
+    ControlResponse::Agents {
+        id: "agents".into(),
+        agents: rows,
+        splits: Vec::new(),
+        qass_checks: None,
+    }
+}
+
+/// The spaces as the fixture has them, with `more`.
+fn spaces_with(more: Vec<qoop_runtime::control::WorkspaceRow>) -> ControlResponse {
+    let mut workspaces = fixture().spaces;
+    workspaces.extend(more);
+    ControlResponse::Workspaces {
+        id: "spaces".into(),
+        workspaces,
+    }
+}
+
+/// The blocks the column draws, by space, and whether each is open.
+fn drawn_blocks(desk: &Entity<Desk>, vcx: &VisualTestContext) -> Vec<(Option<i64>, bool)> {
+    desk.read_with(vcx, |d, _| {
+        d.drawn_column(&d.inbox())
+            .blocks
+            .iter()
+            .map(|b| (b.space, b.open))
+            .collect()
+    })
+}
+
+/// The request of the kind `pick` among what was sent.
+fn sent_request(
+    rx: &mut UnboundedReceiver<Up>,
+    pick: impl Fn(&ControlRequest) -> bool,
+) -> Option<ControlRequest> {
+    request_of(&sent(rx), pick)
+}
+
+/// A space's chevron folds and opens it; a quiet space starts folded; the person's toggle wins
+/// over the default afterwards (the agent on screen no longer opens a space they folded).
+#[gpui::test]
+fn a_space_folds_by_its_chevron_and_a_toggle_wins_over_the_default(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    assert!(
+        vcx.debug_bounds("tree-row-1").is_some(),
+        "acme-web: 2 waits"
+    );
+    assert!(
+        vcx.debug_bounds("tree-row-4").is_none(),
+        "api is quiet: folded"
+    );
+    click_on(&mut vcx, "side-fold-2");
+    assert!(vcx.debug_bounds("tree-row-4").is_some(), "opened");
+    click_on(&mut vcx, "side-fold-1");
+    assert!(vcx.debug_bounds("tree-row-1").is_none(), "folded");
+    pointer_away(&mut vcx);
+    // The agent on screen in acme-web would open it by default: the person folded it.
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(2), window, cx)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("tree-row-2").is_none(), "the toggle wins");
+    assert!(vcx.debug_bounds("tree-row-5").is_some(), "api stays open");
+}
+
+/// A click on a space's name opens the field with the name selected; what is typed replaces
+/// it, and Enter sends `RenameWorkspace` with the name trimmed. The field says Renaming until
+/// the answer and the spaces come back, then closes.
+#[gpui::test]
+fn clicking_a_space_name_renames_it(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    click_on(&mut vcx, "side-name-1");
+    assert!(vcx.debug_bounds("side-edit").is_some(), "the field");
+    let selected = desk.read_with(&vcx, |d, cx| {
+        let f = d.space_edit.as_ref().expect("editing").field.read(cx);
+        (f.text.clone(), f.selection())
+    });
+    assert_eq!(
+        selected,
+        ("acme-web".to_string(), 0..8),
+        "the name, selected"
+    );
+    vcx.simulate_input("  shop  ");
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    let asked = sent_request(&mut rx, |r| {
+        matches!(r, ControlRequest::RenameWorkspace { .. })
+    })
+    .expect("a rename");
+    assert!(
+        matches!(&asked, ControlRequest::RenameWorkspace { workspace: 1, name, .. } if name == "shop"),
+        "{asked:?}"
+    );
+    let said = |desk: &Entity<Desk>, vcx: &VisualTestContext| {
+        desk.read_with(vcx, |d, _| {
+            d.space_edit.as_ref().and_then(|e| e.said.clone())
+        })
+    };
+    assert_eq!(said(&desk, &vcx).as_deref(), Some("Renaming"));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Renamed {
+            id: asked.request_id().to_string(),
+        },
+    );
+    assert!(
+        sent_request(&mut rx, |r| matches!(
+            r,
+            ControlRequest::ListWorkspaces { .. }
+        ))
+        .is_some(),
+        "the spaces are read again"
+    );
+    assert!(said(&desk, &vcx).is_some(), "open until the list shows it");
+    let mut spaces = fixture().spaces;
+    spaces[0].name = "shop".into();
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Workspaces {
+            id: "spaces".into(),
+            workspaces: spaces,
+        },
+    );
+    assert!(
+        desk.read_with(&vcx, |d, _| d.space_edit.is_none()),
+        "closed"
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.model.space(1).map(|w| w.name.clone())),
+        Some("shop".to_string())
+    );
+}
+
+/// A rename the daemon refuses keeps the field open with what was typed, and says why.
+#[gpui::test]
+fn a_refused_rename_keeps_the_field_and_says_why(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    click_on(&mut vcx, "side-name-1");
+    vcx.simulate_input("shop");
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    let asked = sent_request(&mut rx, |r| {
+        matches!(r, ControlRequest::RenameWorkspace { .. })
+    })
+    .expect("a rename");
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Failed {
+            id: asked.request_id().to_string(),
+            reason: "no such workspace".into(),
+        },
+    );
+    let (text, said) = desk.read_with(&vcx, |d, cx| {
+        let e = d.space_edit.as_ref().expect("still open");
+        (e.field.read(cx).text.clone(), e.said.clone())
+    });
+    assert_eq!(text, "shop", "what was typed is kept");
+    assert_eq!(said.as_deref(), Some("no such workspace"));
+    assert!(
+        vcx.debug_bounds("side-edit-said").is_some(),
+        "said under the field"
+    );
+}
+
+/// On the Inbox with a card in the ring, a digit typed in the rename field is a letter of the
+/// name, never an answer; Escape leaves the field, not the Inbox.
+#[gpui::test]
+fn typing_in_a_space_field_answers_no_card_and_stays_on_the_inbox(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.asks = vec![tab_card("Q1", 1, "open")];
+            d.open(Page::Session(1), window, cx);
+            d.open(Page::Inbox, window, cx);
+            d.set_cursor(crate::state::Slot::Card("Q1".into()), 0);
+        })
+    });
+    vcx.run_until_parked();
+    click_on(&mut vcx, "side-name-1");
+    vcx.simulate_keystrokes("v 2");
+    let typed = desk.read_with(&vcx, |d, cx| {
+        d.space_edit.as_ref().map(|e| e.field.read(cx).text.clone())
+    });
+    assert_eq!(typed.as_deref(), Some("v2"), "typed into the field");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.holds.held.is_empty()),
+        "no card answered"
+    );
+    vcx.simulate_keystrokes("escape");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| (d.page, d.space_edit.is_none())),
+        (Page::Inbox, true),
+        "the field left, the Inbox kept"
+    );
+}
+
+/// `+` in the strip opens the new-space field; Enter sends `CreateWorkspace`, the answer reads
+/// the spaces again, and the new space is listed, folded, "0 agents", once they come.
+#[gpui::test]
+fn the_new_space_field_sends_create_workspace_and_lists_again_on_the_answer(
+    cx: &mut TestAppContext,
+) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    click_on(&mut vcx, "side-new-space");
+    vcx.simulate_input(" ideas ");
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    let asked = sent_request(&mut rx, |r| {
+        matches!(r, ControlRequest::CreateWorkspace { .. })
+    })
+    .expect("a new space");
+    assert!(
+        matches!(&asked, ControlRequest::CreateWorkspace { name, .. } if name == "ideas"),
+        "{asked:?}"
+    );
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::WorkspaceCreated {
+            id: asked.request_id().to_string(),
+            workspace: 8,
+        },
+    );
+    assert!(
+        sent_request(&mut rx, |r| matches!(
+            r,
+            ControlRequest::ListWorkspaces { .. }
+        ))
+        .is_some()
+    );
+    answer(
+        &desk,
+        &mut vcx,
+        spaces_with(vec![crate::state::tests::space(8, "ideas")]),
+    );
+    assert!(
+        desk.read_with(&vcx, |d, _| d.space_edit.is_none()),
+        "closed"
+    );
+    assert!(vcx.debug_bounds("side-space-8").is_some(), "listed");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.heading_count(8, false)),
+        "0 agents",
+        "what its heading says"
+    );
+    assert!(
+        drawn_blocks(&desk, &vcx).contains(&(Some(8), false)),
+        "folded"
+    );
+}
+
+/// `+` on a space's heading opens New agent in that space.
+#[gpui::test]
+fn plus_on_a_space_opens_new_agent_in_it(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    click_on(&mut vcx, "side-plus-2");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.sheet.as_ref().map(|s| s.space)),
+        Some(Some(2))
+    );
+}
+
+/// The heading's menu by keyboard: Enter on `...` opens it, Down moves, Escape closes it with
+/// the keys back on `...`; opened again, Down and Enter pick Rename.
+#[gpui::test]
+fn the_space_menu_works_by_keyboard(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let more = desk
+        .read_with(&vcx, |d, _| d.more_focus.borrow().get(&1).cloned())
+        .expect("the ... of acme-web");
+    vcx.update(|window, cx| window.focus(&more, cx));
+    press_key(&mut vcx, "enter");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.space_menu.as_ref().map(|m| (m.space, m.at))),
+        Some((1, 0)),
+        "open on its first item"
+    );
+    assert!(vcx.debug_bounds("side-menu").is_some());
+    vcx.simulate_keystrokes("down");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.space_menu.as_ref().map(|m| m.at)),
+        Some(1)
+    );
+    // The item the keys are on has the focus, so a screen reader says it.
+    let second = desk.read_with(&vcx, |d, _| d.menu_items[1].clone());
+    assert!(
+        vcx.update(|window, _| second.is_focused(window)),
+        "Rename has the focus"
+    );
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        desk.read_with(&vcx, |d, _| d.space_menu.is_none()),
+        "closed"
+    );
+    assert!(
+        vcx.update(|window, _| more.is_focused(window)),
+        "the keys are back on ..."
+    );
+    press_key(&mut vcx, "enter");
+    vcx.simulate_keystrokes("down enter");
+    vcx.run_until_parked();
+    let renaming = desk.read_with(&vcx, |d, cx| {
+        d.space_edit
+            .as_ref()
+            .map(|e| (e.target, e.field.read(cx).text.clone()))
+    });
+    assert_eq!(
+        renaming,
+        Some((crate::column::EditFor::Rename(1), "acme-web".to_string()))
+    );
+}
+
+/// A state tab filters the list to that state: a space with matches says "1 of 3", one with
+/// none says "none working" and folds, and a line says how many all shows besides; the chosen
+/// tab again goes back to all.
+#[gpui::test]
+fn the_filter_shows_one_state_and_says_how_many_are_hidden(cx: &mut TestAppContext) {
+    use crate::column::{count_words, filter_words};
+    use crate::state::StateTab;
+    let (desk, mut vcx, _rx) = open(cx);
+    click_on(&mut vcx, "side-tab-working");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.side_filter),
+        StateTab::Working
+    );
+    pointer_away(&mut vcx);
+    assert!(vcx.debug_bounds("tree-row-1").is_some(), "working");
+    assert!(
+        vcx.debug_bounds("tree-row-5").is_some(),
+        "working, in a quiet space"
+    );
+    for not in ["tree-row-2", "tree-row-3", "tree-row-4"] {
+        assert!(vcx.debug_bounds(not).is_none(), "{not} is not working");
+    }
+    assert!(vcx.debug_bounds("side-filter-note").is_some());
+    // Three of the seven work: the line says so.
+    let (shown, all) = desk.read_with(&vcx, |d, _| {
+        let agents = d.model.agents();
+        (
+            agents
+                .iter()
+                .filter(|e| crate::state::in_filter(e, StateTab::Working))
+                .count(),
+            agents.len(),
+        )
+    });
+    assert_eq!((shown, all), (3, 7));
+    assert_eq!(
+        filter_words(StateTab::Working, shown, all - shown),
+        (
+            "Showing working agents.".to_string(),
+            "shows the other 4.".to_string()
+        )
+    );
+    // What the headings say, as drawn: acme-web has one of its three working, open.
+    let web_open = drawn_blocks(&desk, &vcx).contains(&(Some(1), true));
+    assert!(web_open);
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.heading_count(1, web_open)),
+        "1 of 3"
+    );
+    assert_eq!(count_words(StateTab::Working, 0, 2, false), "none working");
+    desk.update(&mut vcx, |d, cx| {
+        d.side_filter = StateTab::Failed;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        drawn_blocks(&desk, &vcx).iter().find(|b| b.0 == Some(2)),
+        Some(&(Some(2), false)),
+        "api, none failed, folded"
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.heading_count(2, false)),
+        "none failed"
+    );
+    desk.update(&mut vcx, |d, cx| {
+        d.side_filter = StateTab::Working;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert_eq!(filter_words(StateTab::Failed, 0, 7).0, "No failed agents.");
+    // The chosen tab again: all.
+    click_on(&mut vcx, "side-tab-working");
+    assert_eq!(desk.read_with(&vcx, |d, _| d.side_filter), StateTab::All);
+    assert!(vcx.debug_bounds("side-filter-note").is_none());
+}
+
+/// While the pointer is on the column, or the keys drive inside it, nothing moves: a re-sort,
+/// a new Inbox item, a space whose default would open and an agent leaving the filter all
+/// wait, the new ones counted at the foot. Off the column it settles once. A focus a click
+/// left there holds nothing once the pointer leaves; one Tab brought there holds.
+#[gpui::test]
+fn the_list_holds_while_hovered_or_focused(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let before = drawn_blocks(&desk, &vcx);
+    assert_eq!(before[0], (Some(1), true), "acme-web first, open");
+    pointer_on_column(&mut vcx);
+    assert!(desk.read_with(&vcx, |d, _| d.held.is_some()), "held");
+    // From elsewhere: api's 5 becomes the newest and its 4 starts to wait.
+    answer(
+        &desk,
+        &mut vcx,
+        listed_changed(|r| match r.terminal {
+            5 => r.last_active_at_unix = Some(1990),
+            4 => {
+                r.status = Some("blocked".into());
+                r.state = "waiting".into();
+            }
+            _ => {}
+        }),
+    );
+    assert_eq!(
+        drawn_blocks(&desk, &vcx),
+        before,
+        "nothing moved, api still folded"
+    );
+    assert!(
+        vcx.debug_bounds("side-new").is_some(),
+        "the new item is counted"
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.drawn_column(&d.inbox()).inbox.len()),
+        1,
+        "the small Inbox keeps its one drawn row"
+    );
+    pointer_away(&mut vcx);
+    let after = drawn_blocks(&desk, &vcx);
+    assert_eq!(after[0], (Some(2), true), "settled once: api first, open");
+    // A row leaving the filter stays, dimmed, while held.
+    click_on(&mut vcx, "side-tab-working");
+    answer(
+        &desk,
+        &mut vcx,
+        listed_changed(|r| {
+            if r.terminal == 1 {
+                r.status = Some("done".into());
+                r.state = "done".into();
+            }
+        }),
+    );
+    assert!(vcx.debug_bounds("tree-row-1").is_some(), "dimmed in place");
+    pointer_away(&mut vcx);
+    assert!(vcx.debug_bounds("tree-row-1").is_none(), "gone once let go");
+    // A focus a click left on the column holds nothing once the pointer is on the page.
+    assert!(desk.read_with(&vcx, |d, _| d.held.is_none()));
+    // Tab into the column: the keys drive there, and it holds.
+    vcx.update(|window, cx| {
+        let root = desk.read(cx).focus.clone();
+        window.focus(&root, cx);
+    });
+    vcx.simulate_keystrokes("tab tab");
+    vcx.run_until_parked();
+    assert!(
+        desk.read_with(&vcx, |d, _| d.held.is_some()),
+        "held by the keys"
+    );
+}
+
+/// With the pointer on the column and a re-sort from elsewhere waiting, the person's own
+/// changes show at once and only they: a space they made is listed, folded, at the end; their
+/// fold opens api; the re-sort still waits. A filter switch takes the live order.
+#[gpui::test]
+fn the_persons_own_changes_show_while_held(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    // The pointer comes onto the column before it clicks there, as a person's does.
+    pointer_on_column(&mut vcx);
+    click_on(&mut vcx, "side-new-space");
+    assert!(desk.read_with(&vcx, |d, _| d.held.is_some()), "held");
+    answer(
+        &desk,
+        &mut vcx,
+        listed_changed(|r| {
+            if r.terminal == 5 {
+                r.last_active_at_unix = Some(1990);
+            }
+        }),
+    );
+    let order = |desk: &Entity<Desk>, vcx: &VisualTestContext| {
+        drawn_blocks(desk, vcx)
+            .iter()
+            .map(|b| b.0)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(order(&desk, &vcx)[0], Some(1), "the re-sort waits");
+    vcx.simulate_input("ideas");
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    let asked = sent_request(&mut rx, |r| {
+        matches!(r, ControlRequest::CreateWorkspace { .. })
+    })
+    .expect("a new space");
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::WorkspaceCreated {
+            id: asked.request_id().to_string(),
+            workspace: 8,
+        },
+    );
+    answer(
+        &desk,
+        &mut vcx,
+        spaces_with(vec![crate::state::tests::space(8, "ideas")]),
+    );
+    let now = order(&desk, &vcx);
+    assert_eq!(now.last(), Some(&Some(8)), "listed at once, last: {now:?}");
+    assert_eq!(now[0], Some(1), "the re-sort still waits");
+    click_on(&mut vcx, "side-fold-2");
+    assert!(
+        drawn_blocks(&desk, &vcx).contains(&(Some(2), true)),
+        "their fold"
+    );
+    assert_eq!(order(&desk, &vcx)[0], Some(1), "and still nothing else");
+    // A filter switch draws the whole list again, from the live order.
+    click_on(&mut vcx, "side-tab-working");
+    assert_eq!(order(&desk, &vcx)[0], Some(2), "api, the newest, first");
+}
+
+/// Two empty Enters before the first answer make "space 4" and "space 5", never two "space
+/// 4"; a refusal stops counting.
+#[gpui::test]
+fn two_quick_empty_new_spaces_get_two_numbers(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    click_on(&mut vcx, "side-new-space");
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    vcx.simulate_keystrokes("enter");
+    let names: Vec<(String, String)> = sent(&mut rx)
+        .into_iter()
+        .filter_map(|u| match u {
+            Up::Request(r) => match *r {
+                ControlRequest::CreateWorkspace { id, name } => Some((id, name)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let just: Vec<&str> = names.iter().map(|(_, n)| n.as_str()).collect();
+    assert_eq!(just, ["space 4", "space 5"]);
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Failed {
+            id: names[1].0.clone(),
+            reason: "no".into(),
+        },
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.next_space_name()),
+        "space 5",
+        "one still out"
+    );
+}
+
+/// An empty or blank new space takes the numbered name the field shows, the one `ctrl-a w`
+/// gives; an empty rename sends nothing and says why.
+#[gpui::test]
+fn an_empty_new_space_takes_the_numbered_name_and_an_empty_rename_sends_nothing(
+    cx: &mut TestAppContext,
+) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let tui = qoop_tui::run::space_name_after(&fixture().spaces, None, 0);
+    assert_eq!(tui, "space 4");
+    click_on(&mut vcx, "side-new-space");
+    let shown = desk.read_with(&vcx, |d, cx| {
+        d.space_edit
+            .as_ref()
+            .map(|e| e.field.read(cx).placeholder.to_string())
+    });
+    assert_eq!(shown.as_deref(), Some("space 4"), "the placeholder");
+    vcx.simulate_input("   ");
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    let asked = sent_request(&mut rx, |r| {
+        matches!(r, ControlRequest::CreateWorkspace { .. })
+    });
+    assert!(
+        matches!(&asked, Some(ControlRequest::CreateWorkspace { name, .. }) if *name == tui),
+        "{asked:?}"
+    );
+    vcx.simulate_keystrokes("escape");
+    // An empty rename.
+    click_on(&mut vcx, "side-name-1");
+    vcx.simulate_keystrokes("backspace");
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    assert!(
+        sent_request(&mut rx, |r| matches!(
+            r,
+            ControlRequest::RenameWorkspace { .. }
+        ))
+        .is_none(),
+        "nothing sent"
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d
+            .space_edit
+            .as_ref()
+            .and_then(|e| e.said.clone())),
+        Some("A space needs a name.".to_string())
+    );
+}
+
+/// The Inbox row folds its first rows: five at most, then "N more in the Inbox"; nothing
+/// waiting, it says so; the chevron folds it away.
+#[gpui::test]
+fn the_inbox_row_folds_its_first_rows(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    assert!(vcx.debug_bounds("side-item-agent-2").is_some(), "2 waits");
+    desk.update(&mut vcx, |d, cx| {
+        d.asks = (0..6)
+            .map(|n| tab_card(&format!("Q{n}"), 3, "open"))
+            .collect();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let shown = desk.read_with(&vcx, |d, _| d.drawn_column(&d.inbox()).inbox.len());
+    assert_eq!(shown, 5, "five at most");
+    assert!(vcx.debug_bounds("side-inbox-more").is_some(), "2 more");
+    click_on(&mut vcx, "side-inbox-fold");
+    assert!(vcx.debug_bounds("side-inbox").is_none(), "folded");
+    click_on(&mut vcx, "side-inbox-fold");
+    pointer_away(&mut vcx);
+    desk.update(&mut vcx, |d, cx| {
+        d.asks.clear();
+        cx.notify();
+    });
+    answer(
+        &desk,
+        &mut vcx,
+        listed_changed(|r| {
+            if r.terminal == 2 {
+                r.status = Some("working".into());
+                r.state = "working".into();
+            }
+        }),
+    );
+    assert!(
+        vcx.debug_bounds("side-inbox-none").is_some(),
+        "nothing waits"
+    );
+}
+
+/// The window in front again reads the spaces: one made or renamed in the TUI or on the phone
+/// has no event of its own.
+#[gpui::test]
+fn the_spaces_are_read_again_on_activation(cx: &mut TestAppContext) {
+    let (_desk, mut vcx, mut rx) = open(cx);
+    vcx.deactivate_window();
+    sent(&mut rx);
+    vcx.update(|window, _| window.activate_window());
+    vcx.run_until_parked();
+    assert!(
+        sent_request(&mut rx, |r| matches!(
+            r,
+            ControlRequest::ListWorkspaces { .. }
+        ))
+        .is_some(),
+        "read again"
+    );
+}
+
+// Review round 1 of P2.
+
+/// A click on a menu item is the item's only: the agent row under it does not open, and the
+/// keys stay in the rename field the item opened. The column stays held meanwhile.
+#[gpui::test]
+fn a_menu_item_click_never_reaches_the_row_under_it(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    pointer_on_column(&mut vcx);
+    click_on(&mut vcx, "side-more-1");
+    assert!(desk.read_with(&vcx, |d, _| d.space_menu.is_some()));
+    let item = vcx.debug_bounds("side-menu-1").expect("Rename").center();
+    let under = ["tree-row-1", "tree-row-2", "tree-row-3"]
+        .into_iter()
+        .find(|row| vcx.debug_bounds(row).is_some_and(|b| b.contains(&item)));
+    assert!(under.is_some(), "an agent row lies under Rename");
+    vcx.simulate_mouse_move(item, None, gpui::Modifiers::none());
+    assert!(
+        desk.read_with(&vcx, |d, _| d.held.is_some()),
+        "held with the pointer on the menu"
+    );
+    vcx.simulate_click(item, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.page),
+        Page::Inbox,
+        "the row under it did not open"
+    );
+    let in_field = vcx.update(|window, cx| {
+        desk.read(cx)
+            .space_edit
+            .as_ref()
+            .is_some_and(|e| e.field.read(cx).focus.is_focused(window))
+    });
+    assert!(in_field, "the keys are in the rename field");
+}
+
+/// The open menu has the keys only while it has the focus: ⌘J to another agent closes it,
+/// and Space then goes to that agent, never to the menu's first item.
+#[gpui::test]
+fn the_menu_lets_the_keys_go_when_the_focus_leaves(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    pointer_on_column(&mut vcx);
+    click_on(&mut vcx, "side-more-1");
+    assert!(desk.read_with(&vcx, |d, _| d.space_menu.is_some()));
+    vcx.simulate_keystrokes("cmd-j");
+    vcx.run_until_parked();
+    assert_eq!(desk.read_with(&vcx, |d, _| d.page), Page::Session(2));
+    assert!(
+        desk.read_with(&vcx, |d, _| d.space_menu.is_none()),
+        "closed"
+    );
+    sent(&mut rx);
+    vcx.simulate_keystrokes("space");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.sheet.is_none()),
+        "no New agent"
+    );
+    assert!(
+        sent(&mut rx)
+            .iter()
+            .any(|u| matches!(u, Up::Input(2, b) if b == b" ")),
+        "the agent got the space"
+    );
+}
+
+/// Opening the small Inbox while the column is held shows its rows at once: it is his own
+/// action.
+#[gpui::test]
+fn opening_the_small_inbox_while_held_shows_its_rows(cx: &mut TestAppContext) {
+    let (_desk, mut vcx, _rx) = open(cx);
+    pointer_on_column(&mut vcx);
+    click_on(&mut vcx, "side-inbox-fold");
+    assert!(vcx.debug_bounds("side-item-agent-2").is_none(), "folded");
+    pointer_away(&mut vcx);
+    pointer_on_column(&mut vcx);
+    click_on(&mut vcx, "side-inbox-fold");
+    assert!(
+        vcx.debug_bounds("side-item-agent-2").is_some(),
+        "its row, at once"
+    );
+    assert!(vcx.debug_bounds("side-new").is_none(), "not counted as new");
+}
+
+/// Escape in the rename field gives the keys back to the space's name; in the new-space
+/// field, to the strip's `+`.
+#[gpui::test]
+fn escape_in_a_space_field_gives_the_keys_back_to_its_name(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    click_on(&mut vcx, "side-name-1");
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    let name = desk.read_with(&vcx, |d, _| d.name_focus.borrow().get(&1).cloned());
+    let on_name = vcx.update(|window, _| name.is_some_and(|h| h.is_focused(window)));
+    assert!(on_name, "on the name");
+    click_on(&mut vcx, "side-new-space");
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    let plus = desk.read_with(&vcx, |d, _| d.new_space_focus.clone());
+    assert!(
+        vcx.update(|window, _| plus.is_focused(window)),
+        "on the strip's +"
+    );
+}
+
+/// A second click on `...` closes its menu: the press outside the menu closes it, and the
+/// click on `...` does not open it again.
+#[gpui::test]
+fn a_second_click_on_dots_closes_the_menu(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    pointer_on_column(&mut vcx);
+    click_on(&mut vcx, "side-more-1");
+    assert!(desk.read_with(&vcx, |d, _| d.space_menu.is_some()));
+    click_on(&mut vcx, "side-more-1");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.space_menu.is_none()),
+        "closed"
+    );
+    click_on(&mut vcx, "side-more-1");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.space_menu.is_some()),
+        "a third click opens it again"
+    );
+}
+
+/// A third empty Enter after the first space was made, before the spaces come back, still
+/// gets the next number: a made space counts until it is listed.
+#[gpui::test]
+fn a_space_made_counts_until_it_is_listed(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    click_on(&mut vcx, "side-new-space");
+    sent(&mut rx);
+    let names = |rx: &mut UnboundedReceiver<Up>| -> Vec<(String, String)> {
+        sent(rx)
+            .into_iter()
+            .filter_map(|u| match u {
+                Up::Request(r) => match *r {
+                    ControlRequest::CreateWorkspace { id, name } => Some((id, name)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    };
+    vcx.simulate_keystrokes("enter enter");
+    let first = names(&mut rx);
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::WorkspaceCreated {
+            id: first[0].0.clone(),
+            workspace: 8,
+        },
+    );
+    vcx.simulate_keystrokes("enter");
+    let third = names(&mut rx);
+    assert_eq!(third.len(), 1);
+    assert_eq!(third[0].1, "space 6", "not a second space 5");
+}
+
+/// The foot's count says only what will show once let go: a new agent in a space that stays
+/// folded is not counted.
+#[gpui::test]
+fn new_rows_in_a_folded_space_are_not_counted(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    pointer_on_column(&mut vcx);
+    assert!(desk.read_with(&vcx, |d, _| d.held.is_some()));
+    let mut rows = fixture().rows;
+    rows.push(crate::state::tests::row(
+        6,
+        2,
+        "idle",
+        "claude",
+        "a quiet new one",
+    ));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    assert!(
+        vcx.debug_bounds("side-new").is_none(),
+        "api stays folded: nothing new to show"
+    );
+}
+
+/// A chevron on a space with nothing on the filter's list keeps no choice: back on all, the
+/// quiet space is folded as its default says.
+#[gpui::test]
+fn a_chevron_on_a_filtered_out_space_keeps_no_choice(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    click_on(&mut vcx, "side-tab-wants");
+    click_on(&mut vcx, "side-fold-2");
+    assert!(
+        desk.read_with(&vcx, |d, _| !d.folds.contains_key(&2)),
+        "no choice kept"
+    );
+    click_on(&mut vcx, "side-tab-wants");
+    pointer_away(&mut vcx);
+    assert!(vcx.debug_bounds("tree-row-4").is_none(), "api still folded");
+}
+
+/// The computer page lists what asks for the person first, whatever was active last.
+#[gpui::test]
+fn the_computer_page_lists_what_waits_first(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    answer(
+        &desk,
+        &mut vcx,
+        listed_changed(|r| {
+            if r.terminal == 5 {
+                r.last_active_at_unix = Some(1990);
+            }
+        }),
+    );
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Computer(0), window, cx)));
+    vcx.run_until_parked();
+    let y = |vcx: &mut VisualTestContext, what: &'static str| {
+        vcx.debug_bounds(what).expect("drawn").origin.y
+    };
+    let waits = y(&mut vcx, "computer-agent-2");
+    let newest = y(&mut vcx, "computer-agent-5");
+    assert!(waits < newest, "Needs you above the newest working one");
+}
+
+/// An agent row's name says its age in words, the same age the row draws.
+#[gpui::test]
+fn an_agent_rows_name_says_its_age_in_words(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    answer(
+        &desk,
+        &mut vcx,
+        listed_changed(|r| {
+            if r.terminal == 2 {
+                r.last_active_at_unix = Some(2000 - 22 * 60);
+            }
+        }),
+    );
+    let name = desk.read_with(&vcx, |d, _| {
+        let inbox = d.inbox();
+        let agents = d.model.agents();
+        let two = agents
+            .iter()
+            .find(|e| e.terminal() == 2)
+            .copied()
+            .expect("2");
+        (d.row_name(two, &inbox), d.side_age(two, &inbox))
+    });
+    assert!(name.0.ends_with("Needs you, 22 minutes"), "{}", name.0);
+    assert_eq!(name.1.as_deref(), Some("22m"), "drawn short");
+}
+
+/// The avatar draws its mark's ring only when asked: never as a patch on a row painted
+/// otherwise.
+#[gpui::test]
+fn the_avatar_draws_its_ring_only_when_asked(cx: &mut TestAppContext) {
+    use gpui::{Context, Render, Window, div, prelude::*};
+
+    struct Face(bool);
+    impl Render for Face {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(crate::ui::avatar(
+                Some("claude"),
+                crate::state::Kind::Status(qoop_domain::status::Status::Idle),
+                20.,
+                self.0,
+                &crate::theme::DARK,
+            ))
+        }
+    }
+
+    for ring in [true, false] {
+        let window = cx.add_window(move |_, _| Face(ring));
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        assert_eq!(vcx.debug_bounds("avatar-ring").is_some(), ring, "{ring}");
+    }
 }

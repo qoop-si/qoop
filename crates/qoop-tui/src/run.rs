@@ -5319,10 +5319,20 @@ fn name_sessions(state: &mut State, request: &mut u64) {
 /// name, which is also what makes the new space over there: `ctrl-a w` in `devbox:api`
 /// makes `devbox:space 3`, not a local space.
 fn next_space_name(state: &State) -> String {
-    let remote = state
-        .space
+    space_name_after(&state.spaces, state.space, state.creating)
+}
+
+/// [`next_space_name`]'s rule over the space rows: counted among the spaces of the machine of
+/// `on` (This Mac's with none), `creating` more already asked for and not yet answered. The
+/// desktop names its new spaces with it too, so the two interfaces never disagree.
+pub fn space_name_after(
+    spaces: &[qoop_runtime::control::WorkspaceRow],
+    on: Option<i64>,
+    creating: usize,
+) -> String {
+    let remote = on
         .filter(|s| crate::mux::is_remote_workspace(*s))
-        .and_then(|s| state.spaces.iter().find(|w| w.id == s))
+        .and_then(|s| spaces.iter().find(|w| w.id == s))
         .and_then(|w| w.name.split_once(':'))
         .map(|(prefix, _)| prefix.to_string());
     let same = |w: &&qoop_runtime::control::WorkspaceRow| match &remote {
@@ -5332,7 +5342,7 @@ fn next_space_name(state: &State) -> String {
         }
         None => !crate::mux::is_remote_workspace(w.id),
     };
-    let n = state.spaces.iter().filter(same).count() + state.creating + 1;
+    let n = spaces.iter().filter(same).count() + creating + 1;
     match remote {
         Some(prefix) => format!("{prefix}:space {n}"),
         None => format!("space {n}"),
@@ -23838,6 +23848,23 @@ mod tests {
         assert_eq!(next_space_name(&state), "devbox:space 2");
         state.creating = 1;
         assert_eq!(next_space_name(&state), "devbox:space 3");
+    }
+
+    /// `ctrl-a w` names its space through the function the desktop shares: the same rows, the
+    /// same machine and the same count give the same name, a pending one counted.
+    #[test]
+    fn ctrl_a_w_names_its_space_with_the_shared_function() {
+        let mut state = state();
+        state.spaces = vec![space(1, "space 1"), space(R1 | 1, "devbox:work")];
+        state.space = Some(1);
+        assert_eq!(next_space_name(&state), "space 2");
+        assert_eq!(
+            next_space_name(&state),
+            space_name_after(&state.spaces, None, 0)
+        );
+        state.creating = 2;
+        assert_eq!(next_space_name(&state), "space 4");
+        assert_eq!(space_name_after(&state.spaces, Some(1), 2), "space 4");
     }
 
     /// A refused new space stops counting toward the next name.

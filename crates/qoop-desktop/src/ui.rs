@@ -36,6 +36,8 @@ pub enum Icon {
     Panel,
     /// The Board's entry: three columns.
     Board,
+    /// A space heading's menu: three dots.
+    More,
 }
 
 impl Icon {
@@ -43,6 +45,7 @@ impl Icon {
         match self {
             Icon::Panel => "icons/panel.svg",
             Icon::Board => "icons/board.svg",
+            Icon::More => "icons/more.svg",
             Icon::Home => "icons/home.svg",
             Icon::Clock => "icons/clock.svg",
             Icon::Gear => "icons/gear.svg",
@@ -87,6 +90,7 @@ impl Icon {
             "icons/panel.svg" => {
                 r#"<rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M14.5 5v14"/>"#
             }
+            "icons/more.svg" => r#"<path d="M6 12h.01M12 12h.01M18 12h.01" stroke-width="2.6"/>"#,
             "icons/board.svg" => {
                 r#"<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M9.2 4.5v15M14.8 4.5v15"/>"#
             }
@@ -333,14 +337,19 @@ mod mac {
 /// The state mark: real dots on the 3x3 grid, `size` px square. Always drawn beside the
 /// word, so it is hidden from a screen reader, which reads the word.
 pub fn mark(kind: Kind, t: &Theme, size: f32) -> Div {
+    dots_mark(&mark_dots_now(kind), mark_ink(kind, t), size)
+}
+
+/// Dots on the 3x3 grid in `ink`, `size` px square: a state's mark, or one of its own (saved).
+pub fn dots_mark(dots: &[(u8, u8)], ink: u32, size: f32) -> Div {
     let dot = (size / 5.0).max(2.0).round();
     let step = (size - dot) / 2.0;
-    let ink = c(mark_ink(kind, t));
+    let ink = c(ink);
     div()
         .relative()
         .size(px(size))
         .flex_none()
-        .children(mark_dots_now(kind).into_iter().map(|(x, y)| {
+        .children(dots.iter().map(|&(x, y)| {
             div()
                 .absolute()
                 .left(px(f32::from(x) * step))
