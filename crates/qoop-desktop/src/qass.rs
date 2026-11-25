@@ -227,7 +227,7 @@ impl Desk {
             .model
             .spaces
             .iter()
-            .filter(|w| w.name != state::QASS_SPACE)
+            .filter(|w| w.name != state::QASS_SPACE && !state::empty_default(w))
             .collect();
         let mut machines: Vec<String> = Vec::new();
         for w in &spaces {

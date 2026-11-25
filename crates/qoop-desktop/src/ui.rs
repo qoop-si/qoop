@@ -55,8 +55,10 @@ impl Icon {
                 r#"<path d="M4 11l8-7 8 7v8a1 1 0 0 1-1 1h-4.5v-6h-5v6H5a1 1 0 0 1-1-1z"/>"#
             }
             "icons/clock.svg" => r#"<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>"#,
+            // The cog of Feather's "settings" (MIT): one toothed outline round a hub, pulled in a
+            // little so it sits as large as its neighbours. Rays round a circle read as a sun.
             "icons/gear.svg" => {
-                r#"<circle cx="12" cy="12" r="3"/><path d="M12 3.5v2.2M12 18.3v2.2M3.5 12h2.2M18.3 12h2.2M6 6l1.6 1.6M16.4 16.4L18 18M6 18l1.6-1.6M16.4 7.6L18 6"/>"#
+                r#"<g transform="translate(12 12) scale(.88) translate(-12 -12)"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></g>"#
             }
             "icons/plus.svg" => r#"<path d="M12 5v14M5 12h14"/>"#,
             "icons/inbox.svg" => {
@@ -895,5 +897,28 @@ mod tests {
                 assert_eq!(s.text.color, Some(c(pair.text).into()));
             }
         }
+    }
+
+    /// The Settings button is a cog: one toothed outline round a hub. Rays round a circle (eight
+    /// separate strokes) read as a sun.
+    #[test]
+    fn the_settings_icon_is_a_cog_not_a_sun() {
+        let svg = Assets
+            .load("icons/gear.svg")
+            .expect("loads")
+            .expect("a gear");
+        let svg = String::from_utf8(svg.into_owned()).expect("utf8");
+        let outline = svg.split("<path d=\"").nth(1).expect("an outline");
+        let outline = outline.split('"').next().unwrap_or_default();
+        assert_eq!(
+            outline.matches('M').count(),
+            1,
+            "one closed outline, not separate rays"
+        );
+        assert!(
+            outline.ends_with('z') && outline.contains('a'),
+            "toothed and closed"
+        );
+        assert!(svg.contains("<circle"), "a hub");
     }
 }

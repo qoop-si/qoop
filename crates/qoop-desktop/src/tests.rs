@@ -4461,6 +4461,73 @@ fn new_agent_opens_in_the_current_space(cx: &mut TestAppContext) {
     assert_eq!(space_of(&desk, &vcx), Some((Some(1), None)));
 }
 
+/// The session's default space with nothing in it is not a place to work in yet: the sidebar and
+/// Settings leave it out, and New agent opens on the page's space, else the space last worked
+/// in, else the first space with agents. It shows as soon as a tab is in it.
+#[gpui::test]
+fn an_empty_default_space_stays_out_of_the_way(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.simulate_resize(gpui::size(gpui::px(1280.), gpui::px(2600.)));
+    let mut spaces = fixture().spaces;
+    let empty: qoop_runtime::control::WorkspaceRow =
+        serde_json::from_value(serde_json::json!({"id": 7, "name": "default", "terminals": 0}))
+            .expect("space");
+    spaces.insert(0, empty);
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Workspaces {
+            id: "mux".into(),
+            workspaces: spaces,
+        },
+    );
+    let space_of = |desk: &Entity<Desk>, vcx: &VisualTestContext| {
+        desk.read_with(vcx, |d, _| d.sheet.as_ref().map(|s| s.space))
+    };
+    let close = |vcx: &mut VisualTestContext| vcx.simulate_keystrokes("escape");
+
+    // Settings: the empty default has no switch; the others do.
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Settings, window, cx)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("watch-space-1").is_some());
+    assert!(
+        vcx.debug_bounds("watch-space-7").is_none(),
+        "the empty default"
+    );
+    assert!(
+        vcx.debug_bounds("side-space-7").is_none(),
+        "nor in the sidebar"
+    );
+
+    // New agent from a page with no space of its own: the first space that has agents.
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Inbox, window, cx)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a c");
+    assert_eq!(space_of(&desk, &vcx), Some(Some(1)));
+    close(&mut vcx);
+    desk.update(&mut vcx, |d, _| d.work_draft = None);
+
+    // After an agent in api (2), off any agent again: the space last worked in.
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(5), window, cx)));
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Inbox, window, cx)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a c");
+    assert_eq!(space_of(&desk, &vcx), Some(Some(2)));
+    close(&mut vcx);
+    desk.update(&mut vcx, |d, _| d.work_draft = None);
+
+    // A tab in it: it is listed again.
+    desk.update(&mut vcx, |d, _| {
+        d.model.spaces[0].terminals = 1;
+    });
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Settings, window, cx)));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("watch-space-7").is_some(),
+        "a tab is in it"
+    );
+}
+
 /// Start types the shared line (the branch as typed) and the sheet then waits: an agent that
 /// appears in its space is where the person lands and the sheet closes; one in another space, or
 /// no new row, leaves the sheet saying it started.

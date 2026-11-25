@@ -117,6 +117,9 @@ pub struct Desk {
     pub page: Page,
     /// The page `ctrl-a i` and Escape go back to from the Inbox.
     pub(crate) back: Page,
+    /// The space of the last agent page on screen: where New agent opens when the page on
+    /// screen has no space of its own.
+    pub(crate) worked_in: Option<i64>,
     /// The chip over the Inbox's list, the card with its ring, and where in the list it was.
     pub(crate) inbox_filter: crate::inbox::Filter,
     pub(crate) inbox_cursor: Option<state::Slot>,
@@ -323,6 +326,7 @@ impl Desk {
             },
             page: Page::Inbox,
             back: Page::Inbox,
+            worked_in: None,
             inbox_filter: Default::default(),
             inbox_cursor: None,
             cursor_at: 0,
@@ -680,6 +684,9 @@ impl Desk {
             self.strip = None;
         }
         self.page = page;
+        if let Page::Session(t) = page {
+            self.worked_in = self.model.row(t).map(|r| r.workspace).or(self.worked_in);
+        }
         if page == Page::Settings {
             self.read_settings();
             self.ask_watch();

@@ -1299,26 +1299,43 @@ pub fn machines(spaces: &[WorkspaceRow]) -> Vec<(usize, String, Option<i64>)> {
     out
 }
 
+/// The session's own default space with nothing in it: the daemon keeps it and refuses to
+/// close it (`closable` false), so it is never a place a person made. It is left out of the
+/// lists and of New agent's first choice until a tab is in it.
+pub fn empty_default(space: &WorkspaceRow) -> bool {
+    !space.closable && space.terminals == 0 && space.sleeping.is_empty()
+}
+
 /// The space New agent opens on and what to say when it is not the one asked for: `current`
 /// (the space of the page on screen) when it is one a person works in and its computer is
-/// reached; else a space of This Mac, with the words that say why. With no `current`, the first
-/// space of a computer that is reached. `lost` says whether a computer is not reached.
+/// reached; else a space of This Mac, with the words that say why. With no `current`, `last`
+/// (the space last worked in) while its computer is reached; else the first space of a reached
+/// computer that has tabs in it, and the empty default only when nothing else is. `lost` says
+/// whether a computer is not reached.
 pub fn work_space(
     spaces: &[WorkspaceRow],
     current: Option<i64>,
+    last: Option<i64>,
     lost: &dyn Fn(usize) -> bool,
 ) -> (Option<i64>, Option<String>) {
     let offered = || spaces.iter().filter(|w| w.name != QASS_SPACE);
+    let reached = |w: &&WorkspaceRow| !lost(machine_of(w.id));
     let first_reached = || {
         offered()
-            .find(|w| !lost(machine_of(w.id)))
+            .find(|w| reached(w) && !empty_default(w))
+            .or_else(|| offered().find(reached))
             .or_else(|| offered().next())
     };
-    match current.and_then(|id| offered().find(|w| w.id == id)) {
+    let find = |id: i64| offered().find(|w| w.id == id);
+    // The last space is a default only: one that cannot be reached is passed over silently.
+    let want = current
+        .and_then(find)
+        .or_else(|| last.and_then(find).filter(reached));
+    match want {
         Some(w) if !lost(machine_of(w.id)) => (Some(w.id), None),
         Some(asked) => {
             let instead = offered()
-                .find(|w| machine_of(w.id) == 0)
+                .find(|w| machine_of(w.id) == 0 && !empty_default(w))
                 .or_else(first_reached);
             let said = instead.map(|w| {
                 format!(
@@ -2457,5 +2474,42 @@ pub(crate) mod tests {
                 clock(1_000, zone)
             ))
         );
+    }
+
+    /// A space as the daemon lists the session's own default when nothing is in it.
+    fn empty_default_space(id: i64) -> WorkspaceRow {
+        serde_json::from_value(serde_json::json!({"id": id, "name": "default", "terminals": 0}))
+            .expect("space")
+    }
+
+    /// New agent's space: the page on screen, else the space last worked in, else the first
+    /// space with tabs; the session's empty default only when nothing else is there.
+    #[test]
+    fn new_agent_skips_the_empty_default_space() {
+        let reached = |_: usize| false; // `lost`: every computer is reached
+        let mut spaces = vec![empty_default_space(1), space(2, "shop"), space(3, "api")];
+        assert!(empty_default(&spaces[0]) && !empty_default(&spaces[1]));
+        // Nothing on screen, nothing worked in: the first space that has tabs.
+        assert_eq!(work_space(&spaces, None, None, &reached).0, Some(2));
+        // Worked in api last.
+        assert_eq!(work_space(&spaces, None, Some(3), &reached).0, Some(3));
+        // The page on screen wins over the space last worked in.
+        assert_eq!(work_space(&spaces, Some(2), Some(3), &reached).0, Some(2));
+        // A last space whose computer is not reached is passed over without a word.
+        let remote = (1i64 << 40) | 1;
+        spaces.push(space(remote, "staging:billing"));
+        let (picked, said) = work_space(&spaces, None, Some(remote), &|m| m == 1);
+        assert_eq!((picked, said), (Some(2), None));
+        // Only the default: it is the answer, and it is shown again once a tab is in it.
+        spaces.truncate(1);
+        assert_eq!(work_space(&spaces, None, None, &reached).0, Some(1));
+        spaces[0].terminals = 1;
+        assert!(!empty_default(&spaces[0]));
+        // A space a person made, empty, is not the daemon's default.
+        let made: WorkspaceRow = serde_json::from_value(
+            serde_json::json!({"id": 4, "name": "made", "terminals": 0, "closable": true}),
+        )
+        .expect("space");
+        assert!(!empty_default(&made));
     }
 }
