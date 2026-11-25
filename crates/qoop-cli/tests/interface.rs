@@ -2899,15 +2899,16 @@ impl Interface {
         )
     }
 
-    /// `ctrl-a Q` until qass's framed screen shows: a press before the interface has read qass's
-    /// row finds no qass yet, so it is pressed again while the screen does not show it.
+    /// `ctrl-a Q` until qass's framed screen shows (qass's name on its frame, no fold mark beside
+    /// the right column): a press before the interface has read qass's row finds no qass yet,
+    /// so it is pressed again while the screen does not show it.
     fn enter_qass(&mut self) -> bool {
         for _ in 0..10 {
-            if self.screen_has("\u{2500} \u{25be} qass ", Duration::from_millis(300), false) {
+            if self.screen_has(QASS_TITLE, Duration::from_millis(300), false) {
                 return true;
             }
             self.type_in(b"\x01Q");
-            if self.screen_has("\u{2500} \u{25be} qass ", Duration::from_secs(3), false) {
+            if self.screen_has(QASS_TITLE, Duration::from_secs(3), false) {
                 return true;
             }
         }
@@ -2929,11 +2930,18 @@ impl Interface {
     }
 }
 
-/// `ctrl-a Q` goes to qass's own framed screen: its header over qass's terminal in a framed
-/// box, and the board `qoop qass` made, on the rail beside it while the tab is too small for
-/// both; pressed again it goes back.
+/// qass's name on its frame's top edge, as qass's tab draws it.
+const QASS_TITLE: &str = "\u{2500} qass ";
+/// The right column closed to its strip: qass's frame line, a blank, the `«` that opens it.
+const STRIP_OPEN: &str = "\u{2502} \u{ab}";
+/// The open right column's head ends in the `»` that closes it.
+const HEAD_CLOSE: &str = " \u{bb} \u{2500}";
+
+/// `ctrl-a Q` goes to qass's own framed screen: its header over qass's terminal, full height,
+/// and the right column closed to its strip at the right edge, its counts lettered (`q0`, no
+/// question waits); pressed again it goes back. Was: the board on a rail at the left.
 #[test]
-fn ctrl_a_capital_q_shows_qass_framed_screen_and_its_board() {
+fn ctrl_a_capital_q_shows_qass_screen_with_its_column_closed() {
     let mut ui = qass_ui();
     assert!(
         ui.enter_qass(),
@@ -2942,64 +2950,68 @@ fn ctrl_a_capital_q_shows_qass_framed_screen_and_its_board() {
         ui.qoop(&["agents"], &[]).1
     );
     assert!(
-        ui.screen_has("\u{25b8} board", Duration::from_secs(10), false),
-        "no board beside qass:\n{}",
+        ui.screen_has(STRIP_OPEN, Duration::from_secs(10), false)
+            && ui.screen_has("\u{2502}q0", Duration::from_secs(10), false),
+        "no closed column with its counts beside qass:\n{}",
         ui.screen
     );
     ui.type_in(b"\x01Q");
     assert!(
-        ui.screen_has("\u{2500} \u{25be} qass ", Duration::from_secs(10), true),
+        ui.screen_has(QASS_TITLE, Duration::from_secs(10), true),
         "ctrl-a Q again did not go back:\n{}",
         ui.screen
     );
 }
 
-/// `ctrl-a C` on qass's screen opens the schedules panel, and `+` in it the form, which reads
-/// the first run back.
+/// `ctrl-a C` on qass's screen opens the right column on its schedules, and `+` in it the
+/// form, which reads the first run back. Was: a panel of its own (now drawn in the column under
+/// its head, whose tabs stand on the panel's top edge).
 #[test]
-fn ctrl_a_capital_c_opens_the_clock_panel_and_plus_opens_the_form() {
+fn ctrl_a_capital_c_opens_the_column_on_the_schedules_and_plus_opens_the_form() {
     let mut ui = qass_ui();
     assert!(ui.enter_qass(), "{}", ui.screen);
     ui.type_in(b"\x01C");
     assert!(
-        ui.screen_has("\u{2500} schedules ", Duration::from_secs(10), false)
+        ui.screen_has(HEAD_CLOSE, Duration::from_secs(10), false)
             && ui.screen_has("+ adds one", Duration::from_secs(5), false),
-        "ctrl-a C did not open the schedules:\n{}",
+        "ctrl-a C did not open the column on the schedules:\n{}",
         ui.screen
     );
     ui.type_in(b"+");
     assert!(
-        ui.screen_has("\u{2500} new schedule ", Duration::from_secs(10), false)
-            && ui.screen_has("first run", Duration::from_secs(5), false),
+        ui.screen_has("first run", Duration::from_secs(10), false),
         "+ did not open the form:\n{}",
         ui.screen
     );
 }
 
-/// `ctrl-a T` opens the board folded on the rail beside qass, and pressed again folds the pane
-/// the keyboard is in (qass's) to the rail.
+/// `ctrl-a T` on qass's tab opens the right column (its head with `»`) and pressed again
+/// closes it to its strip. Was: it opened the board from a rail at the left, then folded
+/// qass's pane.
 #[test]
-fn ctrl_a_capital_t_folds_the_board_to_the_rail() {
+fn ctrl_a_capital_t_opens_and_closes_the_right_column() {
     let mut ui = qass_ui();
     assert!(ui.enter_qass(), "{}", ui.screen);
-    assert!(ui.screen_has("\u{25b8} board", Duration::from_secs(10), false));
+    assert!(ui.screen_has(STRIP_OPEN, Duration::from_secs(10), false));
     ui.type_in(b"\x01T");
     assert!(
-        ui.screen_has("\u{2500} \u{25be} board ", Duration::from_secs(10), false),
-        "ctrl-a T did not open the board from the rail:\n{}",
+        ui.screen_has(HEAD_CLOSE, Duration::from_secs(10), false)
+            && ui.screen_has(STRIP_OPEN, Duration::from_secs(5), true),
+        "ctrl-a T did not open the column:\n{}",
         ui.screen
     );
     ui.type_in(b"\x01T");
     assert!(
-        ui.screen_has("\u{25b8} qass", Duration::from_secs(10), false),
-        "ctrl-a T did not fold qass's pane to the rail:\n{}",
+        ui.screen_has(STRIP_OPEN, Duration::from_secs(10), false)
+            && ui.screen_has(HEAD_CLOSE, Duration::from_secs(5), true),
+        "ctrl-a T did not close the column:\n{}",
         ui.screen
     );
 }
 
-/// A card qass writes lights its questions, `ctrl-a i` opens the column with the card and its
-/// numbered answers, and `a` sends the first at once (no hold): the card is no longer open,
-/// queued for qass or passed on.
+/// A card qass writes lights its questions (`q1` on the closed column's strip), `ctrl-a i`
+/// opens the column on the questions with the card and its numbered answers, and `a` sends the
+/// first at once (no hold): the card is no longer open, queued for qass or passed on.
 #[test]
 fn a_card_lights_the_questions_and_ctrl_a_i_opens_the_column() {
     let mut ui = qass_ui();
@@ -3022,7 +3034,7 @@ fn a_card_lights_the_questions_and_ctrl_a_i_opens_the_column() {
         .as_bytes(),
     );
     assert!(
-        ui.screen_has("\u{25b8} questions 1", Duration::from_secs(15), false),
+        ui.screen_has("\u{2502}q1", Duration::from_secs(15), false),
         "the card did not light the questions:\n{}",
         ui.screen
     );

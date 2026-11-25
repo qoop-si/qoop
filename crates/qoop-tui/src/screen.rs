@@ -166,10 +166,14 @@ pub struct Chrome<'a> {
     pub questions: Option<crate::qass_screen::Side>,
     /// qass's rail while a pane is folded: the tabs, one per folded pane.
     pub rail: Option<RailPaint>,
+    /// qass's right column, on a tab wide enough for it: its head over the open column, or its
+    /// strip at the right edge.
+    pub column: Option<crate::qass_screen::Column>,
+    /// Where qass's split tab draws the schedules while they are its tab on show: over the right
+    /// column, or stacked over the open pane's tile. The tree knows where, so the client says.
+    pub schedules: Option<crate::qass_screen::Clock>,
     /// The handle on the divider of qass's split tab, in ember.
     pub handle: Option<crate::qass_screen::Handle>,
-    /// The handle on the questions' own edge, beside the board, in ember too.
-    pub questions_handle: Option<crate::qass_screen::Handle>,
     /// qass's split tab: whose titles fold their pane, and the pane folded.
     pub fold: Option<FoldPaint>,
     /// A plugin's agent view, the agents it shows in its order (`sidebar::Column::order`).
@@ -189,7 +193,7 @@ pub struct RailPaint {
     pub y: usize,
     pub rows: usize,
     pub w: usize,
-    pub panes: [Option<crate::rail::Pane>; 3],
+    pub panes: [Option<crate::rail::Pane>; 4],
 }
 
 impl RailPaint {
@@ -208,6 +212,9 @@ pub struct FoldPaint {
     pub qass: u32,
     pub folded: Option<u32>,
     pub path: bool,
+    /// The titles wear the caret that folds their pane: not with the right column, where
+    /// neither pane folds by its title.
+    pub caret: bool,
 }
 
 /// A pane's name on its top edge, the one its row in the column shows: on qass's tab with the
@@ -270,8 +277,9 @@ impl Default for Chrome<'_> {
             clock: None,
             questions: None,
             rail: None,
+            column: None,
+            schedules: None,
             handle: None,
-            questions_handle: None,
             fold: None,
             agent_order: None,
             tab_rails: Vec::new(),
@@ -450,6 +458,8 @@ pub struct Place {
     pub qass: bool,
     /// qass's split tab with the board, the one place its pane folds.
     pub qass_split: bool,
+    /// That tab draws the right column: no title folds, and `T` opens and closes the column.
+    pub column: bool,
     /// Another space awake in the column, so `s` has somewhere to go.
     pub spaces: bool,
     /// The focused terminal is an agent's, the only kind `t` shows as a chat.
@@ -477,9 +487,12 @@ fn hints(context: KeyContext, place: Place) -> Vec<Hint> {
         .iter()
         .filter(|h| h.1.is_none() || works(h.0, place))
         .filter(|h| !place.collapsed || h.0 != "drag edge")
+        .filter(|h| !place.column || h.0 != "click title")
         .map(|h| {
             if place.collapsed && h.1 == Some("hide column") {
                 (h.0, Some("show column"), h.2)
+            } else if place.column && h.0 == "T" {
+                (h.0, Some("column"), h.2)
             } else {
                 *h
             }
@@ -674,10 +687,13 @@ pub(crate) fn qass_plan(frame: &Frame) -> Option<crate::qass_screen::Plan> {
     // qass's split tab: the header over its panes, which draw their own edges, and the
     // questions where the tree put them.
     if frame.tiles.len() >= 2 {
+        // The schedules are a tab over the board's tile (the right column's, or stacked the open
+        // pane's), never under the panes.
         return crate::qass_screen::Plan::band(cols as usize, rows as usize).map(|plan| {
             crate::qass_screen::Plan {
                 side: frame.chrome.questions,
-                ..plan.with_clock(ui.clock)
+                clock: frame.chrome.schedules,
+                ..plan
             }
         });
     }
@@ -988,9 +1004,6 @@ fn edge_grid(frame: &Frame, cols: usize, rows: usize) -> Vec<Vec<Option<(char, E
         put_fold_titles(&mut edges, &frame.tiles, frame.rows, fold);
     }
     if let Some(handle) = frame.chrome.handle {
-        put_handle(&mut edges, handle);
-    }
-    if let Some(handle) = frame.chrome.questions_handle {
         put_handle(&mut edges, handle);
     }
     edges
@@ -1376,8 +1389,12 @@ pub fn paint(frame: &Frame) -> String {
                     Some(qass_box_row(frame, plan, screen, pane_row))
                 } else if pane_row < plan.header.rows() {
                     Some(screen.row(pane_row, |_| String::new()))
-                } else {
+                } else if plan.clock.is_some_and(|c| c.under) {
                     screen.clock_row(pane_row)
+                } else {
+                    // In the right column the schedules are painted over the panes, like the
+                    // questions, and never take the rule's side.
+                    None
                 }
             })
             .collect(),
@@ -1669,13 +1686,43 @@ pub fn paint(frame: &Frame) -> String {
                 out.push_str(&at(pane_row + TABS + 1, left + 1 + side.rect.x));
                 out.push_str(&row);
             }
-            // The schedules under the panes, in the rows the tree leaves free.
-            if let Some((plan, _)) = &qass
+            // The schedules under the panes, in the rows the tree leaves free, or over the right
+            // column on its tab.
+            if let Some((plan, screen)) = &qass
                 && let Some(clock) = plan.clock
-                && let Some(Some(row)) = qass_rows.get(pane_row)
+                && let Some(row) = match clock.under {
+                    true => qass_rows.get(pane_row).cloned().flatten(),
+                    false => screen.clock_row(pane_row),
+                }
             {
                 out.push_str(&at(pane_row + TABS + 1, left + 1 + clock.rect.x));
-                out.push_str(row);
+                out.push_str(&row);
+            }
+            // The right column's head over its top edge, or its strip when it is closed.
+            if let Some(column) = frame.chrome.column {
+                let r = column.rect;
+                let row = match (column.open, pane_row.checked_sub(r.y)) {
+                    (true, Some(0)) => Some((r.x + 1, column.head(spotlight))),
+                    (false, Some(at)) => column.strip(spotlight).get(at).map(|s| (r.x, s.clone())),
+                    _ => None,
+                };
+                if let Some((x, row)) = row {
+                    out.push_str(&at(pane_row + TABS + 1, left + 1 + x));
+                    out.push_str(&row);
+                }
+                // The questions and the schedules draw their own box over the column, its left
+                // side on the border qass shares: that border is painted again as the frame has
+                // it, with its joints, qass's lit edge and the handle that drags it.
+                if column.open
+                    && column.tab != crate::qass_screen::ColumnTab::Board
+                    && pane_row.checked_sub(r.y).is_some_and(|at| at < r.rows)
+                    && let Some(Some((c, ink))) = edges.get(pane_row).and_then(|row| row.get(r.x))
+                {
+                    out.push_str(&at(pane_row + TABS + 1, left + 1 + r.x));
+                    out.push_str(&edge_style(*ink));
+                    out.push(*c);
+                    out.push_str(theme::RESET);
+                }
             }
             if let (Some(rail), Some(rows)) = (frame.chrome.rail, &rail_rows)
                 && let Some(row) = pane_row.checked_sub(rail.y).and_then(|at| rows.get(at))
@@ -1848,6 +1895,7 @@ pub fn paint(frame: &Frame) -> String {
                 },
                 qass: frame.chrome.qass.is_some(),
                 qass_split: frame.chrome.fold.is_some(),
+                column: frame.chrome.column.is_some(),
                 // The way `s` walks: the column's spaces, qass's own left out, the asleep
                 // skipped.
                 spaces: sidebar::shown(frame.spaces, frame.rows)
@@ -3063,6 +3111,8 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("c", "new tab"),
             ("r", "rename tab"),
             ("x/P", "close, save"),
+            // On qass's tab `T` folds the board, which closes the right column (the key row says
+            // `column` there); a longer word does not fit the box at 80 by 24.
             ("i/T", "questions, fold"),
         ],
     ),
@@ -3405,25 +3455,6 @@ fn paint_box(
 pub(crate) const RESIZE_HINT: &[(&str, &str)] = &[
     ("hjkl", "move 5%"),
     ("HJKL", "20%"),
-    ("=", "equalize"),
-    ("esc", "done"),
-];
-
-/// Resize mode's keys on qass's tab, where `s` puts the board and qass on each other's side.
-pub(crate) const RESIZE_BOARD_HINT: &[(&str, &str)] = &[
-    ("hjkl", "move 5%"),
-    ("HJKL", "20%"),
-    ("s", "swap sides"),
-    ("=", "equalize"),
-    ("esc", "done"),
-];
-
-/// The same with the questions beside the board: `<` and `>` take them narrower and wider.
-pub(crate) const RESIZE_QUESTIONS_HINT: &[(&str, &str)] = &[
-    ("hjkl", "move 5%"),
-    ("HJKL", "20%"),
-    ("<>", "questions"),
-    ("s", "swap sides"),
     ("=", "equalize"),
     ("esc", "done"),
 ];
@@ -3826,6 +3857,24 @@ fn rail_rows_of(frame: &Frame, rail: &RailPaint, fade: bool) -> Vec<String> {
                     theme::Role::Faint
                 },
             },
+            Pane::Schedules => {
+                // The schedules on, once read: what the right column's strip counts too.
+                let on = frame
+                    .chrome
+                    .clock
+                    .filter(|clock| clock.loaded)
+                    .map(|clock| clock.list.iter().filter(|s| !s.paused).count());
+                Tab {
+                    pane: *pane,
+                    count: on,
+                    state: None,
+                    dot: if on.unwrap_or(0) > 0 {
+                        theme::Role::Working
+                    } else {
+                        theme::Role::Faint
+                    },
+                }
+            }
             Pane::Qass => Tab {
                 pane: *pane,
                 count: None,
@@ -4116,7 +4165,7 @@ fn put_fold_titles(
         if room < 3 {
             continue;
         }
-        let title = pane_title(agent, true);
+        let title = pane_title(agent, fold.caret);
         let title = width::fit(&title, width::width(&title).min(room - 2));
         let ink = if tile.focused {
             EdgeInk::TitleLit
@@ -6847,6 +6896,20 @@ mod tests {
         ] {
             assert!(all.contains(there), "{there} missing: {all:?}");
         }
+        // qass's tab with the right column: no title folds, and `T` is the column's key.
+        let qass = |column| {
+            let place = Place {
+                qass: true,
+                qass_split: true,
+                column,
+                ..Place::default()
+            };
+            strip(&key_row(KeyContext::Qass, place, 400))
+        };
+        assert!(qass(false).contains("[click title\u{2192}fold or open]"));
+        let column = qass(true);
+        assert!(!column.contains("click title"), "{column:?}");
+        assert!(column.contains("[T\u{2192}column]"), "{column:?}");
         // Short rows drop keys, never leave a name with nothing after it.
         let names = ["tab", "pane", "space", "general"];
         for cols in [40usize, 60, 80, 100, 120, 160] {

@@ -64,16 +64,13 @@ pub struct Layout {
     pub focus: u32,
     pub prev_focus: Option<u32>,
     pub zoomed: Option<u32>,
-    /// Columns cut from the right of the root's first pane, left blank for something drawn
-    /// there (qass's questions beside the board). Only ever set on a copy that is drawn,
-    /// never on a tree that is kept or saved; the divider and every ratio are measured
-    /// without it, so the second pane is the same with or without it.
+    /// Columns left blank for qass's questions beside the open pane while the other is folded
+    /// ([`Layout::fold`]), cut from the open pane on the edge facing the folded one. Only ever
+    /// set on a copy that is drawn, never on a tree that is kept or saved.
     pub gap: usize,
-    /// The gap is cut from the left (top) edge of the root's second pane instead of the right
-    /// edge of its first: qass's tab with qass on the left and the board on the right.
-    pub gap_second: bool,
-    /// The width the owner dragged qass's questions to, in columns, `None` for the default. Kept
-    /// and saved with the root split like its ratio; `gap` is the drawn result of it.
+    /// A questions width the daemon keeps with the root split (`Pane::Split::questions`): no
+    /// longer drawn (the questions are a tab of qass's right column), carried through so a tree
+    /// read and written back keeps what it had.
     pub questions: Option<usize>,
     /// A root pane folded away on its own side (the first on the left, the second on the right),
     /// the other taking the rest, whatever the root's direction: qass's tab with the board or
@@ -84,11 +81,14 @@ pub struct Layout {
     /// Both root panes folded away: each a tile no columns wide, the questions taking the tab.
     /// Only ever set on a drawn copy, like `fold`.
     pub fold_all: bool,
-    /// Columns taken from the board (both panes when they are stacked) for qass's rail: the tabs
-    /// of the folded panes, the edge line and one blank column. Only ever set on a drawn copy,
-    /// like `gap`, and cut after the split is measured, so the divider and every ratio are the
-    /// same with or without it and qass keeps its columns on either side.
+    /// Columns taken from both panes of a stacked tab for qass's rail: the tabs of the folded
+    /// panes, the edge line and one blank column; with a pane folded, from the open one. Only ever
+    /// set on a drawn copy, like `gap`, and cut after the split is measured, so the divider and
+    /// every ratio are the same with or without it.
     pub rail: usize,
+    /// The rail's columns are at the right edge, the folded pane's own side, instead of the
+    /// left: qass's right column closed to its strip. Only ever set on a drawn copy.
+    pub rail_right: bool,
 }
 
 impl Layout {
@@ -102,11 +102,11 @@ impl Layout {
             prev_focus: None,
             zoomed: None,
             gap: 0,
-            gap_second: false,
             questions: None,
             fold: None,
             fold_all: false,
             rail: 0,
+            rail_right: false,
         }
     }
 
@@ -131,7 +131,6 @@ impl Layout {
             prev_focus: None,
             zoomed: None,
             gap: 0,
-            gap_second: false,
             questions: match pane {
                 Pane::Split { questions, .. } if *questions > 0 => Some(*questions as usize),
                 _ => None,
@@ -139,6 +138,7 @@ impl Layout {
             fold: None,
             fold_all: false,
             rail: 0,
+            rail_right: false,
         }
     }
 
@@ -421,35 +421,21 @@ impl Layout {
         }
         let mut out = Vec::new();
         layout_node(&self.root, self.inner(area), &mut out);
-        // The gap comes out of one pane only, after the split is measured: the first pane's
-        // right edge, or the second pane's left edge.
-        if self.gap > 0
-            && let Node::Split { first, second, .. } = &self.root
-            && let Node::Leaf {
-                terminal: Some(cut),
-            } = **(if self.gap_second { second } else { first })
-            && let Some((_, rect)) = out.iter_mut().find(|(t, _)| *t == cut)
-        {
-            let cut = self.gap.min(rect.cols);
-            rect.cols -= cut;
-            if self.gap_second {
-                rect.x += cut;
-            }
-        }
         self.cut_rail(&mut out);
         out
     }
 
-    /// The rail's columns taken from the board, so qass keeps its columns whichever side it is on:
-    /// off the left edge of the first pane when that is the board, else (the board second, after
-    /// the gap was cut from its left edge) both panes move right and the second gives the
-    /// columns up. Both panes give them when stacked.
+    /// The rail's columns taken off the left edge of both panes of a stacked tab. A tab side by
+    /// side never has a rail unless a pane is folded, which [`Layout::folded`] lays out.
     fn cut_rail(&self, out: &mut [(u32, Rect)]) {
         if self.rail == 0 {
             return;
         }
         let Node::Split {
-            dir, first, second, ..
+            dir: Dir::H,
+            first,
+            second,
+            ..
         } = &self.root
         else {
             return;
@@ -460,24 +446,10 @@ impl Layout {
         };
         let (first, second) = (leaf(first), leaf(second));
         for (t, rect) in out.iter_mut() {
-            let cut = self.rail.min(rect.cols.saturating_sub(1));
-            let is_first = Some(*t) == first;
-            let is_second = Some(*t) == second;
-            match dir {
-                Dir::H if is_first || is_second => {
-                    rect.x += cut;
-                    rect.cols -= cut;
-                }
-                Dir::V if is_first && !self.gap_second => {
-                    rect.x += cut;
-                    rect.cols -= cut;
-                }
-                Dir::V if self.gap_second && is_first => rect.x += self.rail,
-                Dir::V if self.gap_second && is_second => {
-                    rect.x += self.rail;
-                    rect.cols = rect.cols.saturating_sub(self.rail).max(1);
-                }
-                _ => {}
+            if Some(*t) == first || Some(*t) == second {
+                let cut = self.rail.min(rect.cols.saturating_sub(1));
+                rect.x += cut;
+                rect.cols -= cut;
             }
         }
     }
@@ -538,8 +510,9 @@ impl Layout {
             };
             vec![(*a, shut), (*b, open)]
         } else {
+            // The rail at the right stands after the open pane, by the folded one's edge.
             let open = Rect {
-                x: inner.x + self.rail,
+                x: inner.x + if self.rail_right { 0 } else { self.rail },
                 cols: open_cols,
                 ..inner
             };
@@ -609,72 +582,7 @@ impl Layout {
             return None;
         }
         let mut path = Vec::new();
-        let col = col.checked_sub(self.rail_shift())?;
         divider_in(&self.root, self.inner(area), col, row, &mut path).then_some(path)
-    }
-
-    /// How far the rail moves the whole side by side split right: with the board second, qass
-    /// and the board both stand that much right of where the split measures them.
-    pub fn rail_shift(&self) -> usize {
-        match &self.root {
-            Node::Split { dir: Dir::V, .. } if self.gap_second => self.rail,
-            _ => 0,
-        }
-    }
-
-    /// The two root panes' columns before the gap is cut, side by side only.
-    pub fn root_cols(&self, area: Rect) -> Option<(usize, usize)> {
-        let Node::Split {
-            dir: Dir::V, ratio, ..
-        } = &self.root
-        else {
-            return None;
-        };
-        let (first, second) = halves(Dir::V, *ratio, self.inner(area))?;
-        Some((first.cols, second.cols))
-    }
-
-    /// The questions' own edge, the board's frame edge beside them: its column and the rows it
-    /// runs over, pane-local. `None` without a gap, and while zoomed, when nothing is drawn.
-    pub fn questions_edge(&self, area: Rect) -> Option<(usize, usize, usize)> {
-        let Node::Split {
-            dir: Dir::V, ratio, ..
-        } = &self.root
-        else {
-            return None;
-        };
-        if self.gap == 0 || self.zoomed.is_some() || self.fold.is_some() {
-            return None;
-        }
-        let (first, second) = halves(Dir::V, *ratio, self.inner(area))?;
-        let x = if self.gap_second {
-            second.x + self.gap - 1
-        } else {
-            first.x + first.cols - self.gap
-        };
-        Some((x, first.y, first.rows))
-    }
-
-    /// Whether a pane-local cell is on the questions' edge.
-    pub fn on_questions_edge(&self, area: Rect, col: usize, row: usize) -> bool {
-        self.questions_edge(area)
-            .is_some_and(|(x, y, rows)| col == x && row >= y && row < y + rows)
-    }
-
-    /// The gap (the edge column and the questions) that puts the questions' edge on `col`.
-    pub fn gap_at(&self, area: Rect, col: usize) -> Option<usize> {
-        let Node::Split {
-            dir: Dir::V, ratio, ..
-        } = &self.root
-        else {
-            return None;
-        };
-        let (first, second) = halves(Dir::V, *ratio, self.inner(area))?;
-        if self.gap_second {
-            (col + 1).checked_sub(second.x)
-        } else {
-            (first.x + first.cols).checked_sub(col)
-        }
     }
 
     /// Put the divider of the split at `path` under a pane-local cell. Answers whether it
@@ -685,7 +593,6 @@ impl Layout {
     /// cell, so a drag toward the limit has already put the divider on the last allowed cell
     /// by the time the pointer passes it.
     pub fn drag(&mut self, area: Rect, path: &[bool], col: usize, row: usize) -> bool {
-        let col = col.saturating_sub(self.rail_shift());
         let area = self.inner(area);
         let Some((dir, _, rect)) = split_at(&self.root, path, area) else {
             return false;
@@ -1541,49 +1448,21 @@ mod tests {
         );
     }
 
-    /// The rail comes off the board (the first pane, or the second with qass first, then the
-    /// whole split moves right), both panes when stacked: qass is the same tile with or without it.
+    /// The rail comes off both panes of a stacked tab, and the divider stays where it is
+    /// measured. Was also: side by side, off the board on either side, the split moved right
+    /// with qass first; a tab side by side now draws qass's right column, with no rail unless a
+    /// pane is folded, which [`Layout::folded`] lays out.
     #[test]
     fn the_rail_is_taken_from_the_board_and_qass_keeps_its_tile() {
         let a = area(161, 30);
         let mut layout = Layout::single(1);
         assert!(layout.split_placeholder(1, Dir::V, a));
         assert!(layout.bind_placeholder(2));
-        // Board first (1), qass second (2).
-        layout.gap_second = false;
-        layout.gap = 20;
-        layout.rail = 0;
+        // Side by side with no fold, a rail takes nothing.
         let bare = layout.tile_rects(a);
         layout.rail = 16;
-        let railed = layout.tile_rects(a);
-        assert_eq!(railed[1].1, bare[1].1, "qass is never touched");
-        assert_eq!(
-            (railed[0].1.x, railed[0].1.cols),
-            (bare[0].1.x + 16, bare[0].1.cols - 16)
-        );
-        // Qass first (1), the board second (2): qass moves right by the rail, same columns.
-        layout.gap_second = true;
-        layout.rail = 0;
-        let bare = layout.tile_rects(a);
-        layout.rail = 16;
-        let railed = layout.tile_rects(a);
-        assert_eq!(
-            (railed[0].1.x, railed[0].1.cols),
-            (bare[0].1.x + 16, bare[0].1.cols),
-            "qass keeps its columns"
-        );
-        assert_eq!(
-            (railed[1].1.x, railed[1].1.cols),
-            (bare[1].1.x + 16, bare[1].1.cols - 16),
-            "the board gives the columns"
-        );
-        assert_eq!(
-            railed[1].1.x + railed[1].1.cols,
-            bare[1].1.x + bare[1].1.cols
-        );
+        assert_eq!(layout.tile_rects(a), bare);
         // Stacked: both lose the rail.
-        layout.gap_second = false;
-        layout.gap = 0;
         layout.set_root_split(Dir::H, 0.5);
         layout.rail = 0;
         let bare = layout.tile_rects(a);
@@ -1597,39 +1476,14 @@ mod tests {
             );
             assert_eq!(railed[i].1.cols, bare[i].1.cols - 16);
         }
-        // The divider is where the panes are drawn: with qass first the whole split stands the
-        // rail's columns to the right, and so does the divider a press finds and a drag moves.
-        layout.set_root_split(Dir::V, 0.5);
-        layout.gap_second = true;
-        layout.rail = 0;
-        let at = layout.tile_rects(a)[0].1;
-        let bare_col = at.x + at.cols;
-        assert!(layout.divider_at(a, bare_col, at.y + 3).is_some());
-        layout.rail = 16;
-        let at = layout.tile_rects(a)[0].1;
-        let col = at.x + at.cols;
-        assert_eq!(col, bare_col + 16);
-        assert!(
-            layout.divider_at(a, col, at.y + 3).is_some(),
-            "the drawn divider"
-        );
-        assert!(
-            layout.divider_at(a, bare_col, at.y + 3).is_none(),
-            "not where it was"
-        );
-        let before = layout.root_split();
-        assert!(layout.drag(a, &[], col + 5, at.y + 3));
-        assert_ne!(layout.root_split(), before);
-        let moved = layout.tile_rects(a)[0].1;
-        assert_eq!(
-            moved.x + moved.cols,
-            col + 5,
-            "the divider follows the pointer"
-        );
+        // The stacked divider is the row between them, rail or not.
+        let top = layout.tile_rects(a)[0].1;
+        assert!(layout.divider_at(a, top.x + 3, top.y + top.rows).is_some());
     }
 
-    /// Swapping the root's panes keeps every pane's size to the cell, twice is the identity,
-    /// and the gap follows the board: cut from the second pane's left edge when it is second.
+    /// Swapping the root's panes keeps every pane's size to the cell and twice is the identity
+    /// (what qass's tab draws with the board saved first). Was also: the questions' gap cut from
+    /// either pane, a gap no longer drawn unless a pane is folded.
     #[test]
     fn swapping_the_root_keeps_every_size_and_twice_is_the_identity() {
         for width in [97, 120, 161, 200] {
@@ -1657,28 +1511,6 @@ mod tests {
         }
         // A tree with no split has nothing to swap.
         assert!(!Layout::single(1).swap_root(area(80, 24)));
-        // The gap is cut from the first pane's right edge, or the second's left edge.
-        let a = area(120, 24);
-        let mut layout = Layout::single(1);
-        assert!(layout.split_placeholder(1, Dir::V, a));
-        assert!(layout.bind_placeholder(2));
-        let (one, two) = (rect_of_in(&layout, 1, a), rect_of_in(&layout, 2, a));
-        layout.gap = 10;
-        assert_eq!(rect_of_in(&layout, 1, a).cols, one.cols - 10);
-        assert_eq!(rect_of_in(&layout, 2, a), two, "the other pane is the same");
-        layout.gap_second = true;
-        assert_eq!(rect_of_in(&layout, 1, a), one);
-        let cut = rect_of_in(&layout, 2, a);
-        assert_eq!((cut.x, cut.cols), (two.x + 10, two.cols - 10));
-    }
-
-    fn rect_of_in(layout: &Layout, terminal: u32, a: Rect) -> Rect {
-        layout
-            .tile_rects(a)
-            .into_iter()
-            .find(|(t, _)| *t == terminal)
-            .expect("a tile")
-            .1
     }
 
     #[test]
