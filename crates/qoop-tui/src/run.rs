@@ -4338,8 +4338,13 @@ impl State {
         let mut resize = false;
         // Every way in (the sidebar, the space keys, ctrl-a Q, the first render) passes here.
         // Nothing is written while the screen stays on qass's space, so a fold chosen on the
-        // page holds until he leaves it.
-        if self.space != self.qass_ui.seen {
+        // page holds until he leaves it. A space not listed yet is not seen: `qoop qass` can
+        // bring the screen into qass's new space before the list names it, and seen then the
+        // entry would pass as an ordinary space and leave the column open.
+        let listed = self
+            .space
+            .is_none_or(|space| self.spaces.iter().any(|w| w.id == space));
+        if self.space != self.qass_ui.seen && listed {
             self.qass_ui.seen = self.space;
             if self.space.is_some() && self.space == sidebar::qass_space(&self.spaces) {
                 let board = Some(crate::qass_screen::Fold::Board);
@@ -26251,6 +26256,23 @@ mod tests {
         assert_eq!(hit, Some(crate::qass_screen::ColumnHit::Open));
         assert!(column_press(&mut state, hit.unwrap()));
         assert!(state.qass_column().is_some_and(|c| c.open));
+    }
+
+    /// `qoop qass` can bring the screen into qass's new space before the list of spaces names
+    /// it: the entry waits for the list, then closes the column. Was: the space passed as seen
+    /// while it was nobody's, and the column stayed open (a macOS CI flake of the card test).
+    #[test]
+    fn an_entry_before_the_space_is_listed_still_closes_the_column() {
+        let mut state = qass_split_window();
+        (state.cols, state.lines) = (160, 45);
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.palette = None;
+        let spaces = std::mem::take(&mut state.spaces);
+        assert!(!state.asks_settle(), "nothing settles before the list");
+        state.spaces = spaces;
+        assert!(state.asks_settle(), "the listed entry closes the column");
+        assert!(state.qass_column().is_some_and(|c| !c.open));
     }
 
     /// The schedules tab draws the schedules over the board's tile and its frame: no pane is
