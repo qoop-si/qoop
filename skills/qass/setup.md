@@ -63,6 +63,20 @@ decide. A: watch, B: not now." Your pick: A. `setup.sh watch on` or `setup.sh wa
 starts the watcher with no summary. A config not saved: `qoop config set qass.agent
 <its current value>`. Other settings (`qoop config --json`): only on their word.
 
+Then how you sound, a card ("Cards" in SKILL.md; handle `voice`, terminal `-`): A: plain, B: a
+character (chief, kanka, captain, deadpan, commentator, or another from the list, `voices`), C:
+their own words. Your pick: A, unless they named one. A preview is
+`qoop qass persona <id> --preview` (the voice and three facts), the facts said in that voice: all
+three for one name they named, the question's alone for each of several, at most 3 a message;
+previews are examples, outside the 100 words and the line limits, each surface within its own. One
+name in their answer: `qoop config set qass.persona <id>` at once, its preview, and "`voice plain`
+undoes it"; several: their previews, the card stays open; B alone: the starters as `name: tone`
+lines, the card stays open. A name not in the list: one line that it is not available, the closest
+entry, or C. On C: draft a 3-line voice (`tone:`, `address:`, `never:`) from their words, pipe it to
+`qoop qass persona custom -` at once (it sets `custom`), its preview, and "`voice plain` undoes it".
+A rule in their words ("ask me less") is a lesson (SKILL.md, "Lessons", with their yes), never a
+voice. On A with another voice set: `qoop config set qass.persona plain`.
+
 ## 3. Item 2, their projects
 
 Before anything runs, say: "I read each project you pick: its build files, CI, deploy files, and

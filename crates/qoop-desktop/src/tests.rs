@@ -2151,6 +2151,156 @@ fn settings_write_in_place_find_and_refuse_a_broken_file(cx: &mut TestAppContext
     assert!(desk.read_with(&vcx, |d, _| d.settings.broken));
 }
 
+/// qass's voice on the settings page: the filter narrows the catalog, a pick writes
+/// `qass.persona`, the lines sent follow it, and their own words are kept and become the voice
+/// on the button only.
+#[gpui::test]
+fn the_voice_setting_picks_filters_and_keeps_their_words(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "# mine\n").expect("config");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.config_path = path.clone();
+            d.pet_path = dir.path().join("avatar.json");
+            d.open(Page::Settings, window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    let plain = vcx.debug_bounds("voice-plain").expect("plain");
+    let chief = vcx.debug_bounds("voice-chief").expect("chief");
+    assert!(plain.origin.y < chief.origin.y, "plain heads the list");
+    assert!(vcx.debug_bounds("voice-custom").is_none(), "no words yet");
+    fn fields(d: &Desk) -> &crate::voice::VoiceFields {
+        d.settings.voice.as_ref().expect("fields")
+    }
+    let find = desk.read_with(&vcx, |d, cx| fields(d).find.read(cx).focus.clone());
+    let set_find = |vcx: &mut gpui::VisualTestContext, text: &str| {
+        let text = text.to_string();
+        desk.update(vcx, |d, cx| {
+            let find = fields(d).find.clone();
+            find.update(cx, |f, cx| {
+                f.set_text(&text);
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+    };
+
+    // A "/" typed in the filter stays there: it never opens Find a setting.
+    vcx.update(|window, cx| window.focus(&find, cx));
+    vcx.simulate_keystrokes("shift-7->/");
+    vcx.run_until_parked();
+    let (typed, closed) = desk.read_with(&vcx, |d, cx| {
+        (
+            fields(d).find.read(cx).text.clone(),
+            d.settings.find.is_none(),
+        )
+    });
+    assert_eq!(typed, "/", "the slash is the filter's");
+    assert!(closed, "Find a setting stays closed");
+    set_find(&mut vcx, "");
+
+    vcx.update(|window, cx| window.focus(&find, cx));
+    vcx.simulate_input("captain");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("voice-chief").is_none(), "filtered out");
+    let at = vcx
+        .debug_bounds("voice-captain")
+        .expect("the captain")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    let text = std::fs::read_to_string(&path).expect("config");
+    assert!(
+        text.contains("persona = \"captain\"") && text.contains("# mine"),
+        "{text}"
+    );
+    vcx.run_until_parked();
+    let said = desk.read_with(&vcx, |d, _| d.settings.said.clone().unwrap_or_default());
+    assert!(
+        said.starts_with("qass speaks as Ship captain: written"),
+        "{said}"
+    );
+    assert!(
+        vcx.debug_bounds("voice-told-captain").is_some(),
+        "the lines told follow the pick"
+    );
+    assert!(vcx.debug_bounds("voice-told-plain").is_none());
+
+    // Nothing matches: said, with a way back.
+    vcx.update(|window, cx| window.focus(&find, cx));
+    vcx.simulate_input("zzzz");
+    vcx.run_until_parked();
+    let at = vcx
+        .debug_bounds("voice-clear")
+        .expect("clear the filter")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("voice-plain").is_some(),
+        "the whole list again"
+    );
+
+    // The list is one stop: after a click, Down moves the pick to the next voice, Up back.
+    let at = vcx
+        .debug_bounds("voice-captain")
+        .expect("the captain")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    let after = std::fs::read_to_string(&path).expect("config");
+    assert!(
+        !after.contains("persona = \"captain\""),
+        "down moved it: {after}"
+    );
+    vcx.simulate_keystrokes("up");
+    vcx.run_until_parked();
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("persona = \"captain\"")
+    );
+
+    // Their own words: typing writes nothing, the button does.
+    desk.update(&mut vcx, |d, cx| {
+        let words = fields(d).words.clone();
+        words.update(cx, |f, cx| {
+            f.set_text("calm and brief, calls me Boss");
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("custom"));
+    let at = vcx
+        .debug_bounds("voice-use")
+        .expect("use these words")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("persona = \"custom\"")
+    );
+    let words = qoop_tui::persona::custom_path(&dir.path().join("qass"));
+    assert_eq!(
+        std::fs::read_to_string(words).unwrap(),
+        "calm and brief, calls me Boss\n"
+    );
+    assert!(
+        vcx.debug_bounds("voice-custom").is_some(),
+        "their words join the list"
+    );
+    assert!(
+        vcx.debug_bounds("voice-saved").is_some(),
+        "the result is said by the button"
+    );
+}
+
 /// A run still going reads as its tab does now: Needs you while its agent asks. One whose tab
 /// is not listed keeps its own word.
 #[gpui::test]

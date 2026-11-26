@@ -160,21 +160,11 @@ fn first_message(prompt: &str) -> String {
 }
 
 /// The owner's gate: a race is started and dropped by the person (their own shell tab, or
-/// outside qoop) or by qass, never from a worker agent's terminal. Read from the caller's row, not the
-/// daemon: a speed bump like [`crate::qass_guard`], not a lock.
+/// outside qoop) or by qass, never from a worker agent's terminal.
 fn refuse_a_worker() -> std::io::Result<()> {
-    let (Some(me), Some(_)) = crate::task::here() else {
-        return Ok(());
-    };
-    let agent = worktree::session_rows()?
-        .iter()
-        .any(|r| r.terminal == me && r.agent);
-    if agent && !crate::qass::called_by_qass() {
-        return Err(std::io::Error::other(
-            "a race is started and dropped by the person or qass, not from an agent's terminal",
-        ));
-    }
-    Ok(())
+    crate::qass::refuse_a_worker(
+        "a race is started and dropped by the person or qass, not from an agent's terminal",
+    )
 }
 
 /// One racer about to start.

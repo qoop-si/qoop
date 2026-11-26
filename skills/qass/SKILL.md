@@ -19,7 +19,7 @@ them, and the owner trusts you to. When a rule and a situation disagree, ask the
 
 They read you between other work, often on a phone. Your first line alone tells them what to do.
 
-- **Their language.** Summaries, cards and answers in the language they write to you in.
+- **Their language.** Summaries, cards and answers in the language they write to you in, worded in the voice `qoop qass persona` prints, under its guard.
 - **A question for them is a card first** ("Cards"), never only chat: write the card, then the chat
   names it by its handle words (`api A`) and nothing more. A question an agent puts to them (its
   stage, its menu, its last words) is one too, unless the table answers it for them.
@@ -93,7 +93,7 @@ for them. A task closed verified gets its one line at once: what now works and w
    agent that stopped since your last look as an event line below.
 4. Give them the summary (its shape is under "How you talk to the owner").
    Under Claude Code a hook loads your lessons (`@QASS_CONFIG@/lessons.md`) and `memory.md` at every
-   start, resume and compaction; else read both now. Notes, scratch, skill dir: your folder's AGENTS.md.
+   start, resume and compaction; else read both and run `qoop qass persona` now. Notes, scratch, skill dir: your folder's AGENTS.md.
 5. `qoop doctor --new @QASS_DATA@/doctor-said`, now and when they ask: fix or escalate each line.
 6. Learning: no `qass-learn` row in `qoop schedule ls --json`: add it. Their "learn drop|keep <n>" and
    "learned" act on `@QASS_CONFIG@/owner.md` (what every agent is told): `<this skill's dir>/learned.md`.
@@ -336,8 +336,8 @@ inbox needs a restart of qoop`: `qoop restart` once (checked), write it again (i
 counts); not restarted, the card stands in chat and `goals.md` only. Without the `-`, the old form
 (`'A: <option>'` words, no inbox record, number from `escalate.sh next E`) when no block can be
 written. The handle: one word of the agent's sidebar name, lowercase, no accented letters (café as
-`cafe`; they may type either), unused by any open card ("billing"), never `plan` (kept for plan
-cards, plans.md). `doing`, `why`, `asks`, labels and reasons are in their language, the words in English (the daemon's `W<n>` drafts are the exception: their fixed labels are English).
+`cafe`; they may type either), unused by any open card ("billing"), never `plan` or `voice` (kept for plan
+cards, plans.md, and the voice card, setup.md). `doing`, `why`, `asks`, labels and reasons are in their language, the words in English (the daemon's `W<n>` drafts are the exception: their fixed labels are English).
 
 `now` when the decision table says escalate (their phone rings, end your turn), unless they typed in
 that agent's tab in the last 10 minutes (never for `escalate, always`); `later` otherwise (it waits
@@ -493,7 +493,7 @@ it), their goals under `# Goals` (their rules are lessons). Remove a worker line
 is gone, read and no card waits; a card once they answered it, it is moot or `qoop ask ls` shows it
 ended (never an open one to save room). Under 8 KB.
 `@QASS_DATA@/board/` is `qoop task board`'s: read, never edit.
-config.toml is theirs: never edit it; `qoop config set` only on their word, in setup.
+config.toml is theirs: never edit it; `qoop config set` only on their word, in setup. Their voice pick too (`voice <name>` in any language): `qoop config set qass.persona <id>`, then `qoop qass persona`, and speak in it from that reply; `voices`: the groups of `qoop qass persona ls`, at most 8 entries a message, then "+N more: type `voices <group>`"; their own words: as setup.md's C.
 
 ## Summary
 

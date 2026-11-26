@@ -194,6 +194,16 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         ..qass
     });
     out.push(row(
+        "qass",
+        "qass speaks as",
+        read.qass_persona.clone(),
+        &voice_help(&read.qass_persona),
+        Kind::Choice(
+            "qass.persona",
+            qass_voices(&read, &qoop_runtime::paths::qass_config_dir()),
+        ),
+    ));
+    out.push(row(
         "report",
         "notes to qoop's maker",
         read.report_send.clone(),
@@ -240,6 +250,38 @@ pub(crate) fn qass_agents(read: &config::Read) -> Vec<String> {
         out.insert(0, read.qass_agent.clone());
     }
     out
+}
+
+/// The voices the row steps through: plain, the starters, the owner's own words once they are
+/// written, and whatever the file names now, so a pick made elsewhere is never stepped over.
+pub(crate) fn qass_voices(read: &config::Read, dir: &std::path::Path) -> Vec<String> {
+    use qoop_tui::persona;
+    let mut out: Vec<String> = std::iter::once(persona::PLAIN)
+        .chain(persona::STARTERS)
+        .map(String::from)
+        .collect();
+    if persona::block(persona::CUSTOM, dir).is_some() {
+        out.push(persona::CUSTOM.into());
+    }
+    if !out.contains(&read.qass_persona) {
+        out.insert(1, read.qass_persona.clone());
+    }
+    out
+}
+
+/// What the voice row says of `choice`, and where every other voice is picked.
+fn voice_help(choice: &str) -> String {
+    use qoop_tui::persona;
+    let said = match persona::find(choice) {
+        Some(p) => p.tone.clone(),
+        None if choice == persona::CUSTOM => "their own words".to_string(),
+        None => "qass's own wording".to_string(),
+    };
+    format!(
+        "{said}; every voice: the desktop's settings or `qoop qass persona ls`, or tell qass \
+         `voice <name>`. Claude qass takes it at your next message (a wake before it, once in the \
+         old voice); other agents at their next start"
+    )
 }
 
 /// What another command prints, one row a line: the first word (or, where names hold
@@ -1007,6 +1049,25 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The voice row offers plain and the starters, the owner's words only once written, and
+    /// keeps a voice picked elsewhere among its choices.
+    #[test]
+    fn the_voice_row_keeps_every_pick() {
+        use qoop_tui::persona;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        let qass = persona::dir_for(&file);
+        std::fs::write(&file, "[qass]\npersona = \"noir\"\n").unwrap();
+        let list = qass_voices(&config::read_from(&file), &qass);
+        assert_eq!(list[..2], ["plain", "noir"]);
+        assert_eq!(list[2..], persona::STARTERS);
+        assert!(!list.contains(&"custom".to_string()), "no words yet");
+        persona::save_custom(&file, &qass, "warm").unwrap();
+        let list = qass_voices(&config::read_from(&file), &qass);
+        assert_eq!(list.last().map(String::as_str), Some("custom"));
+        assert!(voice_help("captain").starts_with(&persona::find("captain").unwrap().tone));
+    }
 
     /// The qass row starts from the agent the file names and its arrows reach every agent qass
     /// starts on, installed here or not: none is left out, none is snapped back from.

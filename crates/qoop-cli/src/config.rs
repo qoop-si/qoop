@@ -24,6 +24,11 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 _ => Err(std::io::Error::other("telemetry is true or false")),
             },
             (Some(key), Some(value), 5) => {
+                if key == "qass.persona" {
+                    crate::qass::refuse_a_worker(
+                        "qass's voice is set by the person or qass, not from an agent's terminal",
+                    )?;
+                }
                 config::set(&config::path(), key, value).map_err(std::io::Error::other)?;
                 // The notch reads it when it starts, or at once from its own window.
                 if key == "notch.enabled" && value == "true" {
@@ -71,6 +76,7 @@ fn show(json: bool) -> std::io::Result<()> {
                 "sleep.qass_idle_minutes": c.lifecycle.qass_idle_minutes.unwrap_or(c.lifecycle.idle_minutes),
                 "daemon.exit_when_asleep": c.lifecycle.exit_when_asleep,
                 "qass.agent": read.qass_agent,
+                "qass.persona": read.qass_persona,
                 "qass.models.best": read.qass_models[0],
                 "qass.models.mid": read.qass_models[1],
                 "qass.models.low": read.qass_models[2],
@@ -85,6 +91,10 @@ fn show(json: bool) -> std::io::Result<()> {
                 "notify.alert_sound": config::sounds_here(),
                 "notify.mute": qoop_runtime::config::MUTES,
                 "qass.agent": crate::settings::qass_agents(&read),
+                "qass.persona": std::iter::once(qoop_tui::persona::PLAIN)
+                    .chain(qoop_tui::persona::all().iter().map(|p| p.id.as_str()))
+                    .chain([qoop_tui::persona::CUSTOM])
+                    .collect::<Vec<_>>(),
                 "report.send": config::REPORT_SENDS,
             },
             "problems": read.problems.iter().map(|p| p.short()).collect::<Vec<_>>(),
@@ -119,6 +129,7 @@ fn show(json: bool) -> std::io::Result<()> {
     );
     println!("daemon.exit_when_asleep = {}", c.lifecycle.exit_when_asleep);
     println!("qass.agent = \"{}\"", read.qass_agent);
+    println!("qass.persona = \"{}\"", read.qass_persona);
     println!("report.send = \"{}\"", read.report_send);
     for a in &read.agents {
         println!("agents.{} = {:?}", a.name, a.command);

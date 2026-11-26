@@ -236,6 +236,8 @@ pub struct Read {
     pub qass_agent: String,
     /// `[qass.models]`: the model each of [`QASS_TIERS`] starts a worker on, in that order.
     pub qass_models: [String; 3],
+    /// `[qass] persona`: qass's voice, `plain`, `custom` or a catalog id ([`crate::persona`]).
+    pub qass_persona: String,
     /// `[report] send`, one of [`REPORT_SENDS`].
     pub report_send: String,
     /// `[spaces.<name>]`, by the space's name.
@@ -455,6 +457,17 @@ fn qass_agent_in(text: &str) -> Option<String> {
     agent_name(agent).then(|| agent.to_string())
 }
 
+/// `[qass] persona` as the file says it, `plain` when it names no voice this build knows.
+fn qass_persona_in(text: &str) -> String {
+    let table: Option<toml::Table> = toml::from_str(text).ok();
+    table
+        .as_ref()
+        .and_then(|t| t.get("qass")?.get("persona")?.as_str())
+        .filter(|v| crate::persona::known(v))
+        .unwrap_or(crate::persona::PLAIN)
+        .to_string()
+}
+
 /// `[report] send` as the file says it, `ask` when it says nothing usable.
 fn report_send_in(text: &str) -> String {
     let table: Option<toml::Table> = toml::from_str(text).ok();
@@ -486,6 +499,7 @@ pub fn read_from(path: &Path) -> Read {
     let mut qass_agent = "claude".to_string();
     let mut qass_models = QASS_TIERS.map(|(_, family)| family.to_string());
     let mut report_send = "ask".to_string();
+    let mut qass_persona = crate::persona::PLAIN.to_string();
     let mut spaces = BTreeMap::new();
     let mut broken = false;
     let (config, agents, problems, exists) = match std::fs::read_to_string(path) {
@@ -496,6 +510,7 @@ pub fn read_from(path: &Path) -> Read {
             }
             qass_models = qass_models_in(&text);
             report_send = report_send_in(&text);
+            qass_persona = qass_persona_in(&text);
             spaces = parsed.spaces;
             broken = parsed.broken;
             (parsed.config, parsed.agents, parsed.problems, true)
@@ -513,11 +528,22 @@ pub fn read_from(path: &Path) -> Read {
             )
         }
     };
+    let mut problems = problems;
+    // Their own words named but gone: said, and qass speaks plain.
+    if qass_persona == crate::persona::CUSTOM
+        && crate::persona::block(crate::persona::CUSTOM, &crate::persona::dir_for(path)).is_none()
+    {
+        problems.push(Problem::new(
+            None,
+            "qass.persona = \"custom\" has no words in qass/persona.md; qass speaks plain",
+        ));
+    }
     Read {
         config,
         agents,
         qass_agent,
         qass_models,
+        qass_persona,
         report_send,
         spaces,
         problems,
@@ -883,6 +909,14 @@ fn parse_all(text: &str) -> Parsed {
                                 QASS_AGENTS.join(", ")
                             ),
                         ),
+                        ("persona", Some(voice)) if crate::persona::known(voice) => {}
+                        ("persona", _) => refuse(
+                            line,
+                            format!(
+                                "persona = {value} is not a voice here: plain, custom or one of \
+                                 `qoop qass persona ls`; qass speaks plain"
+                            ),
+                        ),
                         _ => refuse(line, format!("there is no setting qass.{key}")),
                     }
                 }
@@ -1022,7 +1056,7 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 21] = [
+pub const KEYS: [&str; 22] = [
     "prefix",
     "theme",
     "icons",
@@ -1037,6 +1071,7 @@ pub const KEYS: [&str; 21] = [
     "sleep.qass_idle_minutes",
     "daemon.exit_when_asleep",
     "qass.agent",
+    "qass.persona",
     "qass.models.best",
     "qass.models.mid",
     "qass.models.low",
@@ -1101,6 +1136,24 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
             return Err(format!(
                 "{key} is one of {} or a name from [agents]",
                 QASS_AGENTS.join(", ")
+            ));
+        }
+        "qass.persona" if value == crate::persona::CUSTOM => {
+            let words = crate::persona::custom_path(&crate::persona::dir_for(path));
+            let said = std::fs::read_to_string(&words).unwrap_or_default();
+            if crate::persona::clean(&said).0.is_empty() {
+                return Err(format!(
+                    "{key} custom needs their own words first: `qoop qass persona custom -`, or \
+                     the desktop's \"qass speaks as\" setting ({} is empty)",
+                    words.display()
+                ));
+            }
+            toml_edit::value(value)
+        }
+        "qass.persona" if crate::persona::known(value) => toml_edit::value(value),
+        "qass.persona" => {
+            return Err(format!(
+                "{key} is plain, custom or one of `qoop qass persona ls`"
             ));
         }
         "qass.models.best" | "qass.models.mid" | "qass.models.low" => match tier_model(value) {
@@ -1212,6 +1265,7 @@ mod tests {
             ("sleep.qass_idle_minutes", "0"),
             ("daemon.exit_when_asleep", "false"),
             ("qass.agent", "codex"),
+            ("qass.persona", "captain"),
             ("qass.models.best", "opus"),
             ("qass.models.mid", "claude-sonnet-5-5"),
             ("qass.models.low", "haiku"),
@@ -1250,6 +1304,7 @@ mod tests {
         assert_eq!(read.config.lifecycle.qass_idle_minutes, Some(0));
         assert!(!read.config.lifecycle.exit_when_asleep);
         assert_eq!(read.qass_agent, "codex");
+        assert_eq!(read.qass_persona, "captain");
         assert_eq!(read.report_send, "always");
         assert_eq!(read.qass_models, ["opus", "claude-sonnet-5-5", "haiku"]);
         let text = std::fs::read_to_string(&path).expect("read");
@@ -1368,6 +1423,40 @@ mod tests {
             let read = read_from(&path);
             assert!(!read.broken && !read.problems.is_empty(), "{text}");
         }
+    }
+
+    #[test]
+    fn qass_persona_is_read_and_checked() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        assert_eq!(read_from(&path).qass_persona, "plain");
+        set(&path, "qass.persona", "captain").expect("a catalog voice");
+        assert_eq!(read_from(&path).qass_persona, "captain");
+        assert!(
+            set(&path, "qass.persona", "yoda").is_err(),
+            "not in the catalog"
+        );
+        let why = set(&path, "qass.persona", "custom").expect_err("no words yet");
+        assert!(why.contains("persona.md"), "{why}");
+        let words = crate::persona::custom_path(&crate::persona::dir_for(&path));
+        std::fs::create_dir_all(words.parent().unwrap()).expect("dir");
+        std::fs::write(&words, "warm and brief\n").expect("words");
+        set(&path, "qass.persona", "custom").expect("their words are there");
+        assert_eq!(read_from(&path).qass_persona, "custom");
+        std::fs::write(&words, "").expect("emptied by hand");
+        let said: Vec<_> = read_from(&path)
+            .problems
+            .iter()
+            .map(|p| p.what.clone())
+            .collect();
+        assert!(said.iter().any(|w| w.contains("has no words")), "{said:?}");
+        set(&path, "qass.persona", "plain").expect("plain");
+        assert!(read_from(&path).problems.is_empty());
+        // A voice an update removed reads as plain and is said, never an error.
+        std::fs::write(&path, "[qass]\npersona = \"gone\"\n").expect("write");
+        let read = read_from(&path);
+        assert_eq!(read.qass_persona, "plain");
+        assert_eq!(read.problems.len(), 1, "{:?}", read.problems);
     }
 
     #[test]
