@@ -35,5 +35,19 @@ This needs the Android app for now: a browser cannot pair by code.
 ## Privacy
 
 The phone and the computer talk end to end encrypted through a relay that sees neither the
-screens nor the keys, and a notification carries a fixed sentence and four numbers, nothing
-from a screen.
+screens nor the keys.
+
+A push notification takes another path: the computer hands it to the qoop hub, which sends it
+through Apple (iPhone) or Google (Android), so all three can read its words. An alert carries
+the agent's title (its conversation title, else its tab's name), a subtitle with the space's
+name and what happened (for example "shop, waits on you"), and a short body: fixed words such
+as "Waits at its menu", a question card's own question, or a schedule's result. A card's
+question is written by qass or by the agent that asked, so it can carry the agent's own words
+and may name a file or a command. A question card also sends up to three answer options and
+qass's pick, and every alert sends the agent's program name, its session name, when it was last
+active, and numbers naming the computer, space and terminal. Never sent: anything read off a
+screen (a menu's question line, a command's text, file contents, a path) or the words you type.
+On a locked Android phone an alert shows a fixed sentence, and so does an iPhone with previews
+hidden, for waiting prompts and question cards. In the app, Settings, Notifications sets each
+kind of alert to Sound, Silent or Off. A computer or an app that is not updated sends only a
+fixed sentence and the numbers.
