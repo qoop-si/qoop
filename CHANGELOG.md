@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.22.0](https://github.com/qoop-si/qoop/compare/v0.21.2...v0.22.0) (2026-11-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* **desktop:** the agent page's side panel is gone (its text is in the card under the terminal); the task strip and review are drawers; the qass page is a ledger and qass's terminal is in the chat drawer's Terminal tab; the Type into qass chips, the header Watching switch and the Handled for you today card are gone; New work is now New agent and Start waits to land on the agent; the Inbox has a Needs you and Board segment.
+* **desktop:** Home, the top bar, the status line, the key hints, the Inbox right panel and the corner note are gone; the window opens on the Inbox; Let qass take these N is gone and Let qass handle it is Hand to qass; every pick waits 3 s with Undo; ctrl-a i opens the Inbox page and toggles back, ctrl-a tab is next waiting, ctrl-a x only dismisses a closed card; cmd-J and cmd-N are app keys and never reach a terminal; Schedules is reached from the qass page and Settings from the gear.
+* **tui:** ctrl-a Q is the ledger, not qass's terminal (t in it opens the terminal); ctrl-a T and ctrl-a C are gone; the framed qass screen, its board tile, questions column, rail and clock panel are gone; schedules are read only in the TUI (qoop schedule changes them); qoop qass opens no board pane.
+* **tui:** the column opens on the Priority list (ctrl-a g shows the tree); the seven-tab strip, its nothing-needs-you line and the per-row card marks are gone; the per-pane questions rail, ctrl-a T on an agent pane and its s, q, <, > keys are gone; each local agent pane gains the rail's columns and gives 2 rows to the line, so every pane reflows once on the first start.
+* **tui:** digits in the Inbox wait 3 s before sending (u undoes, enter sends now); ctrl-a i opens the Inbox from every tab; the a-d answer keys and t are replaced by 1-9 and r; ctrl-a tab visits only what is counted, oldest first, never unread done; below 100 columns opening the Inbox folds the agents column; a question handed to qass no longer notes or bells; the palette's needs-you section leaves handed questions out.
+
+### New
+
+* **desktop:** agent page, New agent, a qass page and the Board ([3a1e161](https://github.com/qoop-si/qoop/commit/3a1e161401d0b60ca1d213a99147a9e656b7efcb))
+* **desktop:** agents by space or priority, a state filter, spaces to manage ([9013d95](https://github.com/qoop-si/qoop/commit/9013d954244f2fd957e2536a04e8aacaf15dc9bd))
+* **desktop:** the agent page panel with other agents' questions ([0317e93](https://github.com/qoop-si/qoop/commit/0317e93582416599ee96e4a756dabdf345098a2b))
+* **desktop:** the Inbox as home, a sidebar and the shared answer rules ([56636e2](https://github.com/qoop-si/qoop/commit/56636e2a7a2776d435da2f4b7c5ce3bffea2c7e9))
+* **desktop:** the Inbox reads like mail ([e9cd9de](https://github.com/qoop-si/qoop/commit/e9cd9de8617908aa6497ed493dcc6958735ff91c))
+* **desktop:** top band, qass-first column and the Board page ([573e3c6](https://github.com/qoop-si/qoop/commit/573e3c655b31127aec55fe855522a505aed601f4))
+* **qass:** a voice the owner picks for what qass says ([a400648](https://github.com/qoop-si/qoop/commit/a400648c36c61c251c54ab1be13220a4d5e09e8e))
+* **schedules:** cancel the next run and mark a schedule complete ([b3470be](https://github.com/qoop-si/qoop/commit/b3470be1c290833a73f79b5517a80a9043efd233))
+* **tui:** a Priority left column and one line under each agent ([8f5c2a0](https://github.com/qoop-si/qoop/commit/8f5c2a022d790c712e8d61bbe147e43d71f911fe))
+* **tui:** a qass ledger, the Board in the Inbox and a computer screen ([386231d](https://github.com/qoop-si/qoop/commit/386231d54a3b44df7f837a79cad98003629c1cd9))
+* **tui:** an Inbox pane on ctrl-a i, answers held 3 s with undo ([81c8e44](https://github.com/qoop-si/qoop/commit/81c8e447fadf51387ff55eb0214fb0f1ced8f000))
+* **tui:** qass at full height, a right column for board and lists ([131bb93](https://github.com/qoop-si/qoop/commit/131bb93a914b0c526ba22f34d9c3c92b14d240da))
+
+
+### Fixed
+
+* **asks:** every inbox draft carries options; a status turn opens none ([e200304](https://github.com/qoop-si/qoop/commit/e20030427f14ac6a4b73b97eb066270f0f97d671))
+* **board:** the board page reads on the dark pane in a light theme ([b917785](https://github.com/qoop-si/qoop/commit/b9177853e90a55603f7f01ccaae2491d18a1767a))
+* **cli:** onboarding names the ledger's Start key for qass ([576ce92](https://github.com/qoop-si/qoop/commit/576ce928a9aa4280ac6b286971fab31fad4384b8))
+* **cli:** the watch counts a hand to qass as the Inbox does ([ba616e1](https://github.com/qoop-si/qoop/commit/ba616e1bed0c230f9f3865ccfa2e8bf2ce59218f))
+* **desktop:** keep the terminal and the card whole while an answer is held ([03f5cde](https://github.com/qoop-si/qoop/commit/03f5cde48776e50126908986d6d2398edee371ab))
+* **desktop:** qass's pick on its own line, no empty default, a cog ([c3a9b19](https://github.com/qoop-si/qoop/commit/c3a9b19626053b924da52167bb834990abbe93b4))
+* **desktop:** qass's place opens qass's own agent page again ([eedbd92](https://github.com/qoop-si/qoop/commit/eedbd92f81fe50d45440b6ed3c62c4fe6d408e08))
+* **desktop:** Shift+Enter makes a new line, status marks move ([64a5382](https://github.com/qoop-si/qoop/commit/64a5382f1f41d586a5e884f26a4c96dc032ea3d9))
+* **desktop:** the voice setting folds to one row, built on macOS only ([fa6e44f](https://github.com/qoop-si/qoop/commit/fa6e44fdb561071695179db7fe93f2fc1a2df612))
+* hold answers safely across pastes, reconnects and other clients ([9acfe84](https://github.com/qoop-si/qoop/commit/9acfe8440ca05d01c3c0f0cf70581b1a842ae2aa))
+* **notch:** count agents as the Inbox does and point to qass's questions ([689ccdc](https://github.com/qoop-si/qoop/commit/689ccdcc220bef51cd738f2f278e82a1c703928b))
+* **qass:** take back the board left beside qass's ended agent ([40517ab](https://github.com/qoop-si/qoop/commit/40517aba32ec8c620603a37f26821cecfbc20aa4))
+* **runtime:** only an unsent draft holds a tab against a write ([03f0bcc](https://github.com/qoop-si/qoop/commit/03f0bccbf46fa43da5d600aa4b813d5a973bdccd))
+* **tui:** close qass's column on an entry before its space is listed ([20bbd2c](https://github.com/qoop-si/qoop/commit/20bbd2cdeadf139b88e5cab709b3bd2da2a0531b))
+* **tui:** put the terminal interface back as it was before the v3 redesign ([1f2c19e](https://github.com/qoop-si/qoop/commit/1f2c19e14cdd991b0790db468d5c166445f0065e))
+* **tui:** show names whole in the tree, tabs, menus and notices ([018e5bc](https://github.com/qoop-si/qoop/commit/018e5bc570ec8b9e64d6f6ebccd93e682826ebb6))
+* **tui:** whole card options, a clear pick after a card goes, plan cards ([22f06e7](https://github.com/qoop-si/qoop/commit/22f06e7cf454cc9ad0c5e0bfe558dc8199c3e7e2))
+
 ## [0.21.2](https://github.com/qoop-si/qoop/compare/v0.21.1...v0.21.2) (2026-11-24)
 
 
