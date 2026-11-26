@@ -1,13 +1,17 @@
 //! A schedule's run history through the socket: each run has a row of its own, an edit keeps
 //! the schedule's id, its runs and the report of a run that is going, a watch's start gets a
-//! row, and a run ends `done` at its tab's turn end or `gone` when its tab closed first.
+//! row, and a run ends `done` at its tab's turn end or `gone` when its tab closed first. A skip
+//! cancels the next run only, and a complete schedule keeps its runs and stays off.
 //!
 //! The runs are made in the daemon's store directly, as the loop would: a run the daemon
 //! started here would run this test binary as its `qoop schedule fire` child.
 
 use std::time::{Duration, Instant};
 
-use qoop_runtime::control::{ControlRequest, ControlResponse, ScheduleOp, ScheduleRun};
+use qoop_runtime::control::{
+    ControlRequest, ControlResponse, ScheduleInfo, ScheduleOp, ScheduleRun,
+};
+use qoop_runtime::schedule::{Cron, next_slot, system_zone};
 use qoop_store::schedule::ScheduleRow;
 use qoop_testkit::{PATIENCE, TestClient, TestDaemon};
 
@@ -41,6 +45,8 @@ fn row(name: &str) -> ScheduleRow {
         last_result: None,
         last_terminal: None,
         watch: None,
+        skip_until: None,
+        done_at: None,
     }
 }
 
@@ -347,4 +353,160 @@ async fn a_watch_that_started_an_agent_gets_a_row() {
         (listed[0].result.as_str(), listed[0].terminal),
         ("started", Some(9))
     );
+}
+
+/// The schedule as `ScheduleRead` lists it.
+async fn listed(c: &mut TestClient, schedule: i64) -> ScheduleInfo {
+    let ControlResponse::Schedules { schedules, .. } =
+        ask(c, ControlRequest::ScheduleRead { id: "read".into() }).await
+    else {
+        panic!("no schedules");
+    };
+    schedules
+        .into_iter()
+        .find(|s| s.id == schedule)
+        .expect("the schedule")
+}
+
+async fn refused(c: &mut TestClient, n: &str, action: ScheduleOp) -> String {
+    match ask(c, write(n, action)).await {
+        ControlResponse::Failed { reason, .. } => reason,
+        other => panic!("not refused: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_skip_moves_the_next_run_once_and_a_stale_slot_is_refused() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("schedules").await;
+    let s = store(&d);
+    let schedule = s.add_schedule(&row("daily")).expect("a schedule");
+    let before = listed(&mut c, schedule).await;
+    let first = before.next_at.expect("a next run");
+    written(
+        &mut c,
+        "1",
+        ScheduleOp::Skip {
+            schedule,
+            slot: first,
+        },
+    )
+    .await;
+    let daily = Cron::parse("0 9 * * *").expect("a cron");
+    let second = next_slot(&daily, first, system_zone()).expect("the run after");
+    let after = listed(&mut c, schedule).await;
+    assert_eq!(
+        (after.next_at, after.skip_until),
+        (Some(second), Some(first))
+    );
+    assert_eq!(
+        ScheduleInfo {
+            next_at: before.next_at,
+            skip_until: None,
+            ..after
+        },
+        before,
+        "nothing else changed"
+    );
+    assert!(runs(&mut c, schedule).await.is_empty());
+    // The slot already cancelled, and one that is not next, are stale.
+    for (n, slot) in [("2", first), ("3", second + 86_400)] {
+        let why = refused(&mut c, n, ScheduleOp::Skip { schedule, slot }).await;
+        assert_eq!(why, "stale_slot");
+    }
+    assert_eq!(listed(&mut c, schedule).await.next_at, Some(second));
+    // A watch has no planned run, and an off schedule nothing planned.
+    let watch = ScheduleRow {
+        cron: None,
+        watch: Some("echo one".into()),
+        ..row("issues")
+    };
+    let watch = s.add_schedule(&watch).expect("a watch");
+    // Paused, so the daemon's look never runs its check (this test binary, as its child).
+    assert!(s.pause_schedule(watch).expect("paused"));
+    let why = refused(
+        &mut c,
+        "4",
+        ScheduleOp::Skip {
+            schedule: watch,
+            slot: first,
+        },
+    )
+    .await;
+    assert!(why.contains("watch"), "{why}");
+    assert!(s.pause_schedule(schedule).expect("paused"));
+    refused(
+        &mut c,
+        "5",
+        ScheduleOp::Skip {
+            schedule,
+            slot: second,
+        },
+    )
+    .await;
+    // Off, the cancel is still said, so a client can name the run that turning it on brings.
+    assert_eq!(listed(&mut c, schedule).await.skip_until, Some(first));
+}
+
+/// A cancelled run gets a row of its own, under its slot, that says so. A one-off's is written
+/// with the cancel, and the one-off is done then: it reads as finished, not as on with nothing
+/// planned.
+#[tokio::test]
+async fn a_cancelled_one_off_has_a_row_that_says_cancelled_and_is_done() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("schedules").await;
+    let at = qoop_runtime::store::now() + 3600;
+    let once = ScheduleRow {
+        cron: None,
+        at: Some(at),
+        ..row("once")
+    };
+    let schedule = store(&d).add_schedule(&once).expect("a one-off");
+    written(&mut c, "1", ScheduleOp::Skip { schedule, slot: at }).await;
+    let listed_runs = runs(&mut c, schedule).await;
+    assert_eq!(
+        (
+            listed_runs.len(),
+            listed_runs[0].slot,
+            listed_runs[0].result.as_str(),
+            listed_runs[0].outcome.as_deref()
+        ),
+        (1, at, "skipped: cancelled", Some("skipped"))
+    );
+    assert!(listed_runs[0].ended_at.is_some());
+    let done = listed(&mut c, schedule).await;
+    assert!(
+        done.paused
+            && done.done_at.is_some()
+            && done.next_at.is_none()
+            && done.skip_until.is_none()
+            && done.last_result.as_deref() == Some("skipped: cancelled"),
+        "{done:?}"
+    );
+    // Done: it is not cancelled twice, and does not come back on.
+    refused(&mut c, "2", ScheduleOp::Skip { schedule, slot: at }).await;
+    refused(&mut c, "3", ScheduleOp::Resume { schedule }).await;
+}
+
+#[tokio::test]
+async fn complete_keeps_the_runs_and_a_complete_schedule_does_not_resume() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("schedules").await;
+    let s = store(&d);
+    let schedule = s.add_schedule(&row("weekly")).expect("a schedule");
+    let at = qoop_runtime::store::now();
+    s.start_run(schedule, 0, at)
+        .expect("a run")
+        .expect("the schedule is there");
+    written(&mut c, "1", ScheduleOp::Complete { schedule }).await;
+    let done = listed(&mut c, schedule).await;
+    assert!(done.paused && done.next_at.is_none(), "{done:?}");
+    assert!(
+        done.done_at
+            .is_some_and(|t| (at..=qoop_runtime::store::now()).contains(&t)),
+        "{done:?}"
+    );
+    assert_eq!(runs(&mut c, schedule).await.len(), 1);
+    refused(&mut c, "2", ScheduleOp::Resume { schedule }).await;
+    assert_eq!(listed(&mut c, schedule).await, done);
 }

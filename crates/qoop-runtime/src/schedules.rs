@@ -41,7 +41,7 @@ use crate::control::{
     ScheduleInfo, ScheduleOp, ScheduleRun,
 };
 use crate::daemon::{Bookkeeping, ConnectionRegistry, PROBE_DEADLINE, TerminalRegistry};
-use crate::schedule::{Cron, Decision, Zone, decide, next_at, system_zone, when_words};
+use crate::schedule::{CANCELLED, Cron, Decision, Zone, decide, next_at, system_zone, when_words};
 use crate::store::{HandleError, now};
 
 /// The longest the loop sleeps without looking, so a wake from sleep or a clock set to another
@@ -161,6 +161,11 @@ fn info(row: ScheduleRow, at: i64, zone: Zone) -> ScheduleInfo {
         last_at: row.last_at,
         last_result: row.last_result,
         last_terminal: row.last_terminal,
+        done_at: row.done_at,
+        // Only while it is still ahead of what was claimed: a covered one says nothing.
+        skip_until: row
+            .skip_until
+            .filter(|skip| row.last_slot.is_none_or(|last| *skip > last)),
     }
 }
 
@@ -356,7 +361,28 @@ async fn made(
         last_at: None,
         last_result: None,
         last_terminal: None,
+        skip_until: None,
+        done_at: None,
     })
+}
+
+/// What a skip of a slot that is not the next run any more is refused with: a code, which the
+/// phone reads to look again, as it reads [`STILL_RUNNING`].
+const NOT_NEXT: &str = "stale_slot";
+
+/// Whether `slot` is a run of `row` that may be cancelled: its next one, with nothing due
+/// before it. A watch's next time is a check, not a run.
+fn skippable(row: &ScheduleRow, slot: i64) -> Result<(), &'static str> {
+    if row.watch.is_some() {
+        return Err("a watch has no planned run to cancel");
+    }
+    if row.paused {
+        return Err("nothing is planned while it is off");
+    }
+    if decide(row, now(), system_zone()) != Decision::Wait(slot) {
+        return Err(NOT_NEXT);
+    }
+    Ok(())
 }
 
 /// What a report may say: how the run went, never `claimed`, which is the daemon's word.
@@ -464,7 +490,9 @@ pub(crate) async fn write(
         | ScheduleOp::Resume { schedule }
         | ScheduleOp::Remove { schedule }
         | ScheduleOp::Run { schedule }
-        | ScheduleOp::Report { schedule, .. } => {
+        | ScheduleOp::Report { schedule, .. }
+        | ScheduleOp::Skip { schedule, .. }
+        | ScheduleOp::Complete { schedule } => {
             let row = match store.run(move |s| s.schedule(schedule)).await {
                 Ok(Some(row)) => row,
                 Ok(None) => return failed(id, format!("no schedule {schedule}")),
@@ -472,6 +500,34 @@ pub(crate) async fn write(
             };
             let applied = match action {
                 ScheduleOp::Pause { .. } => store.run(move |s| s.pause_schedule(schedule)).await,
+                ScheduleOp::Resume { .. } if row.done_at.is_some() => {
+                    return failed(id, "it is complete, and a complete schedule stays off");
+                }
+                ScheduleOp::Complete { .. } => {
+                    let at = now();
+                    store.run(move |s| s.complete_schedule(schedule, at)).await
+                }
+                ScheduleOp::Skip { slot, .. } => {
+                    if let Err(reason) = skippable(&row, slot) {
+                        return failed(id, reason);
+                    }
+                    let (expected, once, at) = (row.last_slot, row.at.is_some(), now());
+                    let said = format!("skipped: {CANCELLED}");
+                    match store
+                        .run(move |s| {
+                            // A one-off's only run cancelled: it is done now.
+                            if once {
+                                s.skip_once(schedule, expected, slot, at, &said)
+                            } else {
+                                s.skip_schedule(schedule, expected, slot)
+                            }
+                        })
+                        .await
+                    {
+                        Ok(false) => return failed(id, NOT_NEXT),
+                        skipped => skipped,
+                    }
+                }
                 ScheduleOp::Resume { .. } => {
                     let at = now();
                     store.run(move |s| s.resume_schedule(schedule, at)).await

@@ -42,7 +42,7 @@ pub struct ScheduleRunRow {
     /// `claimed` until the run reports, then `started`, `skipped: <why>` or `failed: <why>`.
     pub result: String,
     pub ended_at: Option<i64>,
-    /// `done`, `failed` or `gone`; none while it runs and for a skip.
+    /// `done`, `failed`, `gone` or `skipped`; none while it runs.
     pub outcome: Option<String>,
     /// The agent's newest message when its turn ended.
     pub summary: Option<String>,
@@ -73,11 +73,14 @@ fn unix_now() -> i64 {
 }
 
 /// When a run that says `result` ended, and how: a claim or a start is still going, a failure
-/// ended `failed`, and a skip ended with no outcome (its `result` says why).
+/// ended `failed`, and a skip ended `skipped` (its `result` says why: `skipped: cancelled` is a
+/// run the owner cancelled). Clients read `result` before `outcome`, so an older one draws a
+/// skip as it always did.
 fn ending(result: &str, at: i64) -> (Option<i64>, Option<&'static str>) {
     match result {
         "claimed" | "started" => (None, None),
         _ if result.starts_with("failed: ") => (Some(at), Some("failed")),
+        _ if result.starts_with("skipped: ") => (Some(at), Some("skipped")),
         _ => (Some(at), None),
     }
 }
@@ -158,6 +161,20 @@ fn claim_in(
         return Ok(None);
     }
     insert_run(tx, id, slot, now, result, None).map(Some)
+}
+
+/// Pause schedule `id` for good, with `done_at` its first `at`, inside the caller's transaction.
+/// False when there is no such schedule.
+fn complete_in(tx: &Connection, id: i64, at: i64) -> rusqlite::Result<bool> {
+    let there = tx.execute("UPDATE schedule SET paused = 1 WHERE id = ?1", params![id])? > 0;
+    if there {
+        tx.execute(
+            "INSERT INTO schedule_mark (schedule, done_at) VALUES (?1, ?2) \
+             ON CONFLICT(schedule) DO UPDATE SET done_at = COALESCE(done_at, excluded.done_at)",
+            params![id, at],
+        )?;
+    }
+    Ok(there)
 }
 
 /// What a Run now came to.
@@ -254,12 +271,20 @@ pub struct ScheduleRow {
     /// The shell command of a watch: checked every few minutes, its new lines start the run.
     /// Kept in `schedule_watch`, so an older binary reads the row as one with no timing.
     pub watch: Option<String>,
+    /// Every slot of a repeat up to this one is cancelled: the owner skipped the next run, once
+    /// or more (a one-off's cancel completes it instead). Kept in `schedule_mark`, as `done_at`
+    /// is.
+    pub skip_until: Option<i64>,
+    /// When the owner marked it complete: paused for good, its runs kept.
+    pub done_at: Option<i64>,
 }
 
 const COLUMNS: &str = "s.id, s.name, s.cron, s.at, s.agent, s.cwd, s.space, s.prompt, s.paused, \
-                       s.created_at, s.last_slot, s.last_at, s.last_result, s.last_terminal, w.command";
+                       s.created_at, s.last_slot, s.last_at, s.last_result, s.last_terminal, w.command, \
+                       m.skip_until, m.done_at";
 
-const FROM: &str = "schedule s LEFT JOIN schedule_watch w ON w.schedule = s.id";
+const FROM: &str = "schedule s LEFT JOIN schedule_watch w ON w.schedule = s.id \
+                    LEFT JOIN schedule_mark m ON m.schedule = s.id";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
     Ok(ScheduleRow {
@@ -278,6 +303,8 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
         last_result: r.get(12)?,
         last_terminal: r.get(13)?,
         watch: r.get(14)?,
+        skip_until: r.get(15)?,
+        done_at: r.get(16)?,
     })
 }
 
@@ -292,7 +319,8 @@ fn name_ok(name: &str) -> bool {
 }
 
 impl Store {
-    /// Record a schedule and answer its id; `row.id` and the `last_*` columns are ignored.
+    /// Record a schedule and answer its id; `row.id`, the `last_*` columns, `skip_until` and
+    /// `done_at` are ignored.
     pub fn add_schedule(&self, row: &ScheduleRow) -> Result<i64, StoreError> {
         if !name_ok(&row.name) {
             return Err(ScheduleError::BadName.into());
@@ -370,6 +398,54 @@ impl Store {
             "UPDATE schedule SET paused = 0, last_slot = ?2 WHERE id = ?1 AND paused = 1",
             params![id, now],
         )? > 0)
+    }
+
+    /// Cancel every run of schedule `id` up to `slot`, its next one, while it still holds the
+    /// last slot the caller decided on (`expected`) and is not paused: a claim in between makes
+    /// the caller's next run a stale one. Nothing else of the schedule changes. Answers whether
+    /// it was written.
+    pub fn skip_schedule(
+        &self,
+        id: i64,
+        expected: Option<i64>,
+        slot: i64,
+    ) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "INSERT INTO schedule_mark (schedule, skip_until) \
+             SELECT id, ?3 FROM schedule WHERE id = ?1 AND last_slot IS ?2 AND paused = 0 \
+             ON CONFLICT(schedule) DO UPDATE SET skip_until = excluded.skip_until",
+            params![id, expected, slot],
+        )? > 0)
+    }
+
+    /// Mark a schedule complete at `at`: paused for good, its runs kept. Marked twice, it keeps
+    /// the first time. Answers whether there was one.
+    pub fn complete_schedule(&self, id: i64, at: i64) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let there = complete_in(&tx, id, at)?;
+        tx.commit()?;
+        Ok(there)
+    }
+
+    /// Cancel the one run of a one-off at `slot`: claimed as `result` (its run row says why) and
+    /// complete, in one transaction, so it reads as done at once rather than on with nothing
+    /// planned. From `expected` only, as [`Store::skip_schedule`]. Answers whether it was
+    /// written.
+    pub fn skip_once(
+        &self,
+        id: i64,
+        expected: Option<i64>,
+        slot: i64,
+        now: i64,
+        result: &str,
+    ) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        if claim_in(&tx, id, expected, slot, now, result)?.is_none() {
+            return Ok(false);
+        }
+        complete_in(&tx, id, now)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Forget a schedule. Answers whether there was one.
@@ -590,7 +666,8 @@ impl Store {
 
     /// Write `row` over the schedule of its id, keeping the id, its runs, whether it is paused
     /// and how its last run went. `moved` is when a new timing starts: it becomes the last
-    /// slot, so nothing of the old timing is caught up. A watch whose command changed starts
+    /// slot, so nothing of the old timing is caught up, and the runs cancelled of the old
+    /// timing are forgotten with it. A watch whose command changed starts
     /// over with no lines seen. Answers whether there was one.
     pub fn change_schedule(
         &self,
@@ -622,6 +699,12 @@ impl Store {
         )? > 0;
         if !changed {
             return Ok(false);
+        }
+        if moved.is_some() {
+            tx.execute(
+                "UPDATE schedule_mark SET skip_until = NULL WHERE schedule = ?1",
+                params![row.id],
+            )?;
         }
         match &row.watch {
             Some(command) => tx.execute(
@@ -799,6 +882,8 @@ mod tests {
             last_result: None,
             last_terminal: None,
             watch: None,
+            skip_until: None,
+            done_at: None,
         }
     }
 
@@ -820,6 +905,83 @@ mod tests {
             );
         }
         assert!(s.add_schedule(&made("2nd-run")).is_ok());
+    }
+
+    /// A skip is written only from the last slot the caller saw and never on a paused row;
+    /// a new timing forgets it, and a remove takes the mark with the schedule.
+    #[test]
+    fn a_skip_holds_from_the_slot_it_saw_and_a_new_timing_forgets_it() {
+        let s = Store::in_memory().expect("open");
+        let id = s.add_schedule(&made("a")).unwrap();
+        assert!(s.skip_schedule(id, None, 900).unwrap());
+        let held = s.schedule(id).unwrap().unwrap();
+        assert_eq!((held.skip_until, held.last_slot), (Some(900), None));
+        // A second skip moves it on; one from a slot the row no longer holds does nothing.
+        assert!(s.skip_schedule(id, None, 960).unwrap());
+        assert!(!s.skip_schedule(id, Some(500), 1020).unwrap());
+        assert!(!s.skip_schedule(id + 9, None, 1020).unwrap());
+        assert_eq!(s.schedule(id).unwrap().unwrap().skip_until, Some(960));
+        assert!(s.pause_schedule(id).unwrap());
+        assert!(!s.skip_schedule(id, None, 1020).unwrap(), "paused");
+        // An edit that keeps the timing keeps the skip; a new timing drops it.
+        let same = ScheduleRow { id, ..made("a") };
+        assert!(s.change_schedule(&same, None).unwrap());
+        assert_eq!(s.schedule(id).unwrap().unwrap().skip_until, Some(960));
+        assert!(s.change_schedule(&same, Some(700)).unwrap());
+        assert_eq!(s.schedule(id).unwrap().unwrap().skip_until, None);
+        assert!(s.remove_schedule(id).unwrap());
+        let marks: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM schedule_mark", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(marks, 0);
+    }
+
+    /// Complete pauses for good with the first time it was marked, and keeps the runs.
+    #[test]
+    fn complete_pauses_keeps_the_runs_and_the_first_time() {
+        let s = Store::in_memory().expect("open");
+        let id = s.add_schedule(&made("a")).unwrap();
+        s.claim_run(id, None, 500, 501, "claimed").unwrap().unwrap();
+        assert!(s.complete_schedule(id, 800).unwrap());
+        assert!(s.complete_schedule(id, 900).unwrap());
+        assert!(!s.complete_schedule(id + 9, 900).unwrap());
+        let held = s.schedule(id).unwrap().unwrap();
+        assert_eq!((held.paused, held.done_at), (true, Some(800)));
+        assert_eq!(runs(&s, id).len(), 1);
+    }
+
+    /// A one-off's cancel writes its run row and completes it together, and only from the slot
+    /// the caller saw.
+    #[test]
+    fn a_cancelled_one_off_is_claimed_and_complete_at_once() {
+        let s = Store::in_memory().expect("open");
+        let once = ScheduleRow {
+            cron: None,
+            at: Some(900),
+            ..made("once")
+        };
+        let id = s.add_schedule(&once).unwrap();
+        assert!(
+            !s.skip_once(id, Some(5), 900, 800, "skipped: cancelled")
+                .unwrap()
+        );
+        assert!(runs(&s, id).is_empty());
+        assert!(!s.schedule(id).unwrap().unwrap().paused);
+        assert!(
+            s.skip_once(id, None, 900, 800, "skipped: cancelled")
+                .unwrap()
+        );
+        let held = s.schedule(id).unwrap().unwrap();
+        assert_eq!(
+            (held.last_slot, held.paused, held.done_at),
+            (Some(900), true, Some(800))
+        );
+        let run = &runs(&s, id)[0];
+        assert_eq!(
+            (run.slot, run.result.as_str(), run.outcome.as_deref()),
+            (900, "skipped: cancelled", Some("skipped"))
+        );
     }
 
     /// Two claims of one slot from the same last slot: one changes the row, the other none.
@@ -1188,7 +1350,7 @@ mod tests {
                 .iter()
                 .all(|r| r.ended_at.is_none() && r.outcome.is_none())
         );
-        // A skip is a row too, ended as it starts, with no outcome.
+        // A skip is a row too, ended `skipped` as it starts.
         assert!(
             s.claim_schedule(id, Some(500), 560, 561, Some("skipped: too old"))
                 .unwrap()
@@ -1199,7 +1361,7 @@ mod tests {
             .expect("the skip's row");
         assert_eq!(
             (skip.result.as_str(), skip.ended_at, skip.outcome.as_deref()),
-            ("skipped: too old", Some(561), None)
+            ("skipped: too old", Some(561), Some("skipped"))
         );
         assert_eq!(s.open_runs().unwrap().len(), 2);
     }

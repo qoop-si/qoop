@@ -521,6 +521,15 @@ impl Store {
                  command TEXT NOT NULL,
                  seen TEXT
              );
+             -- What the owner said of a schedule's plan (`schedule.rs`): every run up to
+             -- `skip_until` is cancelled, and `done_at` is when it was marked complete. A table
+             -- of its own, no version bump: an older binary reads a complete schedule as paused
+             -- (complete pauses it) and runs a cancelled slot.
+             CREATE TABLE IF NOT EXISTS schedule_mark (
+                 schedule INTEGER PRIMARY KEY REFERENCES schedule(id) ON DELETE CASCADE,
+                 skip_until INTEGER,
+                 done_at INTEGER
+             );
              -- Each run of a schedule (`schedule.rs`): made when it starts, a skip included,
              -- and ended when its agent's turn ends or its tab closes. The newest 200 of a
              -- schedule are kept. New table, no version bump: an older binary never reads it.

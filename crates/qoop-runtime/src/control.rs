@@ -853,8 +853,8 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         auto: bool,
     },
-    /// Add, edit, pause, resume, remove or run a schedule, or report how a run went (`qoop
-    /// schedule`).
+    /// Add, edit, pause, resume, remove, run or complete a schedule, cancel its next run, or
+    /// report how a run went (`qoop schedule`).
     /// A write from a terminal carries its token and is refused unless that terminal is qass's;
     /// a client that speaks for no terminal (the app, the CLI outside qoop, the run itself
     /// reporting) sends none. Answered `ScheduleWritten`.
@@ -958,6 +958,20 @@ pub enum ScheduleOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
     },
+    /// Cancel the one run due at `slot`, refused with `stale_slot` unless it is the schedule's
+    /// `next_at`: the next run is then the one after it (`ScheduleInfo.skip_until` says so),
+    /// and nothing else changes. A one-off has no run after it, so it is then complete, its
+    /// run row saying `skipped: cancelled`. A watch has no planned run to cancel. An older
+    /// daemon answers `unknown variant`.
+    Skip {
+        schedule: i64,
+        slot: i64,
+    },
+    /// End it for good: paused, `done_at` set, its runs kept; a `Resume` of it is refused. An
+    /// older daemon answers `unknown variant`.
+    Complete {
+        schedule: i64,
+    },
 }
 
 /// One run of a schedule, as `ScheduleRuns` lists it.
@@ -980,7 +994,9 @@ pub struct ScheduleRun {
     #[serde(default)]
     pub ended_at: Option<i64>,
     /// `done` or `failed` when its agent's turn ended (a failure to start is `failed` too),
-    /// `gone` when its tab closed first; none while it runs and for a skip.
+    /// `gone` when its tab closed first, `skipped` for a skip (`result` says why, and
+    /// `skipped: cancelled` is a run the owner cancelled); none while it runs. An older daemon
+    /// leaves a skip's out, and a client reads `result` first.
     #[serde(default)]
     pub outcome: Option<String>,
     /// Its agent's newest message when the turn ended, at most [`RUN_SUMMARY_MOST`] bytes.
@@ -1026,6 +1042,15 @@ pub struct ScheduleInfo {
     /// When it next comes due, in unix seconds; none when paused or done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_at: Option<i64>,
+    /// When it was marked complete, in unix seconds; an older daemon never sends it, and an
+    /// older client reads a complete schedule as paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_at: Option<i64>,
+    /// Every run up to this slot is cancelled (`ScheduleOp::Skip`) and has not come yet: the
+    /// next run is the first after it, while it is off too. None when nothing is cancelled;
+    /// an older daemon never sends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_until: Option<i64>,
     /// The daemon's words for the timing, the same on every client: `every day 09:00`,
     /// `weekdays 09:00`, `mondays 08:30`, `every 2h`, `every 15m`, `once oct 24 17:00`,
     /// `on change, every 5m`, else the cron text.
@@ -4323,6 +4348,70 @@ mod tests {
             .to_string();
         assert!(too_old_for(&refusal, Some("Messages")), "{refusal}");
         assert!(!too_old_for(&refusal, Some("MessageDetail")), "{refusal}");
+    }
+
+    /// Skip and complete are the phone's shapes (`protocol.ts` `ScheduleOp`), serde names either
+    /// one `unknown variant` to a decoder without it, and `done_at` and `skip_until` are left off
+    /// for an older client and read as none from an older daemon.
+    #[test]
+    fn a_skip_and_a_complete_round_trip_and_serde_names_an_unknown_op() {
+        let skip = ScheduleOp::Skip {
+            schedule: 3,
+            slot: 1_800_000_000,
+        };
+        let complete = ScheduleOp::Complete { schedule: 3 };
+        assert_eq!(
+            serde_json::to_value(&skip).expect("encode"),
+            serde_json::json!({"kind": "skip", "schedule": 3, "slot": 1_800_000_000})
+        );
+        assert_eq!(
+            serde_json::to_value(&complete).expect("encode"),
+            serde_json::json!({"kind": "complete", "schedule": 3})
+        );
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum Before {
+            Pause { schedule: i64 },
+        }
+        for (op, name) in [(skip, "skip"), (complete, "complete")] {
+            let request = ControlRequest::ScheduleWrite {
+                id: "w".into(),
+                terminal: None,
+                token: None,
+                action: Box::new(op.clone()),
+            };
+            let wire = serde_json::to_vec(&request).expect("encode");
+            assert_eq!(
+                serde_json::from_slice::<ControlRequest>(&wire).expect("decode"),
+                request
+            );
+            let refusal = serde_json::from_value::<Before>(serde_json::to_value(&op).unwrap())
+                .expect_err("a decoder without the op cannot read it")
+                .to_string();
+            assert!(
+                refusal.contains(&format!("unknown variant `{name}`")),
+                "{refusal}"
+            );
+        }
+        let old = serde_json::json!({
+            "id": 1, "name": "n", "agent": "claude", "cwd": "/tmp", "prompt": "go",
+            "paused": true, "created_at": 0, "when": "every day 09:00",
+        });
+        let info: ScheduleInfo = serde_json::from_value(old).expect("an older daemon's row");
+        assert_eq!((info.done_at, info.skip_until), (None, None));
+        let bare = serde_json::to_value(&info).expect("encode");
+        assert!(bare.get("done_at").is_none() && bare.get("skip_until").is_none());
+        let done = ScheduleInfo {
+            done_at: Some(5),
+            skip_until: Some(7),
+            ..info
+        };
+        let wire = serde_json::to_vec(&done).expect("encode");
+        assert_eq!(
+            serde_json::from_slice::<ScheduleInfo>(&wire).expect("decode"),
+            done
+        );
     }
 
     #[test]
