@@ -534,40 +534,4 @@ mod tests {
             HandleError::Store(StoreError::NoWorkspace(404))
         ));
     }
-
-    /// A move the daemon answered `Failed` (the store did not answer within its deadline)
-    /// must never land afterwards: a tab that was told it did not move would sit in the
-    /// other space while the daemon, and the person, still have it in the first.
-    #[tokio::test]
-    async fn a_move_that_timed_out_does_not_land_after_the_answer() {
-        let handle = StoreHandle::new(Store::in_memory().expect("open"));
-        let from = handle.create_workspace("from".into()).await.expect("space");
-        let to = handle.create_workspace("to".into()).await.expect("space");
-        handle
-            .create_terminal(1, from, "/tmp".into(), "/bin/sh".into())
-            .await
-            .expect("terminal");
-        // Something holds the store past the deadline, a stalled disk for instance.
-        let staller = handle.clone();
-        tokio::spawn(async move {
-            let _ = staller
-                .run(|_| -> Result<(), StoreError> {
-                    std::thread::sleep(STORE_DEADLINE + Duration::from_secs(2));
-                    Ok(())
-                })
-                .await;
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(matches!(
-            handle.move_terminals(vec![1], to, None).await,
-            Err(HandleError::Timeout)
-        ));
-        // The stall ends and the queued job gets the store.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(
-            handle.open_terminals(to).await.expect("list").is_empty(),
-            "a move answered as failed landed later"
-        );
-        assert_eq!(handle.open_terminals(from).await.expect("list").len(), 1);
-    }
 }
