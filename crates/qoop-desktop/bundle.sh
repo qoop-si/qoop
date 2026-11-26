@@ -3,7 +3,8 @@
 #   crates/qoop-desktop/bundle.sh --binary <path to qoop-desktop> <out dir>
 # writes <out dir>/qoop.app (Info.plist, MacOS/qoop-desktop, Resources/AppIcon.icns). It builds
 # nothing: CI and the release hand it the binary they built. The release signs it again with the
-# Developer ID; ad hoc is what a build without that certificate can carry.
+# Developer ID; ad hoc is what a build without that certificate can carry. A Developer ID dmg made on the
+# owner's Mac (Xcode cloud signing, which CI cannot do) comes from release-mac.sh.
 set -eu
 
 usage() {
