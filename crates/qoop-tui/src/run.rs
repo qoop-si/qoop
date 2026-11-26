@@ -11343,7 +11343,9 @@ where
                                         state.message = None;
                                         let drop = state.drop_target(press.source, row, col);
                                         if let Some(ask) = drop.and_then(|drop| {
-                                            drop_row(&mut state, terminal, drop, &mut request, handle)
+                                            let far = row.abs_diff(press.at.0) >= CROSS_SPACE_ROWS
+                                                || col.abs_diff(press.at.1) > 2;
+                                            drop_row(&mut state, terminal, drop, &mut request, handle, far)
                                         }) {
                                             wr.write_all(&client::encode_control_seq(
                                                 &ask, &mut control_seq,
@@ -14113,6 +14115,12 @@ fn drop_hint(state: &State, source: Source, drop: Option<RowDrop>) -> String {
     }
 }
 
+/// How many rows a held tab has to travel before letting go in another space moves it.
+const CROSS_SPACE_ROWS: u16 = 2;
+
+/// What a drop in another space is told when the pointer barely left where it was pressed.
+const CROSS_SPACE_NEAR: &str = "drag it farther to move it to another space";
+
 /// What a pane dropped on qass's tab is told while the tab draws its right column.
 const COLUMN_NO_PANE: &str = "qass's tab takes no other pane while it has its right column";
 
@@ -14138,6 +14146,7 @@ fn drop_row(
     drop: RowDrop,
     request: &mut u64,
     handle: bool,
+    far: bool,
 ) -> Option<ControlRequest> {
     let Some(from) = state
         .rows
@@ -14163,6 +14172,12 @@ fn drop_row(
         RowDrop::Pane(pane, _) if pane == terminal => return None,
         RowDrop::Pane(pane, side) => (state.space?, Some((pane, side)), None),
     };
+    // A click that drifted a row is not a drag: another space is entered only by a pointer
+    // that really travelled, since a tab sent there has no undo.
+    if space != from && !far {
+        state.message = Some(CROSS_SPACE_NEAR.to_string());
+        return None;
+    }
     if let Some((pane, side)) = beside {
         // qass's tab drawn with its right column is qass and the board: a third pane there would
         // draw the tab from its kept tree, the board thrown to the left.
@@ -17888,6 +17903,35 @@ mod tests {
         );
     }
 
+    /// A tab held and let go in another space moves only when the pointer really travelled:
+    /// a click that drifted a row lands nothing there, says why, and sends no move.
+    #[test]
+    fn a_drop_in_another_space_needs_a_real_drag() {
+        let mut s = drag_state();
+        let mut request = 0;
+        let drop = RowDrop::Space(2);
+        assert_eq!(drop_row(&mut s, 1, drop, &mut request, false, false), None);
+        assert_eq!(s.message.as_deref(), Some(CROSS_SPACE_NEAR));
+        let ask = drop_row(&mut s, 1, drop, &mut request, false, true);
+        assert!(
+            matches!(
+                &ask,
+                Some(ControlRequest::MoveTerminal {
+                    terminal: 1,
+                    workspace: 2,
+                    ..
+                })
+            ),
+            "{ask:?}"
+        );
+        // Inside its own space the short drag still reorders.
+        let place = RowDrop::Bar {
+            space: 1,
+            place: Place::End,
+        };
+        assert!(drop_row(&mut s, 1, place, &mut request, false, false).is_some());
+    }
+
     /// A pane's name on its top edge is a handle for it, and the tab bar a place to let it
     /// go: past the last tab, the pane leaves its split for a tab of its own at the end.
     #[test]
@@ -17927,14 +17971,14 @@ mod tests {
         // The split's first pane, held by its name, leaves too: it is asked to, by name.
         assert_eq!(s.drop_target(Source::Pane(1), 1, end), bar);
         let mut request = 0;
-        let ask = drop_row(&mut s, 1, place, &mut request, true);
+        let ask = drop_row(&mut s, 1, place, &mut request, true, true);
         assert!(
             matches!(&ask, Some(ControlRequest::MoveTerminal { id, terminal: 1, leave_split: true, .. })
                 if id.starts_with(LEAVE)),
             "{ask:?}"
         );
         // Its row in the column still moves the whole split.
-        let ask = drop_row(&mut s, 1, place, &mut request, false);
+        let ask = drop_row(&mut s, 1, place, &mut request, false, true);
         assert!(
             matches!(
                 &ask,
@@ -26749,7 +26793,10 @@ mod tests {
                 COLUMN_NO_PANE
             );
             let mut request = 0;
-            assert_eq!(drop_row(&mut state, 1, drop, &mut request, false), None);
+            assert_eq!(
+                drop_row(&mut state, 1, drop, &mut request, false, true),
+                None
+            );
             assert_eq!(state.message.as_deref(), Some(COLUMN_NO_PANE));
             assert!(
                 state.outline(1, 5, layout::Move::Right).is_some(),
@@ -27487,7 +27534,10 @@ mod tests {
             },
         ] {
             assert!(drop_hint(&state, Source::Pane(5), Some(drop)).contains("stay together"));
-            assert_eq!(drop_row(&mut state, 5, drop, &mut request, true), None);
+            assert_eq!(
+                drop_row(&mut state, 5, drop, &mut request, true, true),
+                None
+            );
             assert_eq!(state.layouts[&9].leaves(), [4, 5]);
             assert!(
                 state
@@ -27502,6 +27552,7 @@ mod tests {
             4,
             RowDrop::Pane(5, layout::Move::Left),
             &mut request,
+            true,
             true,
         );
         assert_eq!(state.layouts[&9].leaves(), [4, 5]);

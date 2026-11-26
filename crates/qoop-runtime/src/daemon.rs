@@ -4751,6 +4751,13 @@ async fn handle_control(
                     reason: format!("there is no terminal {terminal}"),
                 };
             };
+            // Every move says who asked, so a tab found in another space can be traced.
+            crate::say!(
+                "qoopd: move terminal {terminal} from space {from} to space {to} \
+                 (request {}, client {})",
+                id.trim_end_matches(|c: char| c.is_ascii_digit() || c == '-'),
+                connections.kind_of(client).unwrap_or("program")
+            );
             // The tab a place names, as asked: resolved to its split's first pane where the
             // move holds the split lock, so a split changing meanwhile cannot go stale.
             let before = match place {
