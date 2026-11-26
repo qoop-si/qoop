@@ -437,7 +437,10 @@ pub fn decide(row: &ScheduleRow, now: i64, zone: Zone) -> Decision {
         .max(row.created_at.min(now));
     let floor = now - REPEAT_WINDOW;
     let from = base.max(floor);
+    let skip = row.skip_until.unwrap_or(i64::MIN);
     match latest_slot(&cron, from, now, zone) {
+        // A run the owner cancelled is covered as a skip, so it shows in the runs.
+        Some(latest) if latest <= skip => Decision::Skip(latest, CANCELLED.into()),
         Some(latest) => {
             let missed = now - latest > ON_TIME;
             let near = next_slot(&cron, latest, zone).is_some_and(|next| next - now < NEAR);
@@ -451,9 +454,13 @@ pub fn decide(row: &ScheduleRow, now: i64, zone: Zone) -> Decision {
         None if base < floor && next_slot(&cron, base, zone).is_some_and(|next| next <= floor) => {
             Decision::Skip(floor, "it was due more than 7 days ago".into())
         }
-        None => next_slot(&cron, from, zone).map_or(Decision::Idle, Decision::Wait),
+        None => next_slot(&cron, from.max(skip), zone).map_or(Decision::Idle, Decision::Wait),
     }
 }
+
+/// Why a slot the owner cancelled (`ScheduleOp::Skip`) did not run: its run row reads
+/// `skipped: cancelled`, which a client draws as cancelled rather than missed.
+pub const CANCELLED: &str = "cancelled";
 
 fn decide_once(row: &ScheduleRow, at: i64, now: i64) -> Decision {
     // Done once a slot at or after `at` was claimed or skipped, or the schedule was resumed
@@ -470,7 +477,8 @@ fn decide_once(row: &ScheduleRow, at: i64, now: i64) -> Decision {
     }
 }
 
-/// When `row` next comes due, for a list: none when paused or done.
+/// When `row` next comes due, for a list: none when paused or done. A run the owner cancelled
+/// is not next: the one after it is.
 pub fn next_at(row: &ScheduleRow, now: i64, zone: Zone) -> Option<i64> {
     if row.paused {
         return None;
@@ -480,9 +488,12 @@ pub fn next_at(row: &ScheduleRow, now: i64, zone: Zone) -> Option<i64> {
     }
     match (row.at, row.cron.as_deref()) {
         (Some(at), _) => row.last_slot.is_none_or(|last| last < at).then_some(at),
-        (None, Some(cron)) => Cron::parse(cron)
-            .ok()
-            .and_then(|cron| next_slot(&cron, now, zone)),
+        (None, Some(cron)) => {
+            let skip = row.skip_until.unwrap_or(i64::MIN);
+            Cron::parse(cron)
+                .ok()
+                .and_then(|cron| next_slot(&cron, now.max(skip), zone))
+        }
         (None, None) => None,
     }
 }
@@ -692,6 +703,8 @@ mod tests {
             last_result: None,
             last_terminal: None,
             watch: None,
+            skip_until: None,
+            done_at: None,
         }
     }
 
@@ -979,6 +992,28 @@ mod tests {
         assert_eq!(decide(&paused, at + 700, zone), Decision::Idle);
         assert_eq!(next_at(&done, at, zone), None);
         assert_eq!(next_at(&early, at - 5, zone), Some(at));
+    }
+
+    /// A cancelled run is not next, is claimed as a skip when it comes, and the run after it
+    /// fires as before. (A cancelled one-off is done at once, by the write: `skip_once`.)
+    #[test]
+    fn a_cancelled_run_is_skipped_and_the_one_after_it_fires() {
+        let zone = plus3();
+        let now = utc(2026, 10, 22, 5, 0);
+        let (first, second) = (utc(2026, 10, 22, 6, 0), utc(2026, 10, 23, 6, 0));
+        let mut row = repeat("0 9 * * *", now - 86_400, Some(now - 3600));
+        row.skip_until = Some(first);
+        assert_eq!(next_at(&row, now, zone), Some(second));
+        assert_eq!(decide(&row, now, zone), Decision::Wait(second));
+        // Asleep over it, or on time: a skip, never a run.
+        for at in [first, first + 3 * 3600] {
+            assert_eq!(
+                decide(&row, at, zone),
+                Decision::Skip(first, CANCELLED.into())
+            );
+        }
+        row.last_slot = Some(first);
+        assert_eq!(decide(&row, second, zone), Decision::Fire(second));
     }
 
     #[test]

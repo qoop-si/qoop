@@ -145,6 +145,8 @@ async fn each_thing_counts_where_it_happens_and_once() {
             last_result: None,
             last_terminal: None,
             watch: None,
+            skip_until: None,
+            done_at: None,
         })
         .expect("a schedule");
     // The slot the row holds now: the daemon's own look may have claimed one meanwhile.

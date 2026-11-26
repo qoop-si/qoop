@@ -1480,6 +1480,8 @@ mod tests {
             last_result: None,
             last_terminal: None,
             next_at: Some(at(9, 0)),
+            done_at: None,
+            skip_until: None,
             when: "weekdays 09:00".to_string(),
         }
     }

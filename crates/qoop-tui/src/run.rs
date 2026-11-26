@@ -28944,6 +28944,8 @@ mod tests {
             last_result: None,
             last_terminal: None,
             next_at: Some(sidebar::now_unix() + 3600),
+            done_at: None,
+            skip_until: None,
             when: "weekdays 09:00".into(),
         }
     }

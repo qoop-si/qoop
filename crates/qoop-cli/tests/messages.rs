@@ -1342,6 +1342,8 @@ async fn a_runs_agent_ending_its_turn_ends_the_run_done_with_its_last_message() 
             last_result: None,
             last_terminal: None,
             watch: None,
+            skip_until: None,
+            done_at: None,
         })
         .expect("a schedule");
     let run = store
