@@ -517,6 +517,7 @@ impl Desk {
                         d.child(
                             div()
                                 .id("voice-saved")
+                                .debug_selector(|| "voice-saved".into())
                                 .role(Role::Status)
                                 .aria_label(said.clone())
                                 .text_size(px(11.5))
