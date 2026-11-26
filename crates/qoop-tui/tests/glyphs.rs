@@ -27,6 +27,11 @@ const MATCHED: &[(&str, &str)] = &[
         "qoop-tui/src/notify.rs",
         "\u{85}\u{2028}\u{2029}\u{200d}\u{fe0f}\u{fe0e}\u{1f1e6}\u{1f1ff}",
     ),
+    // qass's voice: line separators split, invisible characters dropped from their own words.
+    (
+        "qoop-tui/src/persona.rs",
+        "\u{85}\u{2028}\u{2029}\u{200b}\u{200f}\u{202a}\u{202e}\u{2060}\u{206f}\u{feff}\u{fff9}\u{fffb}\u{e0000}\u{e007f}\u{e0041}\u{e0042}\u{0b}\u{0c}",
+    ),
     ("qoop-runtime/src/idle.rs", "⏺◯"),
     // A task's letters folded to a branch name's ASCII: compared, never drawn.
     ("qoop-tui/src/answers.rs", "İçğıíìîïöóòôõşßüúùûáàâäãéèêëñ"),

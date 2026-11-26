@@ -2168,6 +2168,18 @@ fn the_voice_setting_picks_filters_and_keeps_their_words(cx: &mut TestAppContext
         })
     });
     vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("voice-plain").is_none(),
+        "closed, the setting is one row"
+    );
+    // Tall enough that the open list is on screen, where a click can reach it.
+    vcx.simulate_resize(gpui::size(gpui::px(1280.), gpui::px(2600.)));
+    let at = vcx
+        .debug_bounds("voice-open")
+        .expect("choose a voice")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    vcx.run_until_parked();
     let plain = vcx.debug_bounds("voice-plain").expect("plain");
     let chief = vcx.debug_bounds("voice-chief").expect("chief");
     assert!(plain.origin.y < chief.origin.y, "plain heads the list");
