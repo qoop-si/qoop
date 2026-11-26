@@ -22,8 +22,11 @@
     "Stop": [
       { "matcher": "", "hooks": [{ "type": "command", "command": "\"@QASS_DATA@/.claude/skills/qass/cardcheck.sh\"" }] }
     ],
+    "UserPromptSubmit": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "\"@QASS_DATA@/.claude/skills/qass/cardcheck.sh\" voice" }] }
+    ],
     "SessionStart": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "show() { if [ -s \"$2\" ]; then echo \"$1 ($2):\"; head -c 8000 \"$2\"; [ \"$(wc -c < \"$2\")\" -gt 8000 ] && printf '\\n%s\\n' \"(cut at 8000 characters: the rest of $2 is not loaded)\"; fi; }; show \"Lessons from the owner\" \"@QASS_CONFIG@/lessons.md\"; show \"Your notes\" \"@QASS_DATA@/memory.md\"; echo \"qass: your skill is @QASS_DATA@/.claude/skills/qass (its scripts too), your notes @QASS_DATA@/memory.md, your scratch @QASS_DATA@/scratch/. After a wake or a resume the fleet watcher is not running; start it again (Start, step 3) from that dir before anything else.\"; true" }] }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "show() { if [ -s \"$2\" ]; then echo \"$1 ($2):\"; head -c 8000 \"$2\"; [ \"$(wc -c < \"$2\")\" -gt 8000 ] && printf '\\n%s\\n' \"(cut at 8000 characters: the rest of $2 is not loaded)\"; fi; }; show \"Lessons from the owner\" \"@QASS_CONFIG@/lessons.md\"; show \"Your notes\" \"@QASS_DATA@/memory.md\"; qoop qass persona 2>/dev/null; \"@QASS_DATA@/.claude/skills/qass/cardcheck.sh\" voice >/dev/null 2>&1; echo \"qass: your skill is @QASS_DATA@/.claude/skills/qass (its scripts too), your notes @QASS_DATA@/memory.md, your scratch @QASS_DATA@/scratch/. After a wake or a resume the fleet watcher is not running; start it again (Start, step 3) from that dir before anything else.\"; true" }] }
     ]
   }
 }

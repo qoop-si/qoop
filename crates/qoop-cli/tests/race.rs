@@ -888,4 +888,40 @@ fn a_worker_agents_terminal_cannot_start_a_race_and_the_persons_shell_can() {
         text(&out.stderr)
     );
     assert!(has_ref(&repo, "refs/heads/race/mine/claude"));
+
+    // The same gate keeps qass's voice the person's: a worker sets neither a catalog voice
+    // nor its own words, and the person's own call does.
+    let config = stack.dir.path().join("config/qoop/config.toml");
+    for args in [
+        &["config", "set", "qass.persona", "captain"][..],
+        &["qass", "persona", "custom", "-"][..],
+    ] {
+        let out = stack
+            .command(&repo)
+            .env("QOOP_TERMINAL", &worker)
+            .env("QOOP_TOKEN", &token)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(
+            text(&out.stderr).contains("not from an agent's terminal"),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+    }
+    assert!(
+        !std::fs::read_to_string(&config)
+            .unwrap_or_default()
+            .contains("persona")
+    );
+    let out = stack.run_in(&repo, &["config", "set", "qass.persona", "captain"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        std::fs::read_to_string(&config)
+            .expect("config")
+            .contains("persona = \"captain\""),
+        "the person's own call writes where the worker's was refused"
+    );
 }

@@ -820,6 +820,7 @@ impl Desk {
         }
         if page == Page::Settings {
             self.read_settings();
+            self.ensure_voice(cx);
             self.ask_watch();
         }
         if page == Page::Schedules && self.schedule_page.via.is_none() {
@@ -1086,6 +1087,11 @@ impl Desk {
                 .find
                 .as_ref()
                 .is_some_and(|f| on(f, window, cx))
+            || self
+                .settings
+                .voice
+                .as_ref()
+                .is_some_and(|v| on(&v.find, window, cx) || on(&v.words, window, cx))
     }
 
     /// Whether a schedule sheet is open over the page.
@@ -1226,7 +1232,10 @@ impl Desk {
             }
             "escape" if self.page == Page::Schedules && self.schedules_escape(cx) => {}
             "escape" if self.page == Page::Settings && self.close_find(window, cx) => {}
-            "/" if self.page == Page::Settings && self.settings.find.is_none() => {
+            "/" if self.page == Page::Settings
+                && self.settings.find.is_none()
+                && !self.typing_in_field(window, cx) =>
+            {
                 self.open_find(window, cx)
             }
             // Inside the panel: a block's own-answer field is left first, then the panel

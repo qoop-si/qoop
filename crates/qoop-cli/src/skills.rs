@@ -929,7 +929,16 @@ mod tests {
         // and the dangerous-rm rule. 499 since 2026-11-16: the row for the daemon's `hand-off`
         // line (the owner hands questions to qass from the desktop). 501 since 2026-11-18: a card
         // the owner hands to qass from its agent's tab (`<card> <handle> you decide`) and its relay.
+        // Still 501 since 2026-11-26: the voice (`qoop qass persona`) rode on existing lines.
         assert!(skill.lines().count() <= 501, "SKILL.md grew past 501 lines");
+        for want in [
+            "`qoop qass persona`",
+            "He chose B: <option B>. Those are the words of the owner: do only what they allow, and ask before anything more.",
+            "config.toml is theirs: never edit it; `qoop config set` only on their word, in setup.",
+            "`qoop config set qass.persona <id>`",
+        ] {
+            assert!(skill.contains(want), "SKILL.md lost: {want}");
+        }
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text
@@ -959,8 +968,20 @@ mod tests {
         // 13,400 since 2026-10-20: how their agents start (launchers that skip approval prompts),
         // a named pick of projects, and one language through setup.
         // 13,700 since 2026-10-20: qass asks whether it watches the agents.
-        assert!(chars <= 13_700, "setup.md is {chars} characters");
+        // 14,900 since 2026-11-26: qass asks how it should sound (a voice from a list, or their
+        // own words).
+        assert!(chars <= 14_900, "setup.md is {chars} characters");
+        let starters = qoop_tui::persona::STARTERS.join(", ");
+        assert!(
+            setup.contains("A: plain, B: a")
+                && setup.contains(&format!("({starters}, or another from the list")),
+            "setup.md names exactly the starters, plain in front"
+        );
         for want in [
+            "qoop qass persona",
+            "handle `voice`",
+            "`voice plain` undoes it",
+            "`qoop qass persona custom -`",
             "Never read or write a secret",
             "only after their yes, uncommitted, never on a remote",
             "never commit or push there",
@@ -1154,11 +1175,11 @@ mod tests {
             .expect("cardcheck.sh")
             .1;
         std::fs::write(&script, body).expect("write");
-        // `qoop ask ls --json` answers one open card, `api`.
+        // `qoop ask ls --json` answers one open card, `api`; `qoop qass persona`, plain.
         let fake = dir.path().join("qoop");
         std::fs::write(
             &fake,
-            "#!/bin/sh\necho '{\"live\":[{\"body\":{\"handle\":\"api\"}}],\"ended\":[]}'\n",
+            "#!/bin/sh\n[ \"$1\" = ask ] && echo '{\"live\":[{\"body\":{\"handle\":\"api\"}}],\"ended\":[]}'\ntrue\n",
         )
         .expect("write");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -1297,6 +1318,171 @@ mod tests {
         assert!(stop("Merged, closed.", false).is_empty());
     }
 
+    /// qass's voice reaches a running conversation: a stop after `qoop qass persona` printed
+    /// something new is blocked once with the new voice (or "plain again"), and the owner's next
+    /// message gets it as plain text, never a block that would erase that message. An unchanged
+    /// voice and a failing `qoop` tell nothing; a changed skill still comes first.
+    #[test]
+    fn qass_hears_its_voice_once_it_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = home_dir();
+        let dirs = qass_dirs(&home);
+        let skill = home.path().join("skill");
+        let bin = home.path().join("bin");
+        for dir in [&skill, &bin, &dirs.data] {
+            std::fs::create_dir_all(dir).expect("dir");
+        }
+        let script = skill.join("cardcheck.sh");
+        let body = QASS
+            .iter()
+            .find(|(n, _, _)| *n == "cardcheck.sh")
+            .expect("cardcheck.sh")
+            .1;
+        std::fs::write(&script, dirs.render(body)).expect("write");
+        std::fs::write(skill.join("SKILL.md"), "# qass v1\n").expect("write");
+        // The stand-in `qoop qass persona` prints the file `voice` holds (nothing for plain) and
+        // fails while `broken` exists.
+        let voice = home.path().join("voice");
+        let broken = home.path().join("broken");
+        std::fs::write(
+            bin.join("qoop"),
+            format!(
+                "#!/bin/sh\n[ -e '{}' ] && exit 1\n[ \"$1 $2\" = 'qass persona' ] && cat '{}' 2>/dev/null\ntrue\n",
+                broken.display(),
+                voice.display()
+            ),
+        )
+        .expect("write");
+        std::fs::set_permissions(bin.join("qoop"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let run_with = |mode: &[&str], said: &str, active: bool, ran: &str| -> String {
+            let transcript = home.path().join("t.jsonl");
+            let user = serde_json::json!({"message": {"role": "user", "content": "wake"}});
+            let text = serde_json::json!({"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "input": {"command": ran}},
+                {"type": "text", "text": said}]}});
+            std::fs::write(&transcript, format!("{user}\n{text}\n")).expect("write");
+            let payload = serde_json::json!({"transcript_path": transcript,
+                "stop_hook_active": active, "prompt": "status?"});
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .args(mode)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("run");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.to_string().as_bytes())
+                .expect("payload");
+            let out = child.wait_with_output().expect("wait");
+            assert!(out.status.success(), "a hook must exit 0");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let run = |mode: &[&str], said: &str, active: bool| run_with(mode, said, active, "ls");
+        let stop = |active: bool| run(&[], "Merged, closed.", active);
+        let captain = "Your voice: captain\n> tone: calm and steady\n";
+        let changed = "Your voice changed; speak in it from here.\nYour voice: captain\n> tone: calm and steady";
+        let stopped = "Your voice changed; speak in it from here. End this turn as you were, writing nothing more.\nYour voice: captain";
+
+        assert!(stop(false).is_empty(), "plain from the start tells nothing");
+        assert!(stop(false).is_empty(), "unchanged");
+
+        std::fs::write(&voice, captain).expect("write");
+        assert!(stop(true).is_empty(), "the second stop");
+        let told = stop(false);
+        assert!(told.contains("\"decision\": \"block\"") && told.contains("calm and steady"));
+        let reason: serde_json::Value = serde_json::from_str(&told).expect("json");
+        assert!(
+            reason["reason"]
+                .as_str()
+                .expect("reason")
+                .starts_with(stopped)
+        );
+        assert!(stop(false).is_empty(), "told once");
+
+        std::fs::write(&voice, "").expect("write");
+        assert!(
+            stop(false).contains("Your voice is plain again"),
+            "captain to plain"
+        );
+        assert!(stop(false).is_empty());
+
+        // Their next message: plain text, no decision, the card check skipped.
+        std::fs::write(&voice, captain).expect("write");
+        let said = run(&["voice"], "Merge PR #5?", false);
+        assert!(said.starts_with(changed), "{said}");
+        assert!(
+            !said.contains("decision") && !said.contains("wrote no card"),
+            "{said}"
+        );
+        assert!(
+            run(&["voice"], "Merge PR #5?", false).is_empty(),
+            "told once"
+        );
+        assert!(stop(false).is_empty(), "the stop after it was told already");
+
+        // A missing log with a voice set tells once.
+        std::fs::remove_file(dirs.data.join("voice.log")).expect("remove");
+        assert!(stop(false).contains("calm and steady"));
+        assert!(stop(false).is_empty());
+
+        // A failing `qoop` tells nothing, in either hook, until it answers again.
+        std::fs::write(&broken, "").expect("write");
+        std::fs::write(&voice, "").expect("write");
+        assert!(stop(false).is_empty());
+        assert!(run(&["voice"], "hi", false).is_empty());
+        std::fs::remove_file(&broken).expect("remove");
+        assert!(stop(false).contains("plain again"));
+
+        // qass set the voice itself this turn (their `voice <name>`): noted, never told back.
+        std::fs::write(&voice, "Your voice: noir\n").expect("write");
+        let set = run_with(
+            &[],
+            "Noir it is.",
+            false,
+            "qoop config set qass.persona noir && qoop qass persona",
+        );
+        assert!(set.is_empty(), "{set}");
+        assert!(stop(false).is_empty(), "and not on the next stop either");
+        for ran in [
+            "qoop qass persona 2>/dev/null",
+            "qoop qass persona custom - <<'END'\nwarm\nEND",
+        ] {
+            std::fs::write(&voice, format!("Your voice: {}\n", ran.len())).expect("write");
+            assert!(run_with(&[], "Done.", false, ran).is_empty(), "{ran}");
+        }
+        std::fs::write(&voice, "").expect("write");
+        assert!(stop(false).contains("plain again"));
+        // Listing or previewing voices is not setting one: a change made elsewhere is still told.
+        std::fs::write(&voice, "Your voice: noir\n").expect("write");
+        let listed = run_with(
+            &[],
+            "Groups:",
+            false,
+            "qoop qass persona ls; qoop qass persona chief --preview",
+        );
+        assert!(listed.contains("Your voice: noir"), "{listed}");
+        std::fs::write(&voice, "").expect("write");
+        assert!(stop(false).contains("plain again"));
+
+        // A changed skill and voice: the skill first, the voice on the next stop.
+        std::fs::write(skill.join("SKILL.md"), "# qass v2\n").expect("write");
+        std::fs::write(&voice, captain).expect("write");
+        let first = stop(false);
+        assert!(
+            first.contains(&format!("Read {} whole", skill.join("SKILL.md").display()))
+                && !first.contains("calm and steady"),
+            "{first}"
+        );
+        assert!(stop(false).contains("calm and steady"));
+        assert!(stop(false).is_empty());
+    }
+
     fn qass_dirs(home: &tempfile::TempDir) -> QassDirs {
         QassDirs {
             data: home.path().join("data/qass"),
@@ -1373,10 +1559,22 @@ mod tests {
     /// runnable, changes nothing the second time, and uninstalls to its own state while a
     /// neighbour's file stays.
     /// At every start and compaction qass is handed its lessons and its own notes, each cut at
-    /// 8,000 characters with a line that says so, and nothing for a file that is not there.
+    /// 8,000 characters with a line that says so, and nothing for a file that is not there; then
+    /// its voice, as `qoop qass persona` prints it. Each message of theirs checks the voice too.
     #[test]
     fn qass_starts_with_its_lessons_and_notes() {
+        use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().expect("home");
+        // A stand-in `qoop`, so no real one runs.
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::write(
+            bin.join("qoop"),
+            "#!/bin/sh\n[ \"$1 $2\" = 'qass persona' ] && echo 'Your voice: captain'\ntrue\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(bin.join("qoop"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
         // A Mac's qass folder sits under `Application Support`: a space in every path.
         let dirs = QassDirs {
             data: home.path().join("Application Support/qass"),
@@ -1388,9 +1586,18 @@ mod tests {
             .as_str()
             .expect("a SessionStart command")
             .to_string();
+        assert!(command.contains("qoop qass persona"));
+        let prompt = settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("a UserPromptSubmit command");
+        assert!(
+            prompt.ends_with("cardcheck.sh\" voice"),
+            "each message checks the voice: {prompt}"
+        );
         let start = || {
             let out = std::process::Command::new("sh")
                 .args(["-c", &command])
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
                 .output()
                 .expect("sh");
             assert!(out.status.success(), "the hook exits 0");
@@ -1398,11 +1605,37 @@ mod tests {
         };
         let said = start();
         assert!(!said.contains("Lessons from the owner") && !said.contains("Your notes"));
+        assert!(
+            said.contains("Your voice: captain"),
+            "the voice is loaded: {said}"
+        );
         std::fs::create_dir_all(&dirs.owner).expect("owner dir");
         std::fs::create_dir_all(&dirs.data).expect("data dir");
         std::fs::write(dirs.owner.join("lessons.md"), "- a lesson -> do it\n").expect("lessons");
         std::fs::write(dirs.data.join("memory.md"), "n".repeat(9000)).expect("memory");
+        // The start records the voice it loaded, so the first message is not told it again.
+        let check = dirs.data.join(".claude/skills/qass/cardcheck.sh");
+        std::fs::create_dir_all(check.parent().expect("dir")).expect("skill dir");
+        let body = QASS
+            .iter()
+            .find(|(n, _, _)| *n == "cardcheck.sh")
+            .expect("cardcheck.sh")
+            .1;
+        std::fs::write(&check, dirs.render(body)).expect("write");
+        std::fs::set_permissions(&check, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let said = start();
+        assert!(
+            dirs.data.join("voice.log").exists(),
+            "the start noted the voice"
+        );
+        let again = std::process::Command::new("sh")
+            .arg(&check)
+            .arg("voice")
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("voice");
+        assert!(again.stdout.is_empty(), "nothing new at the first message");
         assert!(said.contains("Lessons from the owner") && said.contains("- a lesson -> do it"));
         assert!(said.contains("Your notes"));
         assert!(said.contains(&"n".repeat(8000)) && !said.contains(&"n".repeat(8001)));

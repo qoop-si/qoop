@@ -50,6 +50,7 @@ mod theme;
 mod ui;
 #[cfg(all(target_os = "macos", feature = "bench"))]
 mod view;
+mod voice;
 
 /// `--version`: the version the app was built as, for the bundle check and a person's question.
 fn version_asked() -> bool {

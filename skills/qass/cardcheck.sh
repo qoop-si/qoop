@@ -9,12 +9,56 @@
 # text it loaded weeks ago, and this script is read from disk on every stop, so a new install
 # reaches the running qass here. The log is one for all of qass's conversations: a fresh one
 # after a later install reads its skill once more, which costs one Read; the very first stop
-# only writes the log, since there is no older install whose skill it could have kept. Any failure lets the stop
-# through: this hook must never hold qass up.
+# only writes the log, since there is no older install whose skill it could have kept. Third, the
+# voice: `qoop qass persona` printing other text than qass was last given (`@QASS_DATA@/voice.log`)
+# blocks the stop once with the new voice, or with "plain again". `cardcheck.sh voice` (the
+# UserPromptSubmit hook) does that voice check alone and prints the text plainly, never a block:
+# a block there would erase the owner's message. Any failure lets the stop through: this hook
+# must never hold qass up.
 command -v python3 >/dev/null 2>&1 || exit 0
 input=$(cat)
 prog=$(cat <<'PY'
 import hashlib, json, os, re, subprocess, sys, time
+
+
+def changed(log, now, tell_when_new):
+    # Whether `now` differs from the last hash in `log` (a missing log tells only when
+    # `tell_when_new`); a new hash is appended.
+    try:
+        with open(log) as f:
+            told = (f.read().split() or [""])[-1]
+    except OSError:
+        told = None
+    if told == now:
+        return False
+    with open(log, "a") as f:
+        f.write(f"{int(time.time())} {now}\n")
+    return told is not None or tell_when_new
+
+
+def voice_changed(quiet=False, then=""):
+    # What to tell qass when its voice changed since it was last given one, else None; `then`
+    # says what to do with it. A failing `qoop qass persona` tells nothing: plain is not known
+    # then. `quiet`: qass read or set the voice itself this turn, so the new one is only noted.
+    try:
+        got = subprocess.run(["qoop", "qass", "persona"], capture_output=True, timeout=5)
+    except Exception:
+        return None
+    if got.returncode != 0:
+        return None
+    block = got.stdout.decode("utf-8", "replace").strip()
+    if not changed("@QASS_DATA@/voice.log", hashlib.sha256(got.stdout).hexdigest()[:12], bool(block)) or quiet:
+        return None
+    if not block:
+        return "Your voice is plain again: drop the voice you were given and speak as your skill says." + then
+    return "Your voice changed; speak in it from here." + then + "\n" + block
+
+
+if sys.argv[2:3] == ["voice"]:
+    said = voice_changed()
+    if said:
+        sys.stdout.buffer.write((said + "\n").encode("utf-8"))
+    sys.exit(0)
 
 payload = json.loads(sys.stdin.read() or "{}")
 if payload.get("stop_hook_active"):
@@ -57,36 +101,32 @@ for content in turn:
             commands.append(str((c.get("input") or {}).get("command", "")))
 last = texts[0] if texts else ""
 
-def skill_changed():
+def let_through():
+    # The stop goes through, unless the skill or the voice changed since qass was last told.
     # ponytail: SKILL.md alone stands for the skill; its other files are read when it names them.
     skill = os.path.join(sys.argv[1], "SKILL.md")
-    log = "@QASS_DATA@/skill.log"
     try:
         with open(skill, "rb") as f:
             now = hashlib.sha256(f.read()).hexdigest()[:12]
     except OSError:
-        return
-    try:
-        with open(log) as f:
-            told = (f.read().split() or [""])[-1]
-    except OSError:
-        told = None
-    if told == now:
-        return
-    with open(log, "a") as f:
-        f.write(f"{int(time.time())} {now}\n")
-    if told is None:
-        # No log yet: a fresh install, nothing older to re-read.
-        return
-    print(json.dumps({"decision": "block", "reason":
-        f"Your skill changed since this conversation last read it. Read {skill} whole now (one "
-        "Read, no offset or limit) and work by it from here; then end this turn as you were."}))
+        now = None
+    # No log yet: a fresh install, nothing older to re-read.
+    if now and changed("@QASS_DATA@/skill.log", now, False):
+        print(json.dumps({"decision": "block", "reason":
+            f"Your skill changed since this conversation last read it. Read {skill} whole now (one "
+            "Read, no offset or limit) and work by it from here; then end this turn as you were."}))
+        sys.exit(0)
+    # Only a command that sets the voice or prints the one in use: `ls`, a preview or a grep is not.
+    said = voice_changed(any(re.search(r"config set qass\.persona|qass persona(\s+custom\s+-)?\s*($|[;&|)<]|\d?>)", c)
+                             for c in commands),
+                         " End this turn as you were, writing nothing more.")
+    if said:
+        print(json.dumps({"decision": "block", "reason": said}))
     sys.exit(0)
 
 
 if any("escalate.sh" in cmd and (re.search(r"\s-\s*<<", cmd) or " show " in cmd + " ") for cmd in commands):
-    skill_changed()
-    sys.exit(0)
+    let_through()
 
 tick = chr(96)
 asked = [l for l in last.splitlines() if l.strip().strip("*_#> -" + tick).strip().endswith("?")]
@@ -110,12 +150,11 @@ if handles or asked:
     # A line that names a live card (its handle or its number) points at it: no new question.
     asked = [l for l in asked if not any(re.search(r"\b" + re.escape(n) + r"\b", l) for n in names)]
 if not asked and not handles:
-    skill_changed()
-    sys.exit(0)
+    let_through()
 print(json.dumps({"decision": "block", "reason":
     "You asked the owner something in chat and wrote no card this turn. Write it as a card "
     "(escalate.sh new ... - <<'END'), then point to it in one line by its handle. If it was "
     "not a question for them, end your message without one."}))
 PY
 )
-printf '%s' "$input" | python3 -c "$prog" "$(dirname "$0")" 2>/dev/null || true
+printf '%s' "$input" | python3 -c "$prog" "$(dirname "$0")" "${1:-}" 2>/dev/null || true

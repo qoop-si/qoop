@@ -841,6 +841,8 @@ pub enum SettingKind {
     Minutes,
     /// Shown as the file says it; changed in the editor.
     Text,
+    /// qass's voice: a filtered list of the catalog, the lines it sends, and their own words.
+    Voice,
 }
 
 /// One line of the settings page: its key in `config.toml`, its name, what it does, how it
@@ -855,7 +857,7 @@ pub struct Setting {
 }
 
 /// Every key of `qoop_tui::config::KEYS`, as the page shows it.
-pub const SETTINGS: [Setting; 21] = [
+pub const SETTINGS: [Setting; 22] = [
     Setting {
         key: "prefix",
         label: "Prefix key",
@@ -955,6 +957,14 @@ pub const SETTINGS: [Setting; 21] = [
         group: "qass",
     },
     Setting {
+        key: "qass.persona",
+        label: "qass speaks as",
+        help: "The voice of what qass tells you: wording only, never its rules or facts. Claude qass \
+               takes it at your next message; other agents at their next start",
+        kind: SettingKind::Voice,
+        group: "qass",
+    },
+    Setting {
         key: "qass.models.best",
         label: "Best model",
         help: "What qass's hardest work runs on",
@@ -1041,6 +1051,7 @@ pub fn setting_value(read: &qoop_tui::config::Read, text: &str, key: &str) -> St
             .to_string(),
         "daemon.exit_when_asleep" => on(c.lifecycle.exit_when_asleep),
         "qass.agent" => read.qass_agent.clone(),
+        "qass.persona" => read.qass_persona.clone(),
         "qass.models.best" => read.qass_models[0].clone(),
         "qass.models.mid" => read.qass_models[1].clone(),
         "qass.models.low" => read.qass_models[2].clone(),

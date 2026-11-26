@@ -283,6 +283,23 @@ pub(crate) fn called_by_qass() -> bool {
         .is_some_and(|row| row["terminal"].as_u64() == Some(caller))
 }
 
+/// The owner's gate: what only the person (their own shell tab, or outside qoop) or qass may
+/// do, refused from a worker agent's terminal with `why`. Read from the caller's row, not the
+/// daemon: a speed bump like [`crate::qass_guard`], not a lock (a worker can still edit the
+/// files by hand).
+pub(crate) fn refuse_a_worker(why: &str) -> std::io::Result<()> {
+    let (Some(me), Some(_)) = crate::task::here() else {
+        return Ok(());
+    };
+    let agent = crate::worktree::session_rows()?
+        .iter()
+        .any(|r| r.terminal == me && r.agent);
+    if agent && !called_by_qass() {
+        return Err(std::io::Error::other(why.to_string()));
+    }
+    Ok(())
+}
+
 /// The sleeping tab that is qass, among the stored tabs of the `qass` space: one that holds
 /// an agent and was started in qass's own folder, the way a running one is found. The space
 /// may hold other tabs (a worker parked there, this page's own tab), and none of them is it.
@@ -655,6 +672,80 @@ pub(crate) fn look() -> Facts {
     }
 }
 
+/// `qoop qass persona`: qass's voice as qass is told it (nothing for plain), a candidate's, the
+/// catalog, or the owner's own words from standard input.
+fn persona(args: &[String]) -> std::io::Result<()> {
+    use qoop_tui::persona;
+    let usage =
+        || crate::usage("usage: qoop qass persona [ls [<group>] | <id> [--preview] | custom -]");
+    let config = qoop_tui::config::path();
+    let dir = paths::qass_config_dir();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match args.as_slice() {
+        [] => {
+            let choice = qoop_tui::config::read_from(&config).qass_persona;
+            print!("{}", persona::block(&choice, &dir).unwrap_or_default());
+        }
+        ["ls"] => {
+            println!("{}  plain: qass's own wording", persona::PLAIN);
+            for (group, n) in persona::groups() {
+                println!("{group}  {n}");
+            }
+            println!("{}  their own words", persona::CUSTOM);
+        }
+        ["ls", group @ ..] => {
+            let group = group.join(" ");
+            let shown: Vec<_> = persona::all()
+                .iter()
+                .filter(|p| p.group.eq_ignore_ascii_case(&group))
+                .collect();
+            if shown.is_empty() {
+                return Err(std::io::Error::other(format!(
+                    "no group {group}: `qoop qass persona ls` lists them"
+                )));
+            }
+            for p in shown {
+                println!("{}  {}: {}", p.id, p.name, p.tone);
+            }
+        }
+        ["custom", "-"] => {
+            refuse_a_worker(
+                "qass's voice is set by the person or qass, not from an agent's terminal",
+            )?;
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+            let cut = persona::save_custom(&config, &dir, &text).map_err(std::io::Error::other)?;
+            println!(
+                "qass speaks in their own words now ({}){}",
+                persona::custom_path(&dir).display(),
+                if cut {
+                    format!(
+                        "; cut to {} lines and {} characters",
+                        persona::CUSTOM_LINES,
+                        persona::CUSTOM_CHARS
+                    )
+                } else {
+                    String::new()
+                }
+            );
+        }
+        [id] | [id, "--preview"] if persona::known(id) => {
+            if args.len() == 2 {
+                print!("{}", persona::preview(id, &dir));
+            } else {
+                print!("{}", persona::block(id, &dir).unwrap_or_default());
+            }
+        }
+        [id, ..] if !persona::known(id) && !id.starts_with('-') => {
+            return Err(std::io::Error::other(format!(
+                "no voice {id}: `qoop qass persona ls` lists them"
+            )));
+        }
+        _ => return Err(usage()),
+    }
+    Ok(())
+}
+
 pub fn run_qass(args: &[String]) -> std::io::Result<()> {
     match args.get(2).map(String::as_str) {
         Some("page") if args.len() == 3 => return crate::qass_page::run(),
@@ -665,9 +756,11 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
                 args.get(4).map(String::as_str),
             );
         }
+        Some("persona") => return persona(&args[3..]),
         Some(_) => {
             return Err(crate::usage(
-                "usage: qoop qass [page | brief <n> [--json] | watch [on | off [T52 | space]]]",
+                "usage: qoop qass [page | brief <n> [--json] | watch [on | off [T52 | space]] | \
+                 persona [ls [<group>] | <id> [--preview] | custom -]]",
             ));
         }
         None => {}

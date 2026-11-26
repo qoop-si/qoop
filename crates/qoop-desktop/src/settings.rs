@@ -37,6 +37,10 @@ pub struct SettingsPage {
     /// The machine shown: `None` for This Mac, else a space of it to ask through.
     pub via: Option<i64>,
     pub remote: RemoteSettings,
+    /// The voice setting's two fields: its filter and their own words.
+    pub voice: Option<crate::voice::VoiceFields>,
+    /// Their own words as `qass/persona.md` holds them now, cleaned; empty for none.
+    pub words: String,
     /// Each settings request still out, under its id: the machine it went to (0 for This
     /// Mac) and whether it writes. An answer from a machine no longer shown is dropped, so a
     /// remote's late answer never lands on This Mac's page, nor This Mac's on a remote's.
@@ -53,6 +57,11 @@ impl Desk {
         // The window follows what the file says now: the prefix, the theme.
         self.reconfigure(&read);
         self.settings.read = Some(read);
+        self.settings.words = std::fs::read_to_string(qoop_tui::persona::custom_path(
+            &qoop_tui::persona::dir_for(&self.config_path),
+        ))
+        .map(|t| qoop_tui::persona::clean(&t).0)
+        .unwrap_or_default();
     }
 
     /// Write `key` = `value` and say where it landed, or why not.
@@ -60,10 +69,14 @@ impl Desk {
         let said = match qoop_tui::config::set(&self.config_path, setting.key, value) {
             Ok(()) => {
                 self.read_settings();
+                let name = (setting.key == "qass.persona")
+                    .then(|| qoop_tui::persona::find(value).map(|p| p.name.as_str()))
+                    .flatten();
                 let shown = match value {
                     "true" => "on",
                     "false" => "off",
-                    other => other,
+                    "custom" if setting.key == "qass.persona" => "your own words",
+                    other => name.unwrap_or(other),
                 };
                 match state::line_of(&self.settings.text, setting.key) {
                     Some(line) => format!(
@@ -108,7 +121,7 @@ impl Desk {
         }
     }
 
-    fn set_setting(&mut self, setting: &Setting, value: &str, cx: &mut Context<Self>) {
+    pub(crate) fn set_setting(&mut self, setting: &Setting, value: &str, cx: &mut Context<Self>) {
         match setting.key {
             "sleep.idle_minutes" | "daemon.exit_when_asleep" => {
                 self.write_sleep(setting, value, cx)
@@ -484,6 +497,7 @@ impl Desk {
                 .text_size(px(12.5))
                 .child(value.clone())
                 .into_any_element(),
+            SettingKind::Voice => return self.voice_setting(s, &value, changed, t, cx),
         };
         div()
             .flex()

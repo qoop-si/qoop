@@ -26,6 +26,7 @@ pub mod microphone;
 pub mod mux;
 pub mod notify;
 pub mod palette;
+pub mod persona;
 pub mod picture;
 pub mod plugins;
 pub mod present;
