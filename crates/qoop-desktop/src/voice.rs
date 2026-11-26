@@ -28,6 +28,8 @@ pub struct VoiceFields {
     pub saved: Option<(String, Result<String, String>)>,
     /// Scroll the voice in use into the list on the next draw: on opening, a clear, a save.
     pub reveal: Cell<bool>,
+    /// The list and the words box are shown: closed, the setting is one row like the others.
+    pub open: bool,
 }
 
 /// One row of the list: the value written, its name, its tone, and its group.
@@ -80,6 +82,7 @@ impl Desk {
             shown: said,
             saved: None,
             reveal: Cell::new(true),
+            open: false,
         });
     }
 
@@ -348,9 +351,31 @@ impl Desk {
                             .text_size(px(12.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(current),
-                    ),
+                    )
+                    .child({
+                        let open = fields.open;
+                        let label = if open { "Close the list" } else { "Choose a voice" };
+                        ui::pill("voice-open", label, t)
+                            .debug_selector(|| "voice-open".into())
+                            .aria_expanded(open)
+                            .h(px(28.))
+                            .child(label)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(v) = this.settings.voice.as_mut() {
+                                    v.open = !v.open;
+                                    v.reveal.set(true);
+                                }
+                                cx.notify();
+                            }))
+                    }),
             )
-            .child(fields.find.clone())
+            .when(fields.open, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(fields.find.clone())
             .child(
                 div()
                     .id("voice-count")
@@ -500,6 +525,9 @@ impl Desk {
                         )
                     }),
             )
+,
+                )
+            })
             .into_any_element()
     }
 }
