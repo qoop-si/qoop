@@ -388,8 +388,35 @@ impl StoreHandle {
         workspace: i64,
         before: Option<i64>,
     ) -> Result<bool, HandleError> {
-        self.run(move |s| s.move_terminals(&ids, workspace, before))
-            .await
+        // A deadline does not cancel the write: the caller is told it failed, so the job
+        // is marked abandoned and rolls back instead of landing later, with the tab
+        // asleep or running in the space the daemon still has it in.
+        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, done) = (abandoned.clone(), landed.clone());
+        let moved = self
+            .run(move |s| {
+                let moved = s.move_terminals_unless(&ids, workspace, before, Some(&flag));
+                // Under the store's lock, so a caller that waits for the lock reads it final.
+                done.store(
+                    matches!(moved, Ok(true)),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                moved
+            })
+            .await;
+        if moved.is_err() {
+            abandoned.store(true, std::sync::atomic::Ordering::SeqCst);
+            // One that was already committing when the flag was set lands anyway: waiting for
+            // the lock tells it apart, and a move that landed is answered as one.
+            // ponytail: if this wait times out too the answer stays the failure; a move stuck
+            // inside its own commit past two deadlines is not closed.
+            let _ = self.run(|_| Ok::<(), StoreError>(())).await;
+            if landed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(true);
+            }
+        }
+        moved
     }
 
     /// Every open terminal's place in its workspace's order.
@@ -506,5 +533,41 @@ mod tests {
             err,
             HandleError::Store(StoreError::NoWorkspace(404))
         ));
+    }
+
+    /// A move the daemon answered `Failed` (the store did not answer within its deadline)
+    /// must never land afterwards: a tab that was told it did not move would sit in the
+    /// other space while the daemon, and the person, still have it in the first.
+    #[tokio::test]
+    async fn a_move_that_timed_out_does_not_land_after_the_answer() {
+        let handle = StoreHandle::new(Store::in_memory().expect("open"));
+        let from = handle.create_workspace("from".into()).await.expect("space");
+        let to = handle.create_workspace("to".into()).await.expect("space");
+        handle
+            .create_terminal(1, from, "/tmp".into(), "/bin/sh".into())
+            .await
+            .expect("terminal");
+        // Something holds the store past the deadline, a stalled disk for instance.
+        let staller = handle.clone();
+        tokio::spawn(async move {
+            let _ = staller
+                .run(|_| -> Result<(), StoreError> {
+                    std::thread::sleep(STORE_DEADLINE + Duration::from_secs(2));
+                    Ok(())
+                })
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(matches!(
+            handle.move_terminals(vec![1], to, None).await,
+            Err(HandleError::Timeout)
+        ));
+        // The stall ends and the queued job gets the store.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            handle.open_terminals(to).await.expect("list").is_empty(),
+            "a move answered as failed landed later"
+        );
+        assert_eq!(handle.open_terminals(from).await.expect("list").len(), 1);
     }
 }

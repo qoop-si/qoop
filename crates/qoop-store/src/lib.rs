@@ -1274,6 +1274,19 @@ impl Store {
         workspace: i64,
         before: Option<i64>,
     ) -> Result<bool, StoreError> {
+        self.move_terminals_unless(ids, workspace, before, None)
+    }
+
+    /// The same, but `abandoned` is read under the store's lock just before the commit: a
+    /// caller that gave up on the answer (its deadline passed) sets it, and the move rolls
+    /// back instead of landing after the client was told it failed.
+    pub fn move_terminals_unless(
+        &mut self,
+        ids: &[i64],
+        workspace: i64,
+        before: Option<i64>,
+        abandoned: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<bool, StoreError> {
         if before.is_some_and(|b| ids.contains(&b)) {
             let mut here = true;
             for id in ids {
@@ -1331,6 +1344,9 @@ impl Store {
                  ON CONFLICT (workspace, terminal) DO UPDATE SET ordinal = excluded.ordinal",
                 params![workspace, terminal, ordinal as i64],
             )?;
+        }
+        if abandoned.is_some_and(|a| a.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Err(StoreError::Abandoned);
         }
         tx.commit()?;
         Ok(true)
