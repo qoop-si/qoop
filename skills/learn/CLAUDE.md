@@ -19,7 +19,7 @@ Files:
    `qoop history --since <since> --json --out scratch/said-<cutoff>.jsonl` (a new file), then Read
    it: every message he
    typed to an agent since then, with time, session, cwd, branch and `repo` (owner/name). Nothing and
-   no `replay` here: write the cutoff to `last-run`, `qoop close "$QOOP_TERMINAL"`, stop. Nothing with
+   no `replay` here: write the cutoff to `last-run` and stop. Nothing with
    `replay`: do item 3 of this list (`./replay`), then section 5 only.
 2. The rules already written: `owner.md`, `~/.claude/CLAUDE.md`, and for each repository a message
    came from (its cwd's git root): `CLAUDE.md`, `AGENTS.md`, `.claude/CLAUDE.md`, `.claude/rules/*.md`.
@@ -100,4 +100,5 @@ needing his word, and no `./replay` line: no report.
 
 ## 6. End
 
-Write the cutoff from step 1 to `last-run`, then `qoop close "$QOOP_TERMINAL"`.
+Write the cutoff from step 1 to `last-run`, then stop: qoop ends the run when your turn ends. Never
+`qoop close` your own terminal; qoop refuses it.
