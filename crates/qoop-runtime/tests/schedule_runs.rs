@@ -510,3 +510,60 @@ async fn complete_keeps_the_runs_and_a_complete_schedule_does_not_resume() {
     refused(&mut c, "2", ScheduleOp::Resume { schedule }).await;
     assert_eq!(listed(&mut c, schedule).await, done);
 }
+
+#[tokio::test]
+async fn a_run_whose_agent_failed_ends_failed_with_no_turn_end() {
+    // Claude's `StopFailure` (an API error, a usage limit) reports `failed` and no turn end;
+    // the run must end anyway, or every later slot of the schedule is skipped as still open.
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = d
+        .terminals()
+        .get(terminal)
+        .expect("the terminal")
+        .token
+        .as_str()
+        .to_string();
+    let mut c = d.attach("schedules").await;
+    let mut hook = d.attach("hook").await;
+    let s = store(&d);
+    let schedule = s.add_schedule(&row("failed")).expect("a schedule");
+    let run = s
+        .start_run(schedule, 0, qoop_runtime::store::now())
+        .expect("a run")
+        .expect("the schedule is there");
+    written(
+        &mut c,
+        "1",
+        report(schedule, 0, Some(i64::from(terminal)), Some(run)),
+    )
+    .await;
+    for (state, event) in [("working", Some("user")), ("failed", None)] {
+        let answer = ask(
+            &mut hook,
+            ControlRequest::ReportAgentState {
+                from: None,
+                id: state.to_string(),
+                terminal,
+                token: token.clone(),
+                state: state.into(),
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: false,
+                clock: 0,
+                session: None,
+                event: event.map(String::from),
+                label: None,
+                said: None,
+            },
+        )
+        .await;
+        assert!(
+            !matches!(answer, ControlResponse::Failed { .. }),
+            "{answer:?}"
+        );
+    }
+    let ended = runs_once(&mut c, schedule, |r| r[0].outcome.is_some()).await;
+    assert_eq!(ended[0].outcome.as_deref(), Some("failed"));
+    assert_eq!(ended[0].terminal, Some(i64::from(terminal)));
+}
