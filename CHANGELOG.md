@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.22.1](https://github.com/qoop-si/qoop/compare/v0.22.0...v0.22.1) (2026-11-28)
+
+
+### Fixed
+
+* **runtime:** a move that missed its store deadline no longer lands later ([3d8c4ab](https://github.com/qoop-si/qoop/commit/3d8c4abd9166478bb4699259ffa52a0a46adb6c4))
+* **schedule:** a run whose agent failed ends, so later slots start ([90f3b5a](https://github.com/qoop-si/qoop/commit/90f3b5a3df256e412d480e6fcb2fd46c5f9029de))
+* **skills:** the learning run stops instead of closing its own tab ([f0dc164](https://github.com/qoop-si/qoop/commit/f0dc164159fe9f1fb744e977996869975b4952be)), closes [#185](https://github.com/qoop-si/qoop/issues/185)
+* **tui:** a drop in another space needs a real drag, and every move is logged ([06f56ba](https://github.com/qoop-si/qoop/commit/06f56bab6890564d7ff83ce20feb4ac892beafdd))
+
 ## [0.22.0](https://github.com/qoop-si/qoop/compare/v0.21.2...v0.22.0) (2026-11-26)
 
 
