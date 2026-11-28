@@ -657,8 +657,10 @@ pub(crate) async fn start(
                         break;
                     }
                     changed = rows.recv() => match changed {
-                        // A run's tab whose turn ended or that closed: its run ends now.
+                        // A run's tab whose turn ended, that failed or that closed: its run
+                        // ends now.
                         Ok(tab) if going.contains(&tab) && (agents.stop_of(tab).is_some()
+                            || reads_failed(&agents, tab)
                             || terminals.workspace_of(tab).is_none()) => break,
                         Ok(_) => {}
                         Err(RecvError::Lagged(_)) => break,
@@ -702,8 +704,17 @@ fn turn_end(agents: &AgentRegistry, tab: u32) -> Option<i64> {
     agents.stop_of(tab)?.split_once('.')?.0.parse().ok()
 }
 
-/// End each run whose agent's turn ended after it started (`done`, or `failed` when the agent
-/// reads failed now, with its newest message) or whose tab is gone (`gone`). Answers the tabs
+/// Whether the agent in `tab` reads failed now. A turn that ends on an error (Claude's
+/// `StopFailure`: an API error, a usage limit) reports no turn end, so this alone ends a run.
+fn reads_failed(agents: &AgentRegistry, tab: u32) -> bool {
+    agents
+        .agent(tab)
+        .is_some_and(|a| a.belief.state == qoop_domain::AgentRuntimeState::Failed)
+}
+
+/// End each run whose agent's turn ended after it started (`done`), or that reads failed now
+/// (`failed`), with its newest message, or whose tab is gone (`gone`). A failed run left open
+/// would skip every later slot of its schedule until someone closed its tab. Answers the tabs
 /// of the runs still going.
 async fn end_runs(
     books: &Bookkeeping,
@@ -727,20 +738,17 @@ async fn end_runs(
             .filter(|t| terminals.workspace_of(*t).is_some());
         let (outcome, summary) = match tab {
             None => ("gone", None),
-            Some(tab) => match turn_end(agents, tab) {
-                Some(at) if at >= run.started_at => {
-                    let failed = agents
-                        .agent(tab)
-                        .is_some_and(|a| a.belief.state == qoop_domain::AgentRuntimeState::Failed);
-                    let said = crate::messages::last_said(terminals, agents, tab).await;
-                    let said = said.map(|text| cut(text, RUN_SUMMARY_MOST));
-                    (if failed { "failed" } else { "done" }, said)
-                }
-                _ => {
+            Some(tab) => {
+                let failed = reads_failed(agents, tab);
+                let turn_ended = turn_end(agents, tab).is_some_and(|at| at >= run.started_at);
+                if !failed && !turn_ended {
                     going.insert(tab);
                     continue;
                 }
-            },
+                let said = crate::messages::last_said(terminals, agents, tab).await;
+                let said = said.map(|text| cut(text, RUN_SUMMARY_MOST));
+                (if failed { "failed" } else { "done" }, said)
+            }
         };
         let (id, at) = (run.id, now());
         match books
